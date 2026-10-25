@@ -14,6 +14,7 @@ AltVault.exe is pythonw.exe renamed; renaming a file doesn't affect its signatur
 compiled into a new unsigned .exe, which is what gets PyInstaller-style apps blocked or flagged.
 """
 import os
+import py_compile
 import re
 import shutil
 import sys
@@ -61,20 +62,27 @@ def copy(src, dst):
 
 
 def build_stdlib_zip(path):
+    """Compiles the needed standard library into one zip of .pyc files. Each file records a neutral
+    'Lib/...' path rather than where Python is installed, so the build machine's folders (and its
+    Windows username) never end up in the download."""
     lib = os.path.join(BASE, "Lib")
-
-    def keep(p):
-        rel = os.path.relpath(p, lib).replace("\\", "/")
-        return rel.split("/")[0].removesuffix(".py") not in SKIP_LIB and "/test" not in rel \
-            and "/tests" not in rel and "__pycache__" not in rel
-
-    with zipfile.PyZipFile(path, "w", zipfile.ZIP_DEFLATED, optimize=2) as z:
-        for name in sorted(os.listdir(lib)):
-            full = os.path.join(lib, name)
-            if not keep(full):
+    tmp = os.path.join(DIST, "_build.pyc")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for folder, dirs, files in os.walk(lib):
+            rel_dir = os.path.relpath(folder, lib).replace("\\", "/")
+            top = rel_dir.split("/")[0]
+            if rel_dir != "." and (top in SKIP_LIB or not os.path.isfile(os.path.join(folder, "__init__.py"))):
+                dirs[:] = []
                 continue
-            if name.endswith(".py") or os.path.isfile(os.path.join(full, "__init__.py")):
-                z.writepy(full, filterfunc=keep)
+            dirs[:] = sorted(d for d in dirs if d not in ("__pycache__", "test", "tests"))
+            for name in sorted(files):
+                if not name.endswith(".py") or (rel_dir == "." and name[:-3] in SKIP_LIB):
+                    continue
+                rel = name if rel_dir == "." else f"{rel_dir}/{name}"
+                py_compile.compile(os.path.join(folder, name), cfile=tmp, dfile="Lib/" + rel, optimize=2,
+                                   doraise=True, invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+                z.write(tmp, rel + "c")
+    os.remove(tmp)
 
 
 def main():
