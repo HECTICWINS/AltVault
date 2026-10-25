@@ -1,0 +1,11 @@
+dist/
+__pycache__/
+*.pyc
+*.bak
+*.tmp
+
+# never commit personal data (normally lives in %LOCALAPPDATA%\PyRAM, listed here in case it's copied in)
+accounts.dat
+settings.json
+pyram.log
+avatars/
