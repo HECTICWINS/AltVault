@@ -16,7 +16,9 @@ A secure, lightweight Roblox account manager for Windows. Download, unzip, doubl
 - **Anti-AFK that doesn't get in your way.** It keeps every client from being kicked for idling without flashing Roblox windows over your browser or game.
   It also waits until you pause typing.
 - **Featherweight.** About 50 MB of RAM and well under 1% of one CPU core while running.
-- **One window only.** Opening AltVault again just brings the open window to the front.
+- **Runs quietly in the tray.** Closing the window keeps AltVault running as a small icon next to the clock, with Anti-AFK still on.
+  Click the icon to open AltVault, or right-click it to switch Anti-AFK on or off or to quit.
+- **One window only.** Opening AltVault again just brings it back, even from the tray.
 
 ## Features
 

@@ -517,6 +517,180 @@ def app_icon_path():
     return path
 
 
+# ---------------------------------------------------------------- system tray
+# Closing the window hides AltVault to a tray icon so Anti-AFK keeps running. Tk has no tray
+# support, so this is the Win32 notification-icon API with its own message-only window and
+# message loop on a background thread; anything that touches Tk is handed back via root.after().
+TRAY_CLASS = "AltVaultTray"
+WM_TRAY = 0x8001        # WM_APP + 1: tray icon mouse events
+WM_TRAY_SHOW = 0x8002   # WM_APP + 2: a second launch asking this AltVault to show itself
+HWND_MESSAGE = -3
+NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
+NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO = 0x1, 0x2, 0x4, 0x10
+WM_DESTROY, WM_CLOSE, WM_LBUTTONUP, WM_RBUTTONUP = 0x0002, 0x0010, 0x0202, 0x0205
+TPM_RETURNCMD, TPM_RIGHTBUTTON = 0x0100, 0x0002
+MF_STRING, MF_SEPARATOR, MF_CHECKED = 0x0, 0x800, 0x8
+IMAGE_ICON, LR_LOADFROMFILE = 1, 0x10
+SM_CXSMICON, SM_CYSMICON = 49, 50
+ASFW_ANY = -1
+TRAY_OPEN, TRAY_AFK, TRAY_QUIT = 1, 2, 3
+
+WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+
+
+class WNDCLASSEXW(ctypes.Structure):
+    _fields_ = [("cbSize", wt.UINT), ("style", wt.UINT), ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int), ("hInstance", wt.HINSTANCE), ("hIcon", wt.HICON),
+                ("hCursor", wt.HANDLE), ("hbrBackground", wt.HBRUSH), ("lpszMenuName", wt.LPCWSTR),
+                ("lpszClassName", wt.LPCWSTR), ("hIconSm", wt.HICON)]
+
+
+class NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [("cbSize", wt.DWORD), ("hWnd", wt.HWND), ("uID", wt.UINT), ("uFlags", wt.UINT),
+                ("uCallbackMessage", wt.UINT), ("hIcon", wt.HICON), ("szTip", wt.WCHAR * 128),
+                ("dwState", wt.DWORD), ("dwStateMask", wt.DWORD), ("szInfo", wt.WCHAR * 256),
+                ("uVersion", wt.UINT), ("szInfoTitle", wt.WCHAR * 64), ("dwInfoFlags", wt.DWORD),
+                ("guidItem", ctypes.c_byte * 16), ("hBalloonIcon", wt.HICON)]
+
+
+_shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+_shell32.Shell_NotifyIconW.argtypes = [wt.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+_user32.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+_user32.DefWindowProcW.restype = ctypes.c_ssize_t
+_user32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
+_user32.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD, ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_int, ctypes.c_int, wt.HWND, wt.HMENU, wt.HINSTANCE, wt.LPVOID]
+_user32.CreateWindowExW.restype = wt.HWND
+_user32.FindWindowExW.argtypes = [wt.HWND, wt.HWND, wt.LPCWSTR, wt.LPCWSTR]
+_user32.FindWindowExW.restype = wt.HWND
+_user32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+_user32.SendMessageTimeoutW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM, wt.UINT, wt.UINT,
+                                        ctypes.POINTER(ctypes.c_size_t)]
+SMTO_ABORTIFHUNG = 0x0002
+_user32.LoadImageW.argtypes = [wt.HINSTANCE, wt.LPCWSTR, wt.UINT, ctypes.c_int, ctypes.c_int, wt.UINT]
+_user32.LoadImageW.restype = wt.HANDLE
+_user32.DestroyIcon.argtypes = [wt.HICON]
+_user32.CreatePopupMenu.restype = wt.HMENU
+_user32.AppendMenuW.argtypes = [wt.HMENU, wt.UINT, ctypes.c_size_t, wt.LPCWSTR]
+_user32.TrackPopupMenu.argtypes = [wt.HMENU, wt.UINT, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.HWND, wt.LPVOID]
+_user32.DestroyMenu.argtypes = [wt.HMENU]
+_user32.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
+_user32.DestroyWindow.argtypes = [wt.HWND]
+_user32.RegisterWindowMessageW.argtypes = [wt.LPCWSTR]
+_user32.AllowSetForegroundWindow.argtypes = [wt.DWORD]
+_user32.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT]
+_user32.TranslateMessage.argtypes = [ctypes.POINTER(wt.MSG)]
+_user32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
+_kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
+_kernel32.GetModuleHandleW.restype = wt.HMODULE
+
+
+def find_tray_window():
+    """The tray window of an AltVault already running in this session, if any."""
+    return _user32.FindWindowExW(wt.HWND(HWND_MESSAGE), None, TRAY_CLASS, None)
+
+
+class TrayIcon:
+    """The notification-area icon. on_open / on_toggle_afk / on_quit are called on the Tk thread;
+    afk_on() is a plain function (safe from this thread) used for the menu's check mark."""
+
+    def __init__(self, root, icon_path, on_open, on_toggle_afk, on_quit, afk_on):
+        self.root, self.icon_path = root, icon_path
+        self.on_open, self.on_toggle_afk, self.on_quit, self.afk_on = on_open, on_toggle_afk, on_quit, afk_on
+        self.hwnd = None
+        self.ready = threading.Event()
+        self._proc = WNDPROC(self._wndproc)   # keep a reference, or ctypes frees the callback
+        threading.Thread(target=self._run, daemon=True).start()
+        self.ready.wait(5)
+
+    def _tk(self, fn):
+        try:
+            self.root.after(0, fn)
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _data(self, flags=0):
+        nid = NOTIFYICONDATAW()
+        nid.cbSize, nid.hWnd, nid.uID, nid.uFlags = ctypes.sizeof(NOTIFYICONDATAW), self.hwnd, 1, flags
+        return nid
+
+    def _add(self):
+        nid = self._data(NIF_MESSAGE | NIF_ICON | NIF_TIP)
+        nid.uCallbackMessage, nid.hIcon, nid.szTip = WM_TRAY, self.hicon, APP_TITLE
+        _shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
+
+    def _run(self):
+        hinst = _kernel32.GetModuleHandleW(None)
+        # Set before CreateWindowExW, which already sends the window its first messages.
+        self.taskbar_created = _user32.RegisterWindowMessageW("TaskbarCreated")
+        wc = WNDCLASSEXW(cbSize=ctypes.sizeof(WNDCLASSEXW), lpfnWndProc=self._proc, hInstance=hinst,
+                         lpszClassName=TRAY_CLASS)
+        _user32.RegisterClassExW(ctypes.byref(wc))
+        self.hwnd = _user32.CreateWindowExW(0, TRAY_CLASS, APP_TITLE, 0, 0, 0, 0, 0,
+                                            wt.HWND(HWND_MESSAGE), None, hinst, None)
+        size = _user32.GetSystemMetrics(SM_CXSMICON), _user32.GetSystemMetrics(SM_CYSMICON)
+        self.hicon = _user32.LoadImageW(None, self.icon_path, IMAGE_ICON, *size, LR_LOADFROMFILE)
+        self._add()
+        self.ready.set()
+        msg = wt.MSG()
+        while _user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            _user32.TranslateMessage(ctypes.byref(msg))
+            _user32.DispatchMessageW(ctypes.byref(msg))
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        if msg == WM_TRAY:
+            event = lparam & 0xFFFF
+            if event == WM_LBUTTONUP:
+                self._tk(self.on_open)
+            elif event == WM_RBUTTONUP:
+                self._menu(hwnd)
+            return 0
+        if msg == WM_TRAY_SHOW:
+            self._tk(self.on_open)
+            return 0
+        if msg == self.taskbar_created:   # Explorer restarted: the icon has to be added again
+            self._add()
+            return 0
+        if msg == WM_CLOSE:
+            _shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._data()))
+            _user32.DestroyIcon(self.hicon)
+            _user32.DestroyWindow(hwnd)
+            return 0
+        if msg == WM_DESTROY:
+            self.hwnd = None
+            _user32.PostQuitMessage(0)
+            return 0
+        return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def _menu(self, hwnd):
+        menu = _user32.CreatePopupMenu()
+        _user32.AppendMenuW(menu, MF_STRING, TRAY_OPEN, "Open AltVault")
+        _user32.AppendMenuW(menu, MF_STRING | (MF_CHECKED if self.afk_on() else 0), TRAY_AFK, "Anti-AFK")
+        _user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+        _user32.AppendMenuW(menu, MF_STRING, TRAY_QUIT, "Quit AltVault")
+        pt = wt.POINT()
+        _user32.GetCursorPos(ctypes.byref(pt))
+        _user32.SetForegroundWindow(hwnd)   # without this the menu doesn't close when clicking elsewhere
+        choice = _user32.TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None)
+        _user32.DestroyMenu(menu)
+        action = {TRAY_OPEN: self.on_open, TRAY_AFK: self.on_toggle_afk, TRAY_QUIT: self.on_quit}.get(choice)
+        if action:
+            self._tk(action)
+
+    def notify(self, title, text):
+        nid = self._data(NIF_INFO)
+        nid.szInfoTitle, nid.szInfo = title[:63], text[:255]
+        _shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
+
+    def remove(self):
+        """Takes the icon out of the tray and ends the tray thread. Waits (briefly) for it to happen,
+        or the process could exit first and leave a ghost icon behind."""
+        hwnd = self.hwnd
+        if hwnd:
+            result = ctypes.c_size_t()
+            _user32.SendMessageTimeoutW(hwnd, WM_CLOSE, 0, 0, SMTO_ABORTIFHUNG, 2000, ctypes.byref(result))
+
+
 def dark_title_bar(win):
     win.update_idletasks()
     value = ctypes.c_int(1)
@@ -531,6 +705,11 @@ def acquire_instance_lock():
     """Returns a handle while this is the only AltVault, else focuses the open one and returns None."""
     handle = _kernel32.CreateMutexW(None, False, "Local\\AltVault_instance")
     if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        tray = find_tray_window()
+        if tray:   # ask the running AltVault to show itself; it may be hidden in the tray
+            _user32.AllowSetForegroundWindow(ASFW_ANY)
+            _user32.PostMessageW(tray, WM_TRAY_SHOW, 0, 0)
+            return None
         # Match Tk's window class too, or an Explorer window open on a folder called "AltVault" would win.
         hwnd = _user32.FindWindowW("TkTopLevel", APP_TITLE)
         if hwnd:
@@ -1200,6 +1379,8 @@ class App:
         self.afk_wait_started = None  # when a due ping started waiting for the user to pause
         self.afk_retry_hwnds = None   # windows to retry after a pass that couldn't focus them
         self.afk_retries = 0
+        self.afk_on = False           # mirrors the Anti-AFK box for the tray thread, which can't read Tk
+        self.tray = None              # set by main(); without it, closing the window quits
 
         apply_theme(root, self.scale)
         root.title(APP_TITLE)
@@ -1420,7 +1601,7 @@ class App:
     def refresh_presence(self, reschedule=True):
         if reschedule:
             self.root.after(PRESENCE_INTERVAL, self.refresh_presence)
-        if self.root.state() == "iconic":
+        if self.root.state() in ("iconic", "withdrawn"):   # minimised, or hidden in the tray
             self.presence_stale = True
             return
         accounts = list(self.accounts)
@@ -1597,6 +1778,7 @@ class App:
             self.root.after_cancel(self.afk_job)
             self.afk_job = None
         self.afk_wait_started, self.afk_retry_hwnds, self.afk_retries = None, None, 0
+        self.afk_on = self.anti_afk_var.get()
         if self.anti_afk_var.get():
             self.schedule_afk(3)
             if not quiet:
@@ -1816,8 +1998,35 @@ class App:
             messagebox.showwarning("Join", "\n\n".join(problems), parent=self.root)
 
     def on_close(self):
+        """The window's X: hide to the tray so Anti-AFK keeps working. Quit is in the tray menu."""
         self.settings["geometry"] = self.root.geometry()
         self.save_settings()
+        if not self.tray:
+            self.root.destroy()
+            return
+        self.root.withdraw()
+        if not self.settings.get("tray_hint_shown"):
+            self.tray.notify("AltVault is still running",
+                             "Anti-AFK and your accounts keep working. Click the tray icon to open AltVault, "
+                             "or right-click it to quit.")
+            self.settings["tray_hint_shown"] = True
+            save_settings(self.settings)
+
+    def show_from_tray(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def tray_toggle_afk(self):
+        self.anti_afk_var.set(not self.anti_afk_var.get())
+        self.toggle_anti_afk()
+
+    def quit_app(self):
+        if self.root.state() != "withdrawn":
+            self.settings["geometry"] = self.root.geometry()
+        self.save_settings()
+        if self.tray:
+            self.tray.remove()
         self.root.destroy()
 
 
@@ -1869,8 +2078,15 @@ def main():
     threading.Thread(target=remove_stale_login_profiles, daemon=True).start()
     if os.path.exists(DATA_FILE):
         threading.Thread(target=restrict_to_owner, args=(DATA_FILE,), daemon=True).start()
-    App(root, accounts)
+    app = App(root, accounts)
+    try:
+        app.tray = TrayIcon(root, app_icon_path(), app.show_from_tray, app.tray_toggle_afk, app.quit_app,
+                            lambda: app.afk_on)
+    except (OSError, AttributeError):
+        log.exception("Couldn't create the tray icon; closing the window will quit")
     root.mainloop()
+    if app.tray:
+        app.tray.remove()
     for login in list(_open_logins):   # never leave a login browser or its profile behind
         login.close()
     disable_multi_roblox()
