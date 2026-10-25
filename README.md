@@ -20,7 +20,8 @@ A secure, lightweight Roblox account manager for Windows. Download, unzip, doubl
 
 ## Features
 
-- **Saved accounts:** cookies are encrypted with Windows DPAPI.
+- **Log in with browser:** add accounts by logging in normally. You don't need developer tools or cookie copying.
+- **Saved accounts:** logins are encrypted with Windows DPAPI.
 - **Join:** launch one or many accounts into a game, optionally all into the same server or a specific Job ID.
 - **Multi-Roblox:** run several clients at once.
 - **Auto-tile:** arrange any number of Roblox windows in an even grid.
@@ -48,9 +49,22 @@ There's nothing to `pip install`; AltVault only uses Python's standard library.
 
 ## Adding an account
 
-AltVault asks for an account's `.ROBLOSECURITY` cookie. The **Add account** dialog walks you through copying it from your browser.
+Click **Add account**, then **Log in with browser**.
 
-> **Your cookie is equivalent to your password.** Only paste it into software you trust and have read.
+1. A private browser window opens on roblox.com. AltVault uses Chrome, Edge or Brave, whichever you have.
+2. Log in as usual. 2-step verification works too.
+3. AltVault saves the account, closes the window and deletes that window's temporary profile.
+4. Click **Log in another account** to add the next alt straight away.
+
+You only do this once per account. AltVault never logs the account out.
+Log in again only if Roblox ends that session, for example after a password change or "Log out of all sessions"; right-click the account > **Log in again**.
+
+The login window uses a brand-new, empty browser profile, so your normal browser, its logins and its history aren't touched.
+AltVault reads only the Roblox login from that window, over a connection that exists only on your PC and only while the window is open.
+
+Prefer not to use a browser window? Choose **Paste a cookie instead** and paste the account's `.ROBLOSECURITY` value.
+
+> **A Roblox login cookie is equivalent to your password.** Only give it to software you trust and have read.
 > AltVault is a single readable file so that you can check exactly what it does with it.
 
 ## Anti-AFK

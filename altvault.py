@@ -4,8 +4,10 @@ so it works with Windows Smart App Control turned on.
 Everything lives in %LOCALAPPDATA%\\AltVault. Account cookies are encrypted with Windows
 DPAPI (only your Windows user on this PC can decrypt them) and are never written to the log.
 """
+import base64
 import ctypes
 import ctypes.wintypes as wt
+import hashlib
 import http.client
 import json
 import logging
@@ -13,8 +15,11 @@ import math
 import os
 import random
 import re
+import shutil
+import socket
 import struct
 import subprocess
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -27,7 +32,7 @@ import zlib
 from tkinter import messagebox, simpledialog, ttk
 
 APP_TITLE = "AltVault"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 APP_DIR = os.path.join(os.environ["LOCALAPPDATA"], "AltVault")
 DATA_FILE = os.path.join(APP_DIR, "accounts.dat")
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
@@ -755,6 +760,187 @@ def launch(cookie, place_id, job_id=""):
                           "Is the Roblox player installed?") from None
 
 
+# ---------------------------------------------------------------- browser login
+# "Log in with browser" opens a throwaway browser profile on the Roblox login page. Once the user
+# has logged in, the .ROBLOSECURITY cookie is read over the browser's local DevTools connection,
+# then the browser is closed and the profile deleted. The user's own browser profile is never
+# touched, and the session is never logged out (that would invalidate the saved cookie).
+
+# Only fixed install locations, so nothing on PATH can stand in for the browser.
+BROWSERS = (r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+            r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+            r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe",
+            r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
+            r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe",
+            r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe")
+LOGIN_URL = "https://www.roblox.com/login"
+LOGIN_TIMEOUT = 600   # seconds the login window may stay open
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+LOGIN_PROFILE_PREFIX = "AltVault-login-"
+_open_logins = set()   # BrowserLogins whose browser may still be open; closed on exit
+
+
+def remove_stale_login_profiles():
+    """Deletes throwaway login profiles left behind if AltVault was killed mid-login. They can hold
+    a live session, so none may linger. Only one AltVault runs at a time, so none is in use now."""
+    tmp = tempfile.gettempdir()
+    for name in os.listdir(tmp):
+        if name.startswith(LOGIN_PROFILE_PREFIX):
+            shutil.rmtree(os.path.join(tmp, name), ignore_errors=True)
+
+
+def find_browser():
+    return next((p for p in (os.path.expandvars(b) for b in BROWSERS) if os.path.isfile(p)), None)
+
+
+class DevTools:
+    """Just enough of a WebSocket client (RFC 6455) to send Chrome DevTools Protocol commands to a
+    browser on this PC."""
+
+    def __init__(self, port, path):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n"
+                           f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise OSError("DevTools closed the connection")
+            head += chunk
+        head, self.buf = head.split(b"\r\n\r\n", 1)
+        lines = head.decode("latin-1").split("\r\n")
+        headers = {k.strip().lower(): v.strip() for k, _, v in (line.partition(":") for line in lines[1:])}
+        accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+        if " 101 " not in lines[0] + " " or headers.get("sec-websocket-accept") != accept:
+            raise OSError("DevTools refused the connection")
+        self.next_id = 0
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise OSError("DevTools closed the connection")
+            self.buf += chunk
+        data, self.buf = self.buf[:n], self.buf[n:]
+        return data
+
+    def _send_frame(self, opcode, payload):
+        mask = os.urandom(4)
+        n = len(payload)
+        head = bytes([0x80 | opcode]) + (bytes([0x80 | n]) if n < 126 else
+                                         bytes([0x80 | 126]) + struct.pack(">H", n) if n < 65536 else
+                                         bytes([0x80 | 127]) + struct.pack(">Q", n))
+        self.sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def _message(self):
+        parts = []
+        while True:
+            b1, b2 = self._read(2)
+            n = b2 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._read(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._read(8))[0]
+            mask = self._read(4) if b2 & 0x80 else None
+            data = self._read(n)
+            if mask:
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+            opcode = b1 & 0x0F
+            if opcode == 8:
+                raise OSError("DevTools closed the connection")
+            if opcode == 9:
+                self._send_frame(10, data)   # answer pings
+                continue
+            if opcode in (0, 1, 2):
+                parts.append(data)
+                if b1 & 0x80:
+                    return b"".join(parts)
+
+    def call(self, method, **params):
+        self.next_id += 1
+        self._send_frame(1, json.dumps({"id": self.next_id, "method": method, "params": params}).encode())
+        while True:
+            msg = json.loads(self._message())
+            if msg.get("id") == self.next_id:
+                if "error" in msg:
+                    raise OSError(msg["error"].get("message", "DevTools error"))
+                return msg.get("result", {})
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class BrowserLogin:
+    """A throwaway browser window on the Roblox login page. wait() returns the cookie once the user
+    has logged in; close() shuts the browser and deletes its profile. Safe to cancel from any thread."""
+
+    def __init__(self):
+        browser = find_browser()
+        if not browser:
+            raise RobloxError("No Chrome, Edge or Brave was found. Use “Paste a cookie” instead.")
+        self.profile = tempfile.mkdtemp(prefix=LOGIN_PROFILE_PREFIX)
+        _open_logins.add(self)
+        self.devtools = None
+        self.cancelled = False
+        self.proc = subprocess.Popen([
+            browser, f"--user-data-dir={self.profile}", "--remote-debugging-port=0", "--no-first-run",
+            "--no-default-browser-check", "--disable-sync", "--disable-extensions", "--new-window", LOGIN_URL])
+
+    def _connect(self):
+        # The browser writes its randomly chosen DevTools port and path here once it has started.
+        with open(os.path.join(self.profile, "DevToolsActivePort"), encoding="utf-8") as f:
+            port, path = f.read().split()[:2]
+        self.devtools = DevTools(int(port), path)
+
+    def wait(self, timeout=LOGIN_TIMEOUT):
+        deadline = time.monotonic() + timeout
+        while not self.cancelled:
+            if self.proc.poll() is not None:
+                raise RobloxError("The login window was closed before the login finished.")
+            if time.monotonic() > deadline:
+                raise RobloxError("The login timed out. Try again.")
+            try:
+                if not self.devtools:
+                    self._connect()
+                for c in self.devtools.call("Storage.getCookies").get("cookies", []):
+                    if c.get("name") == ".ROBLOSECURITY" and c.get("value") \
+                            and str(c.get("domain", "")).lstrip(".").endswith("roblox.com"):
+                        return c["value"]
+            except (OSError, ValueError, KeyError):   # browser still starting, or reconnect needed
+                if self.devtools:
+                    self.devtools.close()
+                    self.devtools = None
+            time.sleep(1)
+        raise RobloxError("Login cancelled.")
+
+    def close(self):
+        self.cancelled = True
+        _open_logins.discard(self)
+        if self.devtools:
+            try:
+                self.devtools.call("Browser.close")
+            except (OSError, ValueError):
+                pass
+            self.devtools.close()
+            self.devtools = None
+        try:
+            self.proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+        for _ in range(20):   # the browser's helper processes can hold files for a moment
+            shutil.rmtree(self.profile, ignore_errors=True)
+            if not os.path.exists(self.profile):
+                return
+            time.sleep(0.5)
+        log.warning("Couldn't fully delete the temporary login profile")
+
+
 UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 
 
@@ -823,6 +1009,7 @@ def apply_theme(root, scale):
     s.configure("Small.TLabel", foreground=C["muted"], font=("Segoe UI", 9))
     s.configure("Title.TLabel", font=("Segoe UI Semibold", 16))
     s.configure("Error.TLabel", foreground=C["red"])
+    s.configure("Success.TLabel", foreground=C["green"])
 
 
 def themed_menu(root):
@@ -832,11 +1019,11 @@ def themed_menu(root):
 
 # ---------------------------------------------------------------- UI
 
-ADD_STEPS = [
-    "Open a private window (Ctrl+Shift+N in Chrome/Edge) and log into the account on roblox.com.",
-    "Press F12 > Application tab (Firefox: Storage) > Cookies > https://www.roblox.com.",
-    "Click .ROBLOSECURITY and copy its whole Value, then paste it below.",
-    "Close the private window. Don't click Log Out — that kills the cookie.",
+COOKIE_STEPS = [
+    "Log into the account on roblox.com in a private window (Ctrl+Shift+N).",
+    "Press F12 > Application (Firefox: Storage) > Cookies > https://www.roblox.com.",
+    "Copy the whole Value of .ROBLOSECURITY and paste it here.",
+    "Close the private window. Don't click Log Out, which kills the cookie.",
 ]
 
 
@@ -844,40 +1031,109 @@ class AddAccountDialog(tk.Toplevel):
     def __init__(self, app, for_account=None):
         super().__init__(app.root, bg=C["bg"])
         self.app = app
-        self.title(f"Update cookie — {for_account['name']}" if for_account else "Add account")
+        self.login = None   # the BrowserLogin in progress, if any
+        wrap = int(500 * app.scale)
+        self.title(f"Update login: {for_account['name']}" if for_account else "Add account")
         self.resizable(False, False)
         self.transient(app.root)
         frm = ttk.Frame(self, padding=18)
         frm.pack(fill="both", expand=True)
-        ttk.Label(frm, text="Add a Roblox account", style="Title.TLabel").pack(anchor="w")
-        for i, step in enumerate(ADD_STEPS, 1):
-            ttk.Label(frm, text=f"{i}.  {step}", wraplength=int(520 * app.scale),
-                      justify="left").pack(anchor="w", pady=(8 if i == 1 else 2, 0))
-        ttk.Button(frm, text="Open roblox.com login",
-                   command=lambda: webbrowser.open("https://www.roblox.com/login")).pack(anchor="w", pady=(10, 0))
+        ttk.Label(frm, text=f"Log in again as @{for_account['name']}" if for_account
+                  else "Add a Roblox account", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(frm, text="A private browser window opens on roblox.com. Log in as usual (2-step verification "
+                  "works too). AltVault saves the account and closes the window. Your normal browser and its "
+                  "logins aren't touched.", wraplength=wrap, justify="left").pack(anchor="w", pady=(8, 0))
+        self.login_btn = ttk.Button(frm, text="Log in with browser", style="Accent.TButton", command=self.toggle_login)
+        self.login_btn.pack(anchor="w", pady=(12, 0))
+        self.status = ttk.Label(frm, text="", style="Muted.TLabel", wraplength=wrap, justify="left")
+        self.status.pack(anchor="w", pady=(8, 0))
 
-        ttk.Label(frm, text=".ROBLOSECURITY cookie", style="Muted.TLabel").pack(anchor="w", pady=(14, 2))
-        self.cookie_var = tk.StringVar()
-        cookie_entry = ttk.Entry(frm, textvariable=self.cookie_var, show="•")
-        cookie_entry.pack(fill="x")
         ttk.Label(frm, text="Note (optional)", style="Muted.TLabel").pack(anchor="w", pady=(10, 2))
         self.note_var = tk.StringVar(value=for_account.get("note", "") if for_account else "")
         ttk.Entry(frm, textvariable=self.note_var).pack(fill="x")
-        ttk.Label(frm, text="This cookie works like your password. Only ever paste it into AltVault.",
-                  style="Small.TLabel").pack(anchor="w", pady=(10, 0))
-        self.status = ttk.Label(frm, text="", style="Error.TLabel")
-        self.status.pack(anchor="w", pady=(6, 0))
 
-        btns = ttk.Frame(frm)
-        btns.pack(fill="x", pady=(10, 0))
-        self.add_btn = ttk.Button(btns, text="Save account", style="Accent.TButton", command=self.submit)
-        self.add_btn.pack(side="right")
-        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right", padx=8)
-        self.bind("<Return>", lambda _e: self.submit())
+        # Pasting a cookie by hand stays available for anyone who prefers it, folded away.
+        self.more_btn = ttk.Button(frm, text="Paste a cookie instead ▸", command=self.toggle_paste)
+        self.more_btn.pack(anchor="w", pady=(12, 0))
+        self.paste = ttk.Frame(frm)
+        for i, step in enumerate(COOKIE_STEPS, 1):
+            ttk.Label(self.paste, text=f"{i}.  {step}", style="Small.TLabel", wraplength=wrap,
+                      justify="left").pack(anchor="w", pady=(6 if i == 1 else 1, 0))
+        self.cookie_var = tk.StringVar()
+        self.cookie_entry = ttk.Entry(self.paste, textvariable=self.cookie_var, show="•")
+        self.cookie_entry.pack(fill="x", pady=(8, 0))
+        self.add_btn = ttk.Button(self.paste, text="Save account", command=self.submit)
+        self.add_btn.pack(anchor="e", pady=(8, 0))
+        ttk.Label(self.paste, text="A cookie works like a password. Only ever paste it into AltVault.",
+                  style="Small.TLabel").pack(anchor="w", pady=(4, 0))
+
+        ttk.Button(frm, text="Close", command=self.destroy).pack(side="bottom", anchor="e", pady=(14, 0))
+        self.cookie_entry.bind("<Return>", lambda _e: self.submit())
         self.bind("<Escape>", lambda _e: self.destroy())
         dark_title_bar(self)
         self.grab_set()
-        cookie_entry.focus_set()
+        self.login_btn.focus_set()
+
+    def toggle_paste(self):
+        if self.paste.winfo_ismapped():
+            self.paste.pack_forget()
+            self.more_btn.config(text="Paste a cookie instead ▸")
+        else:
+            self.paste.pack(fill="x", after=self.more_btn)
+            self.more_btn.config(text="Paste a cookie instead ▾")
+            self.cookie_entry.focus_set()
+
+    # ------------------------------------------------------------ browser login
+    def toggle_login(self):
+        if self.login:
+            self.login.cancelled = True
+            self.status.config(text="Cancelling...", style="Muted.TLabel")
+            return
+        try:
+            self.login = BrowserLogin()
+        except (RobloxError, OSError) as e:
+            self.status.config(text=str(e), style="Error.TLabel")
+            return
+        self.login_btn.config(text="Cancel login")
+        self.status.config(text="Log in to Roblox in the browser window that just opened. This window "
+                           "updates by itself when you're done.", style="Muted.TLabel")
+        login, note = self.login, self.note_var.get().strip()
+
+        def work():
+            try:
+                cookie = login.wait()
+                user = get_user(cookie)
+                result = (self._login_done, user, cookie, note)
+            except RobloxError as e:
+                result = (self._login_failed, str(e))
+            except Exception:
+                log.exception("Browser login failed")
+                result = (self._login_failed, "Something went wrong with the browser login. Try again.")
+            finally:
+                login.close()   # shut the browser and delete its throwaway profile, whatever happened
+            try:
+                self.after(0, *result)
+            except (RuntimeError, tk.TclError):
+                pass   # this window was closed meanwhile
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _login_done(self, user, cookie, note):
+        self.login = None
+        self.app.add_or_update(user, cookie, note)
+        self.note_var.set("")
+        self.login_btn.config(text="Log in another account")
+        self.status.config(text=f"Saved @{user['name']}. Log in another account, or Close.", style="Success.TLabel")
+
+    def _login_failed(self, msg):
+        self.login = None
+        self.login_btn.config(text="Log in with browser")
+        self.status.config(text=msg, style="Muted.TLabel" if msg == "Login cancelled." else "Error.TLabel")
+
+    def destroy(self):
+        if self.login:   # the worker sees this within a second and closes the browser
+            self.login.cancelled = True
+        super().destroy()
 
     def submit(self):
         cookie = self.cookie_var.get().strip().strip('"')
@@ -1075,7 +1331,7 @@ class App:
     def status_of(self, acc):
         """(text, tag) for the account's Status column."""
         if acc["id"] in self.expired:
-            return "Cookie expired — right-click > Update cookie", "expired"
+            return "Login expired — right-click > Log in again", "expired"
         running = acc["id"] in self.running.values()
         p = self.presence.get(acc["id"])
         kind = p.get("userPresenceType") if p else None
@@ -1283,7 +1539,7 @@ class App:
                              else "Turn anti-AFK off for this account",
                              command=lambda: self.toggle_afk_skip(acc))
             menu.add_command(label="Edit note", command=lambda: self.edit_note(acc))
-            menu.add_command(label="Update cookie", command=lambda: AddAccountDialog(self, acc))
+            menu.add_command(label="Log in again", command=lambda: AddAccountDialog(self, acc))
             menu.add_command(label="Move up", command=lambda: self.move(acc, -1))
             menu.add_command(label="Move down", command=lambda: self.move(acc, 1))
         menu.add_separator()
@@ -1460,7 +1716,7 @@ class App:
             return
         expired = [a for a in sel if a["id"] in self.expired]
         if expired:
-            messagebox.showerror("Join", "These accounts need a fresh cookie first:\n" +
+            messagebox.showerror("Join", "These accounts need to log in again first (right-click > Log in again):\n" +
                                  "\n".join("@" + a["name"] for a in expired), parent=self.root)
             return
         if len(sel) > 1 and not self.multi_var.get():
@@ -1487,7 +1743,7 @@ class App:
                     launch(acc["cookie"], place_id, job_id)
                 except CookieExpired:
                     self.expired.add(acc["id"])
-                    problems.append(f"@{acc['name']}: cookie expired — right-click > Update cookie.")
+                    problems.append(f"@{acc['name']}: login expired — right-click > Log in again.")
                     continue
                 except (RobloxError, OSError) as e:
                     log.warning("Launch of %s failed: %s", acc["name"], e)
@@ -1610,10 +1866,13 @@ def main():
         messagebox.showerror(APP_TITLE, f"Couldn't read saved accounts:\n{e}\n\nFile: {DATA_FILE}")
         root.destroy()
         return
+    threading.Thread(target=remove_stale_login_profiles, daemon=True).start()
     if os.path.exists(DATA_FILE):
         threading.Thread(target=restrict_to_owner, args=(DATA_FILE,), daemon=True).start()
     App(root, accounts)
     root.mainloop()
+    for login in list(_open_logins):   # never leave a login browser or its profile behind
+        login.close()
     disable_multi_roblox()
 
 
