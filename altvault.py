@@ -55,6 +55,7 @@ AFK_IDLE = 2                     # seconds of no mouse/keyboard use before steal
 AFK_MAX_WAIT = 300               # if the user never pauses that long, ping anyway
 AFK_RETRY = 30                   # seconds before retrying windows that refused focus
 AFK_MAX_RETRIES = 3
+AFK_STUCK = 90                   # seconds after which a still-running pass is treated as stuck
 AFK_KEYS = {"space": 0x20, "f13": 0x7C, **{c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"}}
 
 log = logging.getLogger("altvault")
@@ -118,6 +119,7 @@ _user32.GetWindow.argtypes = [wt.HWND, wt.UINT]
 _user32.GetWindow.restype = wt.HWND
 _user32.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
 _user32.SendInput.argtypes = [wt.UINT, ctypes.c_void_p, ctypes.c_int]
+_user32.IsHungAppWindow.argtypes = [wt.HWND]
 _kernel32.GetTickCount.restype = wt.DWORD
 _dwmapi.DwmSetWindowAttribute.argtypes = [wt.HWND, wt.DWORD, ctypes.c_void_p, wt.DWORD]
 
@@ -136,6 +138,9 @@ KEYEVENTF_KEYUP = 0x0002
 
 
 SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_ASYNCWINDOWPOS = 0x4000   # post the change to the window's own thread instead of waiting on it
+HWND_TOP = 0
 GA_ROOT = 2
 GW_HWNDPREV = 3
 GWL_EXSTYLE = -20
@@ -296,25 +301,35 @@ def _nudge_input():
     _user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT))
 
 
+def responsive(hwnd):
+    """False if the window's program is 'Not responding'. Several window calls wait for the owning
+    program to answer, so touching a frozen window (a Roblox client mid-teleport, say) could stall
+    Anti-AFK forever."""
+    return bool(hwnd) and _user32.IsWindow(hwnd) and not _user32.IsHungAppWindow(hwnd)
+
+
 def force_foreground(hwnd):
     """Brings a window to the front even while another app has focus. Returns success.
 
     Windows' foreground lock blocks background apps from switching focus. Sharing input state with
     the foreground thread plus a harmless synthetic input gets around it; an Alt tap and
-    SwitchToThisWindow are later fallbacks. Focus changes are asynchronous, so check and retry."""
+    SwitchToThisWindow are later fallbacks. Focus changes are asynchronous, so check and retry.
+    Frozen windows are never touched, and raising uses the non-blocking (async) form."""
+    if not responsive(hwnd):
+        return False
     me = _kernel32.GetCurrentThreadId()
     for attempt in range(6):
         fg = _user32.GetForegroundWindow()
         if fg == hwnd:
             return True
-        fg_thread = _user32.GetWindowThreadProcessId(fg, None) if fg else 0
+        fg_thread = _user32.GetWindowThreadProcessId(fg, None) if fg and responsive(fg) else 0
         attached = bool(fg_thread) and fg_thread != me and _user32.AttachThreadInput(me, fg_thread, True)
         if attempt < 3:
             _nudge_input()
         else:
             _user32.keybd_event(VK_MENU, 0, 0, 0)
             _user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
-        _user32.BringWindowToTop(hwnd)
+        _user32.SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_ASYNCWINDOWPOS)
         _user32.SetForegroundWindow(hwnd)
         if attached:
             _user32.AttachThreadInput(me, fg_thread, False)
@@ -347,6 +362,27 @@ def _offscreen_origin():
     return gm(SM_XVIRTUALSCREEN) + gm(SM_CXVIRTUALSCREEN) + 200, gm(SM_YVIRTUALSCREEN)
 
 
+def _move_async(hwnd, x, y, insert_after=None, flags=0):
+    """Moves a window without waiting on its program (so a freeze can't stall us), then waits up to
+    ~0.4 s for the move to land. Returns True once it has."""
+    _user32.SetWindowPos(hwnd, insert_after, x, y, 0, 0,
+                         SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS | flags)
+    r = wt.RECT()
+    for _ in range(20):
+        if _user32.GetWindowRect(hwnd, ctypes.byref(r)) and (r.left, r.top) == (x, y):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+# What the current Anti-AFK pass is doing, so a stuck pass can be reported precisely.
+afk_step = {"step": "idle", "since": 0.0}
+
+
+def _step(name):
+    afk_step["step"], afk_step["since"] = name, time.monotonic()
+
+
 def anti_afk_pass(hwnds, vk):
     """Roblox ignores input sent to background windows, so briefly focus each window, tap the key,
     then give focus back. The key is only sent once Roblox is confirmed in front, so it can never
@@ -357,6 +393,7 @@ def anti_afk_pass(hwnds, vk):
     back in its old place and stacking order afterwards; it is never seen. A window that's fully
     visible already is pinged where it is, since raising it changes nothing on screen.
     Returns (pinged, minimised, missed) lists of hwnds."""
+    _step("starting")
     prev = _user32.GetForegroundWindow()
     pinged, minimised, missed, moved = [], [], [], []
     off_x, off_y = _offscreen_origin()
@@ -370,30 +407,40 @@ def anti_afk_pass(hwnds, vk):
             if _user32.IsIconic(hwnd):   # restoring it would disturb the user, and it can't take input
                 minimised.append(hwnd)
                 continue
+            if not responsive(hwnd):     # frozen (e.g. mid-teleport): retry it shortly instead
+                missed.append(hwnd)
+                continue
             if hwnd != prev and not fully_visible(hwnd):
+                _step("moving a covered window off-screen")
                 r = wt.RECT()
                 _user32.GetWindowRect(hwnd, ctypes.byref(r))
                 above = _user32.GetWindow(hwnd, GW_HWNDPREV)
                 moved.append((hwnd, r.left, r.top, above))
-                _user32.SetWindowPos(hwnd, None, off_x, off_y, 0, 0,
-                                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING)
+                if not _move_async(hwnd, off_x, off_y, flags=SWP_NOZORDER):
+                    missed.append(hwnd)   # didn't move in time; focusing it now would flash it
+                    continue
+            _step("focusing a Roblox window")
             if force_foreground(hwnd):
                 time.sleep(0.1)
                 if _user32.GetForegroundWindow() == hwnd:
+                    _step("pressing the key")
                     tap_key(vk)
                     pinged.append(hwnd)
                     continue
             missed.append(hwnd)
     finally:   # whatever happens above, never leave the user without focus or a window off-screen
-        if prev and _user32.GetForegroundWindow() != prev and _user32.IsWindow(prev):
+        _step("restoring focus")
+        if prev and _user32.GetForegroundWindow() != prev and responsive(prev):
             force_foreground(prev)
         # Put moved windows back, top-most first, each directly below the window that was above
         # it, so the user's stacking order is restored and nothing pops over their current app.
+        _step("putting windows back")
         for hwnd, x, y, above in sorted(moved, key=lambda m: depth.get(m[0], 0)):
-            flags = SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING
+            flags = 0
             if not above or not _user32.IsWindow(above) or _user32.GetWindowLongW(above, GWL_EXSTYLE) & WS_EX_TOPMOST:
-                flags |= SWP_NOZORDER
-            _user32.SetWindowPos(hwnd, above or None, x, y, 0, 0, flags)
+                flags = SWP_NOZORDER
+            _move_async(hwnd, x, y, above or None, flags)
+        _step("idle")
     return pinged, minimised, missed
 
 
@@ -1379,6 +1426,11 @@ class App:
         self.afk_wait_started = None  # when a due ping started waiting for the user to pause
         self.afk_retry_hwnds = None   # windows to retry after a pass that couldn't focus them
         self.afk_retries = 0
+        self.afk_busy_since = 0.0     # when the running pass started (watchdog)
+        self.afk_pass_id = 0          # identifies the current pass, so a late stuck one is ignored
+        self.afk_waiting_for = None   # why a due ping is being held back, for the log
+        self.afk_waiting_since = 0.0
+        self.afk_waiting_logged = False
         self.afk_on = False           # mirrors the Anti-AFK box for the tray thread, which can't read Tk
         self.tray = None              # set by main(); without it, closing the window quits
 
@@ -1779,6 +1831,7 @@ class App:
             self.afk_job = None
         self.afk_wait_started, self.afk_retry_hwnds, self.afk_retries = None, None, 0
         self.afk_on = self.anti_afk_var.get()
+        log.info("Anti-AFK %s", "on" if self.afk_on else "off")
         if self.anti_afk_var.get():
             self.schedule_afk(3)
             if not quiet:
@@ -1808,31 +1861,57 @@ class App:
         self.status.config(text=f"Anti-AFK {'off' if acc['id'] in skip else 'on'} for @{acc['name']}.")
 
     def afk_due(self):
+        """Timer callback for the next ping. Whatever goes wrong, it always leaves a timer running
+        and says so in the log; Anti-AFK must never stop silently."""
         if self.afk_job:   # no-op when the timer fired this; stops a second timer otherwise
             self.root.after_cancel(self.afk_job)
             self.afk_job = None
         if not self.anti_afk_var.get():
             return
-        if self.afk_busy or self.joining:   # don't fight a join for focus
+        try:
+            self._afk_due()
+        except Exception:
+            log.exception("Anti-AFK scheduling failed; trying again in a minute")
+            self.afk_busy = False
+            self.schedule_afk(60)
+
+    def _afk_due(self):
+        now = time.monotonic()
+        if self.afk_busy:
+            # Watchdog: a pass takes ~1 s per window. If one is still running after 90 s it's stuck
+            # (the worker can't be killed, but it no longer blocks new pings).
+            if now - self.afk_busy_since > AFK_STUCK:
+                log.warning("Anti-AFK: a ping got stuck at '%s'; starting a fresh one", afk_step["step"])
+                self.afk_busy = False
+            else:
+                self.schedule_afk(5)
+                return
+        if self.joining:   # don't fight a join for focus
+            self._afk_waiting("a join to finish")
             self.schedule_afk(5)
             return
         if self.afk_wait_started is None:
-            self.afk_wait_started = time.monotonic()
-        if idle_seconds() < AFK_IDLE and time.monotonic() - self.afk_wait_started < AFK_MAX_WAIT:
+            self.afk_wait_started = now
+        if idle_seconds() < AFK_IDLE and now - self.afk_wait_started < AFK_MAX_WAIT:
             self.schedule_afk(1)
             return
         self.afk_wait_started = None
+        self.afk_waiting_for = None
 
         skip = self.afk_skip_ids()
         hwnds = [hwnd for hwnd, pid, _ in roblox_windows() if self.running.get(pid) not in skip]
         if self.afk_retry_hwnds is not None:
             hwnds = [h for h in hwnds if h in self.afk_retry_hwnds]
         if not hwnds:
+            if self.afk_retry_hwnds is None:
+                log.info("Anti-AFK: no Roblox windows to ping; checking again in ~10 min")
             self.afk_retry_hwnds, self.afk_retries = None, 0
             self.schedule_afk(random.uniform(*AFK_INTERVAL))
             return
         vk = AFK_KEYS.get(str(self.settings.get("afk_key", "space")).lower(), AFK_KEYS["space"])
-        self.afk_busy = True
+        self.afk_busy, self.afk_busy_since = True, now
+        self.afk_pass_id += 1
+        pass_id = self.afk_pass_id
 
         def work():
             try:
@@ -1840,28 +1919,43 @@ class App:
             except Exception:
                 log.exception("Anti-AFK pass failed")
                 result = ([], [], [])
-            self.ui(self.afk_finished, *result)
+            self.ui(self.afk_finished, *result, pass_id)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def afk_finished(self, pinged, minimised, missed):
+    def _afk_waiting(self, reason):
+        """Logs (once) when a due ping has been held up for over a minute."""
+        if self.afk_waiting_for != reason:
+            self.afk_waiting_for, self.afk_waiting_since = reason, time.monotonic()
+        elif time.monotonic() - self.afk_waiting_since > 60 and not self.afk_waiting_logged:
+            log.info("Anti-AFK: ping waiting for %s", reason)
+            self.afk_waiting_logged = True
+
+    def afk_finished(self, pinged, minimised, missed, pass_id=None):
+        if pass_id is not None and pass_id != self.afk_pass_id:
+            log.info("Anti-AFK: a ping that had got stuck finished late (pinged %d)", len(pinged))
+            return   # a newer pass has taken over; its result is the one that counts
         self.afk_busy = False
+        self.afk_waiting_logged = False
         parts = [f"pinged {len(pinged)}"]
         if minimised:
             parts.append(f"{len(minimised)} minimised (restore to keep them safe)")
         if missed:
             parts.append(f"{len(missed)} busy, retrying")
-        log.info("Anti-AFK: %s", ", ".join(parts))
         if not self.anti_afk_var.get():
+            log.info("Anti-AFK: %s", ", ".join(parts))
             return
-        self.status.config(text=f"Anti-AFK {time.strftime('%H:%M')}: " + ", ".join(parts))
         if missed and self.afk_retries < AFK_MAX_RETRIES:
             self.afk_retries += 1
             self.afk_retry_hwnds = set(missed)
-            self.schedule_afk(AFK_RETRY)
+            delay = AFK_RETRY
         else:
             self.afk_retry_hwnds, self.afk_retries = None, 0
-            self.schedule_afk(random.uniform(*AFK_INTERVAL))
+            delay = random.uniform(*AFK_INTERVAL)
+        self.schedule_afk(delay)
+        nxt = time.strftime("%H:%M", time.localtime(time.time() + delay))
+        log.info("Anti-AFK: %s; next ping ~%s", ", ".join(parts), nxt)
+        self.status.config(text=f"Anti-AFK {time.strftime('%H:%M')}: " + ", ".join(parts) + f" · next ~{nxt}")
 
     def ensure_multi(self):
         """Makes Multi-Roblox active before a join. Returns False if the user cancelled."""
@@ -2042,6 +2136,7 @@ def main():
     os.makedirs(APP_DIR, exist_ok=True)
     logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
+    log.info("AltVault %s starting", APP_VERSION)
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except (AttributeError, OSError):
