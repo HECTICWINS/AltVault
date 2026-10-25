@@ -104,6 +104,15 @@ _user32.AttachThreadInput.argtypes = [wt.DWORD, wt.DWORD, wt.BOOL]
 _user32.MapVirtualKeyW.argtypes = [wt.UINT, wt.UINT]
 _user32.keybd_event.argtypes = [wt.BYTE, wt.BYTE, wt.DWORD, ctypes.c_size_t]
 _user32.GetLastInputInfo.argtypes = [ctypes.c_void_p]
+_user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+_user32.WindowFromPoint.argtypes = [wt.POINT]
+_user32.WindowFromPoint.restype = wt.HWND
+_user32.GetAncestor.argtypes = [wt.HWND, wt.UINT]
+_user32.GetAncestor.restype = wt.HWND
+_user32.GetWindow.argtypes = [wt.HWND, wt.UINT]
+_user32.GetWindow.restype = wt.HWND
+_user32.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
+_user32.SendInput.argtypes = [wt.UINT, ctypes.c_void_p, ctypes.c_int]
 _kernel32.GetTickCount.restype = wt.DWORD
 _dwmapi.DwmSetWindowAttribute.argtypes = [wt.HWND, wt.DWORD, ctypes.c_void_p, wt.DWORD]
 
@@ -121,8 +130,29 @@ VK_MENU = 0x12
 KEYEVENTF_KEYUP = 0x0002
 
 
+SWP_NOSIZE = 0x0001
+GA_ROOT = 2
+GW_HWNDPREV = 3
+GWL_EXSTYLE = -20
+WS_EX_TOPMOST = 0x0008
+INPUT_MOUSE = 0
+MOUSEEVENTF_MOVE = 0x0001
+
+
 class LASTINPUTINFO(ctypes.Structure):
     _fields_ = [("cbSize", wt.UINT), ("dwTime", wt.DWORD)]
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wt.LONG), ("dy", wt.LONG), ("mouseData", wt.DWORD), ("dwFlags", wt.DWORD),
+                ("time", wt.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class INPUT(ctypes.Structure):
+    class _U(ctypes.Union):
+        _fields_ = [("mi", MOUSEINPUT), ("_pad", ctypes.c_byte * 32)]   # sized for the largest member
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wt.DWORD), ("u", _U)]
 
 
 def _dpapi(func, data):
@@ -253,12 +283,20 @@ def idle_seconds():
     return ((_kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000
 
 
+def _nudge_input():
+    """A zero-distance mouse move: makes this process the source of the latest input, which lifts
+    Windows' foreground lock, without the side effects of a key press (an Alt tap opens menus)."""
+    event = INPUT(type=INPUT_MOUSE)
+    event.mi = MOUSEINPUT(0, 0, 0, MOUSEEVENTF_MOVE, 0, 0)
+    _user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT))
+
+
 def force_foreground(hwnd):
     """Brings a window to the front even while another app has focus. Returns success.
 
     Windows' foreground lock blocks background apps from switching focus. Sharing input state with
-    the foreground thread plus a synthetic Alt tap gets around it; SwitchToThisWindow is the fallback.
-    Focus changes are asynchronous, so check and retry."""
+    the foreground thread plus a harmless synthetic input gets around it; an Alt tap and
+    SwitchToThisWindow are later fallbacks. Focus changes are asynchronous, so check and retry."""
     me = _kernel32.GetCurrentThreadId()
     for attempt in range(6):
         fg = _user32.GetForegroundWindow()
@@ -266,8 +304,11 @@ def force_foreground(hwnd):
             return True
         fg_thread = _user32.GetWindowThreadProcessId(fg, None) if fg else 0
         attached = bool(fg_thread) and fg_thread != me and _user32.AttachThreadInput(me, fg_thread, True)
-        _user32.keybd_event(VK_MENU, 0, 0, 0)
-        _user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+        if attempt < 3:
+            _nudge_input()
+        else:
+            _user32.keybd_event(VK_MENU, 0, 0, 0)
+            _user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
         _user32.BringWindowToTop(hwnd)
         _user32.SetForegroundWindow(hwnd)
         if attached:
@@ -285,27 +326,69 @@ def tap_key(vk):
     _user32.keybd_event(vk, scan, KEYEVENTF_KEYUP, 0)
 
 
+def fully_visible(hwnd):
+    """True if nothing covers the window (checked at its centre and four inner corners)."""
+    r = wt.RECT()
+    if not _user32.GetWindowRect(hwnd, ctypes.byref(r)):
+        return False
+    inset = 12
+    points = [((r.left + r.right) // 2, (r.top + r.bottom) // 2), (r.left + inset, r.top + inset),
+              (r.right - inset, r.top + inset), (r.left + inset, r.bottom - inset), (r.right - inset, r.bottom - inset)]
+    return all(_user32.GetAncestor(_user32.WindowFromPoint(wt.POINT(x, y)), GA_ROOT) == hwnd for x, y in points)
+
+
+def _offscreen_origin():
+    gm = _user32.GetSystemMetrics
+    return gm(SM_XVIRTUALSCREEN) + gm(SM_CXVIRTUALSCREEN) + 200, gm(SM_YVIRTUALSCREEN)
+
+
 def anti_afk_pass(hwnds, vk):
     """Roblox ignores input sent to background windows, so briefly focus each window, tap the key,
     then give focus back. The key is only sent once Roblox is confirmed in front, so it can never
-    land in another app. Returns (pinged, minimised, missed) lists of hwnds."""
+    land in another app.
+
+    Activating a window brings it to the front, which would flash it over whatever the user is
+    doing. So any Roblox window that's covered is first moved off-screen, pinged there, and put
+    back in its old place and stacking order afterwards; it is never seen. A window that's fully
+    visible already is pinged where it is, since raising it changes nothing on screen.
+    Returns (pinged, minimised, missed) lists of hwnds."""
     prev = _user32.GetForegroundWindow()
-    pinged, minimised, missed = [], [], []
-    for hwnd in hwnds:
-        if not _user32.IsWindow(hwnd):
-            continue
-        if _user32.IsIconic(hwnd):   # restoring it would disturb the user, and it can't take input
-            minimised.append(hwnd)
-            continue
-        if force_foreground(hwnd):
-            time.sleep(0.1)
-            if _user32.GetForegroundWindow() == hwnd:
-                tap_key(vk)
-                pinged.append(hwnd)
+    pinged, minimised, missed, moved = [], [], [], []
+    off_x, off_y = _offscreen_origin()
+    stacking = []   # every top-level window, front to back, as it was before the pass
+    _user32.EnumWindows(WNDENUMPROC(lambda h, _l: stacking.append(h) or True), 0)
+    depth = {h: i for i, h in enumerate(stacking)}
+    try:
+        for hwnd in hwnds:
+            if not _user32.IsWindow(hwnd):
                 continue
-        missed.append(hwnd)
-    if prev and _user32.GetForegroundWindow() != prev and _user32.IsWindow(prev):
-        force_foreground(prev)
+            if _user32.IsIconic(hwnd):   # restoring it would disturb the user, and it can't take input
+                minimised.append(hwnd)
+                continue
+            if hwnd != prev and not fully_visible(hwnd):
+                r = wt.RECT()
+                _user32.GetWindowRect(hwnd, ctypes.byref(r))
+                above = _user32.GetWindow(hwnd, GW_HWNDPREV)
+                moved.append((hwnd, r.left, r.top, above))
+                _user32.SetWindowPos(hwnd, None, off_x, off_y, 0, 0,
+                                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING)
+            if force_foreground(hwnd):
+                time.sleep(0.1)
+                if _user32.GetForegroundWindow() == hwnd:
+                    tap_key(vk)
+                    pinged.append(hwnd)
+                    continue
+            missed.append(hwnd)
+    finally:   # whatever happens above, never leave the user without focus or a window off-screen
+        if prev and _user32.GetForegroundWindow() != prev and _user32.IsWindow(prev):
+            force_foreground(prev)
+        # Put moved windows back, top-most first, each directly below the window that was above
+        # it, so the user's stacking order is restored and nothing pops over their current app.
+        for hwnd, x, y, above in sorted(moved, key=lambda m: depth.get(m[0], 0)):
+            flags = SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING
+            if not above or not _user32.IsWindow(above) or _user32.GetWindowLongW(above, GWL_EXSTYLE) & WS_EX_TOPMOST:
+                flags |= SWP_NOZORDER
+            _user32.SetWindowPos(hwnd, above or None, x, y, 0, 0, flags)
     return pinged, minimised, missed
 
 

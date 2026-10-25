@@ -1,18 +1,31 @@
 # AltVault
 
-A lightweight Roblox account manager for Windows, written as a single Python file with no dependencies.
-Because it runs on the official, signed Python interpreter rather than an unsigned `.exe`, it works with Windows Smart App Control turned on.
+A secure, lightweight Roblox account manager for Windows. Download, unzip, double-click, and you're running.
+
+## Why AltVault
+
+- **No need to turn anything off.** AltVault runs with **Smart App Control** and **Microsoft Defender** left on.
+  You don't need to add exclusions, click "Run anyway", or disable your antivirus.
+  Every program file in the download is the official, digitally signed runtime from python.org.
+  Unsigned `.exe` builds are what usually get blocked or flagged.
+- **Nothing to install.** You don't need .NET, Visual C++ redistributables, Python or admin rights; it's one zip.
+- **Your accounts stay yours.** Logins are encrypted to your Windows account, and the file is locked so only you can open it.
+  Cookies are only ever sent to `roblox.com`, and AltVault has no servers of its own to send anything to.
+- **Code you can actually check.** The whole app is a single readable file, `altvault.py`.
+  You or anyone you trust can review it before pasting in a login.
+- **Anti-AFK that doesn't get in your way.** It keeps every client from being kicked for idling without flashing Roblox windows over your browser or game.
+  It also waits until you pause typing.
+- **Featherweight.** About 50 MB of RAM and well under 1% of one CPU core while running.
+- **One window only.** Opening AltVault again just brings the open window to the front.
 
 ## Features
 
-- **Saved accounts:** your cookies are encrypted with Windows DPAPI.
+- **Saved accounts:** cookies are encrypted with Windows DPAPI.
 - **Join:** launch one or many accounts into a game, optionally all into the same server or a specific Job ID.
 - **Multi-Roblox:** run several clients at once.
-- **Auto-tile:** arrange the Roblox windows in a grid.
+- **Auto-tile:** arrange any number of Roblox windows in an even grid.
 - **Live status:** see who's online or in game, with avatars.
 - **Anti-AFK:** stops Roblox's 20-minute idle kick for every open client, while you keep using your PC.
-- **Low resource use:** idles at roughly 0.2% of one CPU core, and stops polling while minimised.
-- **One window only:** opening AltVault again just brings the existing window to the front.
 
 ## Install
 
@@ -45,11 +58,12 @@ AltVault asks for an account's `.ROBLOSECURITY` cookie. The **Add account** dial
 Tick **Anti-AFK** in the footer. Every 8–11 minutes AltVault:
 
 1. waits until you've stopped using your mouse and keyboard for 2 seconds,
-2. brings each Roblox window to the front for a moment and presses Space (a jump),
+2. gives each Roblox window focus for a split second and presses Space (a jump),
 3. returns focus to the app you were using.
 
 Roblox ignores input sent to background windows, so a brief focus switch is the only reliable method.
-The key is only pressed once a Roblox window is confirmed to be in front, so it never types into your other apps.
+Any Roblox window hidden behind your other apps is moved off-screen for that moment and put back exactly where it was, so you never see it flash.
+The key is only pressed once a Roblox window is confirmed to be in focus, so it never types into your other apps.
 
 - To exclude an account, right-click it and choose **Turn anti-AFK off for this account**.
 - Don't minimise Roblox windows; Windows can't send them input. Leave them behind other windows instead.
