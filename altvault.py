@@ -13,6 +13,7 @@ import math
 import os
 import random
 import re
+import struct
 import subprocess
 import threading
 import time
@@ -22,6 +23,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
+import zlib
 from tkinter import messagebox, simpledialog, ttk
 
 APP_TITLE = "AltVault"
@@ -344,6 +346,89 @@ def safe_geometry(saved):
     return saved
 
 
+# ---------------------------------------------------------------- app icon
+# Drawn in code (a vault door on an indigo tile) so the app stays one readable file. Shapes are
+# signed-distance fields, which give smooth edges at every size without supersampling.
+ICON_SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
+ICON_VERSION = 1
+
+
+def _png(size, rgba):
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+    stride = size * 4
+    raw = b"".join(b"\0" + rgba[y * stride:(y + 1) * stride] for y in range(size))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+def _sd_trapezoid(x, y, r1, r2, he):
+    """Signed distance to a trapezoid centred on the origin: half-width r1 at the top (y=-he),
+    r2 at the bottom (y=+he). After Inigo Quilez's 2D distance functions."""
+    k2x, k2y = r2 - r1, 2 * he
+    x = abs(x)
+    cax, cay = x - min(x, r1 if y < 0 else r2), abs(y) - he
+    t = min(max(((r2 - x) * k2x + (he - y) * k2y) / (k2x * k2x + k2y * k2y), 0), 1)
+    cbx, cby = x - r2 + k2x * t, y - he + k2y * t
+    s = -1 if cbx < 0 and cay < 0 else 1
+    return s * math.sqrt(min(cax * cax + cay * cay, cbx * cbx + cby * cby))
+
+
+def _render_icon(size):
+    small = size <= 24   # thicker strokes and a bigger keyhole so it still reads at 16px
+    top, bottom = (0x6F, 0x7B, 0xFF), (0x3C, 0x45, 0xB8)
+    px = 1 / size        # one pixel in unit coordinates, for anti-aliasing
+    ring_r, ring_w = (0.31, 0.085) if small else (0.31, 0.055)
+    k = 1.25 if small else 1.0   # keyhole scale
+    out = bytearray()
+    for j in range(size):
+        y = (j + 0.5) / size
+        t = y
+        bg = [round(top[k] + (bottom[k] - top[k]) * t) for k in range(3)]
+        for i in range(size):
+            x = (i + 0.5) / size
+            # rounded square tile
+            qx, qy = abs(x - 0.5) - 0.44 + 0.2, abs(y - 0.5) - 0.44 + 0.2
+            tile = math.hypot(max(qx, 0), max(qy, 0)) + min(max(qx, qy), 0) - 0.2
+            a_tile = min(max(0.5 - tile / px, 0), 1)
+            if a_tile == 0:
+                out += b"\0\0\0\0"
+                continue
+            dx, dy = x - 0.5, y - 0.5
+            ring = abs(math.hypot(dx, dy) - ring_r) - ring_w / 2               # the vault door's rim
+            head = math.hypot(dx, dy + 0.045 * k) - 0.075 * k                  # keyhole: round top...
+            stem = _sd_trapezoid(dx, dy - 0.06 * k, 0.03 * k, 0.058 * k, 0.085 * k)   # ...flared slot
+            d = min(ring, head, stem)
+            a_white = min(max(0.5 - d / px, 0), 1)
+            rgb = [round(c + (255 - c) * a_white) for c in bg]
+            out += bytes((*rgb, round(255 * a_tile)))
+    return bytes(out)
+
+
+def write_icon(path):
+    """Writes a multi-size .ico (PNG entries, supported since Windows Vista)."""
+    images = [_png(s, _render_icon(s)) for s in ICON_SIZES]
+    offset = 6 + 16 * len(images)
+    header = struct.pack("<HHH", 0, 1, len(images))
+    for s, img in zip(ICON_SIZES, images):
+        header += struct.pack("<BBBBHHII", s % 256, s % 256, 0, 0, 1, 32, len(img), offset)
+        offset += len(img)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(header + b"".join(images))
+    os.replace(tmp, path)
+
+
+def app_icon_path():
+    """The cached .ico, drawn on first run (and again if the design changes)."""
+    path = os.path.join(APP_DIR, f"altvault-{ICON_VERSION}.ico")
+    if not os.path.exists(path):
+        os.makedirs(APP_DIR, exist_ok=True)
+        write_icon(path)
+    return path
+
+
 def dark_title_bar(win):
     win.update_idletasks()
     value = ctypes.c_int(1)
@@ -358,7 +443,8 @@ def acquire_instance_lock():
     """Returns a handle while this is the only AltVault, else focuses the open one and returns None."""
     handle = _kernel32.CreateMutexW(None, False, "Local\\AltVault_instance")
     if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
-        hwnd = _user32.FindWindowW(None, APP_TITLE)
+        # Match Tk's window class too, or an Explorer window open on a folder called "AltVault" would win.
+        hwnd = _user32.FindWindowW("TkTopLevel", APP_TITLE)
         if hwnd:
             focus_window(hwnd)
         return None
@@ -1415,11 +1501,22 @@ def main():
     instance = acquire_instance_lock()
     if instance is None:
         return
+    try:   # own taskbar identity, so Windows shows AltVault's icon instead of grouping it under Python
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("AltVault.AccountManager")
+    except (AttributeError, OSError):
+        pass
     root = tk.Tk()
+    try:
+        root.iconbitmap(default=app_icon_path())   # default= applies to every dialog too
+    except (OSError, tk.TclError):
+        log.warning("Couldn't set the window icon")
 
     def report(exc, val, tb):
         log.error("Unhandled UI error", exc_info=(exc, val, tb))
-        messagebox.showerror(APP_TITLE, f"Something went wrong:\n{val}\n\nDetails are in {LOG_FILE}")
+        # Only interrupt with a dialog while the user is in AltVault. An error from a background
+        # timer must never pop up over Roblox or whatever else they're doing.
+        if _user32.GetForegroundWindow() == _user32.GetParent(root.winfo_id()):
+            messagebox.showerror(APP_TITLE, f"Something went wrong:\n{val}\n\nDetails are in {LOG_FILE}")
     root.report_callback_exception = report
 
     try:

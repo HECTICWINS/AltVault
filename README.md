@@ -12,6 +12,7 @@ Because it runs on the official, signed Python interpreter rather than an unsign
 - **Live status:** see who's online or in game, with avatars.
 - **Anti-AFK:** stops Roblox's 20-minute idle kick for every open client, while you keep using your PC.
 - **Low resource use:** idles at roughly 0.2% of one CPU core, and stops polling while minimised.
+- **One window only:** opening AltVault again just brings the existing window to the front.
 
 ## Install
 
@@ -21,8 +22,10 @@ You don't need Python or anything else installed.
 2. Unzip it anywhere, such as your Documents folder.
 3. Double-click **AltVault.exe**.
 
-`AltVault.exe` is the official, digitally signed Python runtime from python.org, renamed. That's why it has the Python icon,
-and why Windows Smart App Control and SmartScreen let it run without warnings, unlike unsigned `.exe` builds.
+`AltVault.exe` is the official, digitally signed Python runtime from python.org, renamed.
+That's why Windows Smart App Control and SmartScreen let it run without warnings, unlike unsigned `.exe` builds.
+It's also why the file itself shows the Python icon: changing it would break the signature.
+The running window and taskbar show AltVault's icon. For a desktop shortcut with the same icon, right-click `AltVault.exe` > **Show more options** > **Create shortcut**, then point the shortcut's icon at `AltVault.ico`.
 The download contains no compiled code of ours. The app itself is the readable `altvault.py` next to the exe.
 
 **Already have Python 3.9 or newer?** You can just download `altvault.py` and double-click it, or run `pyw altvault.py`.

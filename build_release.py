@@ -129,6 +129,11 @@ def main():
         f.write(SITECUSTOMIZE)
     for name in APP_FILES:
         copy(os.path.join(ROOT, name), os.path.join(OUT, name))
+    # The exe must keep Python's icon (changing it would break the signature), so ship the app
+    # icon alongside for shortcuts; the running window and taskbar use it automatically.
+    sys.path.insert(0, ROOT)
+    import altvault
+    altvault.write_icon(os.path.join(OUT, "AltVault.ico"))
 
     with open(os.path.join(ROOT, "altvault.py"), encoding="utf-8") as f:
         m = re.search(r'^APP_VERSION = "([^"]+)"', f.read(), re.M)
