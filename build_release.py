@@ -56,6 +56,19 @@ if sys.argv in ([], [""]):
 '''
 
 
+# Every zip entry gets this date, so the download doesn't reveal when or where it was built
+# (zip times are the builder's local clock).
+ZIP_DATE = (2026, 1, 1, 0, 0, 0)
+
+
+def zip_add(z, src, arcname):
+    info = zipfile.ZipInfo(arcname, ZIP_DATE)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = 0o644 << 16
+    with open(src, "rb") as f:
+        z.writestr(info, f.read(), compresslevel=9)
+
+
 def copy(src, dst):
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     shutil.copy2(src, dst)
@@ -81,7 +94,7 @@ def build_stdlib_zip(path):
                 rel = name if rel_dir == "." else f"{rel_dir}/{name}"
                 py_compile.compile(os.path.join(folder, name), cfile=tmp, dfile="Lib/" + rel, optimize=2,
                                    doraise=True, invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
-                z.write(tmp, rel + "c")
+                zip_add(z, tmp, rel + "c")
     os.remove(tmp)
 
 
@@ -123,11 +136,12 @@ def main():
     archive = os.path.join(DIST, f"AltVault-{version}-win64.zip")
     if os.path.exists(archive):
         os.remove(archive)
-    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-        for folder, _, files in os.walk(OUT):
-            for name in files:
+    with zipfile.ZipFile(archive, "w") as z:
+        for folder, dirs, files in os.walk(OUT):
+            dirs.sort()
+            for name in sorted(files):
                 full = os.path.join(folder, name)
-                z.write(full, os.path.relpath(full, DIST))
+                zip_add(z, full, os.path.relpath(full, DIST).replace("\\", "/"))
     size = sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(OUT) for f in fs)
     print(f"Built {OUT} ({size / 2**20:.1f} MB unpacked)")
     print(f"      {archive} ({os.path.getsize(archive) / 2**20:.1f} MB)")
