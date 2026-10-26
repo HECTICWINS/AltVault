@@ -9,3 +9,6 @@ accounts.dat
 settings.json
 pyram.log
 avatars/
+
+# local dev helpers (prototypes, screenshot harness)
+dev/
