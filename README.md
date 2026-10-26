@@ -78,8 +78,13 @@ It's also why the file itself shows the Python icon: changing it would break the
 The running window and taskbar show AltVault's icon. For a desktop shortcut with the same icon, right-click `AltVault.exe` > **Show more options** > **Create shortcut**, then point the shortcut's icon at `AltVault.ico`.
 The download contains no compiled code of ours. The app itself is the readable `altvault.py` next to the exe.
 
-**Already have Python 3.9 or newer?** You can just download `altvault.py` and double-click it, or run `pyw altvault.py`.
-There's nothing to `pip install`; AltVault only uses Python's standard library.
+**Already have Python 3.9 or newer?** You can run the source instead of the download. There's nothing to `pip install`; AltVault only uses Python's standard library.
+
+1. Install Python from [python.org](https://www.python.org/downloads/windows/) (64-bit, 3.13 recommended), not the Microsoft Store version.
+2. Right-click `altvault.py` > **Open with** > **Python**. Or run `pyw altvault.py` in that folder.
+
+Double-clicking `altvault.py` only works if `.py` files open with Python on your PC. Code editors such as VS Code often take them over, so the file opens as text instead.
+**Code > Download ZIP** on GitHub gives you this source version. For the ready-to-run `AltVault.exe`, use the [Releases](https://github.com/HECTICWINS/AltVault/releases) page.
 
 **Upgrading from PyRAM?** Close PyRAM, then start AltVault. Your saved accounts, settings and avatars move over automatically.
 
