@@ -1027,6 +1027,27 @@ class TestWindow(unittest.TestCase):
             self.app.settings.pop(key, None)
         self.app.refresh()
 
+    def test_group_chevron_follows_open_and_closed(self):
+        tree, row = self.app.tree, "group:Mains"
+        chevron = lambda: str(tree.item(row, "image")[0])
+        self.assertEqual(chevron(), str(self.app.chevron(True)))
+        click = types.SimpleNamespace(x=1, y=1)
+        with mock.patch.object(av, "save_settings", lambda s: None), \
+                mock.patch.object(tree, "identify_row", lambda y: row), \
+                mock.patch.object(tree, "identify_element", lambda x, y: "Treeitem.image"):
+            self.assertEqual(self.app.tree_click(click), "break")
+            self.assertFalse(tree.item(row, "open"))
+            self.assertEqual(chevron(), str(self.app.chevron(False)))
+            self.app.tree_click(click)
+        self.assertTrue(tree.item(row, "open"))
+        self.app.settings.pop("collapsed_groups", None)
+
+    def test_names_tk_cannot_draw_are_cleaned(self):
+        self.assertEqual(av.clean_name("[\U0001F383] Tap Simulator REBORN"), "Tap Simulator REBORN")
+        self.assertEqual(av.clean_name("[\U0001F383 UPD] Bee Swarm"), "[UPD] Bee Swarm")
+        with mock.patch.dict(self.app.settings, {"recents": [{"id": "1", "name": "\U0001F95A Eggs \U0001F525"}]}):
+            self.assertEqual(self.app.recents()[0]["name"], "Eggs")
+
     def test_every_sidebar_page_opens(self):
         self.assertEqual([k for k, _, _ in self.app.NAV],
                          ["accounts", "profiles", "games", "live", "stats", "pulse", "settings"])

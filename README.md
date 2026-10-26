@@ -247,9 +247,11 @@ The key is only pressed once a Roblox window is confirmed to be in focus, so it 
 | Path | Contents |
 | --- | --- |
 | `%LOCALAPPDATA%\AltVault\accounts.dat` | Encrypted accounts. Never share this file. |
-| `%LOCALAPPDATA%\AltVault\settings.json` | Window size, last game and options (no secrets) |
-| `%LOCALAPPDATA%\AltVault\avatars\` | Cached avatar images |
-| `%LOCALAPPDATA%\AltVault\altvault.log` | Errors and warnings (no secrets) |
+| `%LOCALAPPDATA%\AltVault\settings.json` | Window size, games, profiles and options (no secrets) |
+| `%LOCALAPPDATA%\AltVault\history.json` | Hourly numbers for Stats and Pulse, one week (no names or secrets) |
+| `%LOCALAPPDATA%\AltVault\avatars\`, `game-icons\` | Cached avatar and game images |
+| `%LOCALAPPDATA%\AltVault\altvault.log` | What AltVault did, errors and warnings (no cookies or login tickets) |
+| `*.altvault` (wherever you save it) | An export of your accounts, locked with your password. Delete it once imported. |
 
 ## Building the download
 

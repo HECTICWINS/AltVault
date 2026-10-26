@@ -4,11 +4,18 @@ __pycache__/
 *.bak
 *.tmp
 
-# never commit personal data (normally lives in %LOCALAPPDATA%\PyRAM, listed here in case it's copied in)
+# Never commit personal data. AltVault keeps it in %LOCALAPPDATA%\AltVault; these are listed in
+# case a copy ever lands in this folder.
 accounts.dat
 settings.json
+history.json
+altvault.log
 pyram.log
 avatars/
+game-icons/
+altvault-*.ico
+# Export files hold your logins (password-protected, but still never shared).
+*.altvault
 
-# local dev helpers (prototypes, screenshot harness)
+# Local dev helpers (prototypes, screenshot harnesses, old backups)
 dev/

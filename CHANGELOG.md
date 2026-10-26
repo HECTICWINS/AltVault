@@ -18,6 +18,8 @@ Every release on the [Releases](../../releases) page is built by GitHub from the
 - Settings is now a page instead of a separate window.
 - **Purple night theme:** near-black with a faint violet tint, and a dark violet accent on the selected page, main buttons, ticks and charts. New purple app icon.
 - **Dark dialogs everywhere:** confirmations, warnings and text prompts match the app instead of flashing a bright Windows box. Destructive actions (Remove, Close all, Delete) use a red button.
+- **Light on power:** pages only redraw what actually changed, so the Live page idles at about 0.2% of one CPU core (it was over 20% in testing). Roblox memory now matches Task Manager (the private working set).
+- Game names with emoji (which Windows can't draw here) show cleanly, and group arrows are redrawn to match the theme.
 - Scrollbars only appear when a list is longer than its box. Game and Server boxes sit side by side, and empty charts say so instead of showing blank axes.
 
 ## 2.6.0

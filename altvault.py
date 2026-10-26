@@ -632,6 +632,13 @@ class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
                    "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage")]
 
 
+class PROCESS_MEMORY_COUNTERS_EX2(ctypes.Structure):
+    """Adds the private working set: the 'Memory' figure Task Manager shows (Windows 10 21H2+)."""
+    _fields_ = PROCESS_MEMORY_COUNTERS._fields_ + [
+        ("PrivateUsage", ctypes.c_size_t), ("PrivateWorkingSetSize", ctypes.c_size_t),
+        ("SharedCommitUsage", ctypes.c_ulonglong)]
+
+
 class MEMORYSTATUSEX(ctypes.Structure):
     _fields_ = [("dwLength", wt.DWORD), ("dwMemoryLoad", wt.DWORD)] + \
                [(name, ctypes.c_ulonglong) for name in (
@@ -641,7 +648,7 @@ class MEMORYSTATUSEX(ctypes.Structure):
 
 PROCESS_VM_READ = 0x0010
 _kernel32.GetProcessTimes.argtypes = [wt.HANDLE] + [ctypes.POINTER(wt.FILETIME)] * 4
-_kernel32.K32GetProcessMemoryInfo.argtypes = [wt.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), wt.DWORD]
+_kernel32.K32GetProcessMemoryInfo.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.DWORD]
 _kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(MEMORYSTATUSEX)]
 
 
@@ -658,9 +665,12 @@ def process_usage(pid):
         if _kernel32.GetProcessTimes(handle, *map(ctypes.byref, times)):
             kernel, user = ((t.dwHighDateTime << 32 | t.dwLowDateTime) for t in times[2:])
             cpu = (kernel + user) / 1e7
-        mem = PROCESS_MEMORY_COUNTERS(cb=ctypes.sizeof(PROCESS_MEMORY_COUNTERS))
-        ok = _kernel32.K32GetProcessMemoryInfo(handle, ctypes.byref(mem), ctypes.sizeof(mem))
-        return cpu, mem.WorkingSetSize if ok else None
+        mem = PROCESS_MEMORY_COUNTERS_EX2(cb=ctypes.sizeof(PROCESS_MEMORY_COUNTERS_EX2))
+        if _kernel32.K32GetProcessMemoryInfo(handle, ctypes.byref(mem), ctypes.sizeof(mem)):
+            return cpu, mem.PrivateWorkingSetSize   # matches Task Manager
+        old = PROCESS_MEMORY_COUNTERS(cb=ctypes.sizeof(PROCESS_MEMORY_COUNTERS))   # older Windows
+        ok = _kernel32.K32GetProcessMemoryInfo(handle, ctypes.byref(old), ctypes.sizeof(old))
+        return cpu, old.WorkingSetSize if ok else None
     finally:
         _kernel32.CloseHandle(handle)
 
@@ -1503,13 +1513,23 @@ def get_presence(cookie, user_id):
     return json.loads(body)["userPresences"][0]
 
 
+def clean_name(text):
+    """A game name Tk can draw. Emoji (outside the Basic Multilingual Plane) show as empty boxes,
+    so they're dropped along with any brackets they leave empty: '[🎃] Tap Sim' -> 'Tap Sim'."""
+    text = "".join(ch for ch in str(text or "") if ord(ch) <= 0xFFFF and ch not in "️‍")
+    text = re.sub(r"[\[(【]\s*[\])】]", "", text)
+    text = re.sub(r"([\[(【])\s+", r"\1", text)
+    text = re.sub(r"\s+([\])】])", r"\1", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
 def get_place_name(cookie, place_id):
     try:
         status, _, body = _request(
             f"https://games.roblox.com/v1/games/multiget-place-details?placeIds={place_id}", cookie)
         if status == 200:
             places = json.loads(body)
-            return places[0]["name"] if places else None
+            return (clean_name(places[0]["name"]) or None) if places else None
     except (RobloxError, ValueError, KeyError):
         pass
     return None
@@ -2052,6 +2072,17 @@ def apply_theme(root, scale):
     s.configure("Vertical.TScrollbar", troughcolor=C["panel"], background=C["panel"], borderwidth=0,
                 arrowsize=tw)
 
+    # Group arrows in lists. Tk 8.6 doesn't tell image elements whether a row is open, so the
+    # stock arrow is hidden and group rows show one of these chevrons as their own image instead.
+    ind = max(round(16 * scale), 12)
+    tree_kw = {"check": C["muted"], "check_w": 1.5 * scale, "box": (0, 0, ind, ind)}
+    image("tree-closed", ind, ind, 0, None, mark=((0.4, 0.28), (0.62, 0.5), (0.4, 0.72)), **tree_kw)
+    image("tree-open", ind, ind, 0, None, mark=CHEVRON, **tree_kw)
+    leaf = image("tree-leaf", max(round(4 * scale), 2), ind, 0, None)
+    s.element_create("AVTree.indicator", "image", leaf, sticky="")
+    s.layout("Item", [("Treeitem.padding", {"sticky": "nswe", "children": [
+        ("AVTree.indicator", {"side": "left", "sticky": ""}), ("Treeitem.image", {"side": "left", "sticky": ""}),
+        ("Treeitem.text", {"side": "left", "sticky": ""})]})])
     s.configure("Treeview", background=C["panel"], fieldbackground=C["panel"], borderwidth=0,
                 rowheight=int(50 * scale))
     s.map("Treeview", background=[("selected", C["sel"])], foreground=[("selected", C["fg"])])
@@ -2594,6 +2625,16 @@ class PasswordDialog(tk.Toplevel):
             self.destroy()
 
 
+def set_text(widget, text=None, **options):
+    """Changes a label only if something differs. Re-setting the same text still makes Tk lay out
+    and repaint the window, which on a page refreshed every couple of seconds wastes real power."""
+    if text is not None:
+        options["text"] = text
+    changed = {k: v for k, v in options.items() if str(widget.cget(k)) != str(v)}
+    if changed:
+        widget.config(**changed)
+
+
 class LivePage(ttk.Frame):
     """Every Roblox window as a live tile (see 'live view' above), with a stats panel on the right.
     Thumbnails exist only while this page is on screen. Stats are sampled every few seconds, and
@@ -2648,7 +2689,7 @@ class LivePage(ttk.Frame):
 
     def update_toolbar(self):
         on = self.app.stream_var.get()
-        self.stream_btn.config(text=f"Stream mode: {'on' if on else 'off'}", style="Accent.TButton" if on else "TButton")
+        set_text(self.stream_btn, f"Stream mode: {'on' if on else 'off'}", style="Accent.TButton" if on else "TButton")
 
     # ------------------------------------------------------------ stats panel
     def build_panel(self):
@@ -2774,12 +2815,12 @@ class LivePage(ttk.Frame):
         rate, alts = self.eggs_rate(), self.count("green")
         if rate is None:
             for key in ("per_min", "per_hour", "per_day"):
-                self.values[key].config(text="—")
-            self.hatch_hint.config(text="Type one alt's hatch speed, in the unit picked below the box.")
+                set_text(self.values[key], "—")
+            set_text(self.hatch_hint, "Type one alt's hatch speed, in the unit picked below the box.")
             return
         for key, total in zip(("per_min", "per_hour", "per_day"), hatch_totals(rate, alts)):
-            self.values[key].config(text=short_number(total))
-        self.hatch_hint.config(text=f"{alts} alt{'s' if alts != 1 else ''} in a game · "
+            set_text(self.values[key], short_number(total))
+        set_text(self.hatch_hint, f"{alts} alt{'s' if alts != 1 else ''} in a game · "
                                     f"{short_number(rate * 60)} per hour each")
 
     def count(self, color):
@@ -2787,8 +2828,8 @@ class LivePage(ttk.Frame):
 
     def update_headline(self):
         n, ingame, loading, hung = len(self.tiles), self.count("green"), self.count("yellow"), self.count("red")
-        self.big.config(text=str(ingame))
-        self.big_of.config(text=f" / {n}")
+        set_text(self.big, str(ingame))
+        set_text(self.big_of, f" / {n}")
         if not n:
             dot, text = C["muted"], "No Roblox windows"
         elif hung:
@@ -2797,15 +2838,19 @@ class LivePage(ttk.Frame):
             dot, text = C["yellow"], f"{loading} still loading"
         else:
             dot, text = C["green"], "Every window is in a game"
-        self.pill_dot.config(fg=dot)
-        self.pill_text.config(text=text)
+        set_text(self.pill_dot, fg=dot)
+        set_text(self.pill_text, text)
         for key, value in (("ingame", ingame), ("loading", loading), ("hung", hung)):
-            self.values[key].config(text=str(value))
-        self.summary.config(text=f"{n} window{'s' if n != 1 else ''} · {ingame} in a game · click a tile to "
+            set_text(self.values[key], str(value))
+        set_text(self.summary, f"{n} window{'s' if n != 1 else ''} · {ingame} in a game · click a tile to "
                                  "bring it to the front" if n else "Roblox windows show up here while they're open")
 
     def draw_ram_bar(self):
         bar = self.ram_bar
+        key = (None if self.ram_used is None else round(self.ram_used, 3), bar.winfo_width())
+        if key == getattr(self, "_ram_drawn", None):
+            return
+        self._ram_drawn = key
         bar.delete("all")
         if self.ram_used is None:
             return
@@ -2823,10 +2868,10 @@ class LivePage(ttk.Frame):
         usage = {pid: process_usage(pid) for pid in pids}
         cpu = self.cpu.percent({pid: u[0] for pid, u in usage.items() if u and u[0] is not None})
         rams = [u[1] if u else None for u in usage.values()]
-        self.values["cpu"].config(text="…" if cpu is None and pids else f"{cpu or 0:.0f}%")
-        self.values["ram"].config(text="—" if None in rams else f"{sum(rams) / 2 ** 30:.1f} GB")
+        set_text(self.values["cpu"], "…" if cpu is None and pids else f"{cpu or 0:.0f}%")
+        set_text(self.values["ram"], "—" if None in rams else f"{sum(rams) / 2 ** 30:.1f} GB")
         free, total = memory_status()
-        self.values["free"].config(text=f"{free / 2 ** 30:.1f} of {total / 2 ** 30:.0f} GB")
+        set_text(self.values["free"], f"{free / 2 ** 30:.1f} of {total / 2 ** 30:.0f} GB")
         self.ram_used = 1 - free / total if total else None
         self.draw_ram_bar()
         app = self.app
@@ -2834,10 +2879,10 @@ class LivePage(ttk.Frame):
         day = lambda f: h.total(f, 24)
         ingame, ok, failed = percent_of(day("ingame"), day("open")), day("launch_ok"), day("launch_fail")
         launch = percent_of(ok, ok + failed)
-        self.values["day_ingame"].config(text="—" if ingame is None else f"{ingame:.1f}%")
-        self.values["day_launch"].config(text="—" if launch is None else f"{launch:.1f}%")
-        self.values["day_pings"].config(text=short_number(day("pings")))
-        self.values["day_closed"].config(text=f"{day('closed'):g}")
+        set_text(self.values["day_ingame"], "—" if ingame is None else f"{ingame:.1f}%")
+        set_text(self.values["day_launch"], "—" if launch is None else f"{launch:.1f}%")
+        set_text(self.values["day_pings"], short_number(day("pings")))
+        set_text(self.values["day_closed"], f"{day('closed'):g}")
         self.sample_job = self.after(1000 if cpu is None and pids else self.SAMPLE_MS, self.sample)
 
     # ------------------------------------------------------------ tiles
@@ -2913,14 +2958,15 @@ class LivePage(ttk.Frame):
             x0 = (width - in_row * tile_w - (in_row - 1) * gap) // 2
             y0 = (height - rows * tile_h - (rows - 1) * gap) // 2
             tile.place(x=x0 + col * (tile_w + gap), y=max(y0, 0) + row * (tile_h + gap), width=tile_w, height=tile_h)
-        self.after_idle(self.place_thumbs)
+        self.after_idle(lambda: self.place_thumbs(settle=True))
 
-    def place_thumbs(self):
+    def place_thumbs(self, settle=False):
         """Puts each window's thumbnail over its tile's body, keeping the window's shape. Minimised
         and frozen windows get a note instead (DWM has no fresh picture of them)."""
         if not self.shown or not self.winfo_ismapped():
             return
-        self.update_idletasks()
+        if settle:   # tiles were just placed; make their positions final before reading them
+            self.update_idletasks()
         dest = _user32.GetParent(self.app.root.winfo_id())
         ox, oy = client_origin(dest)
         for hwnd, tile in self.tiles.items():
@@ -3010,9 +3056,10 @@ class LiveTile(tk.Frame):
 
     def set_note(self, text):
         if text:
-            self.note.config(text=text)
-            self.note.place(relx=0.5, rely=0.5, anchor="center")
-        else:
+            set_text(self.note, text)
+            if not self.note.winfo_manager():
+                self.note.place(relx=0.5, rely=0.5, anchor="center")
+        elif self.note.winfo_manager():
             self.note.place_forget()
 
 
@@ -3191,8 +3238,8 @@ class StatCard(tk.Frame):
         self.sub.pack(anchor="w")
 
     def set(self, value, sub="", color=None):
-        self.value.config(text=value, fg=color or C["fg"])
-        self.sub.config(text=sub)
+        set_text(self.value, value, fg=color or C["fg"])
+        set_text(self.sub, sub)
 
 
 class Chart(tk.Canvas):
@@ -3761,7 +3808,7 @@ class ProfilesPage(ttk.Frame):
             shown = ", ".join(names[:4]) + (f" +{len(names) - 4} more" if len(names) > 4 else "")
             self.tree.insert("", "end", iid=str(i), values=(
                 "   " + p["name"], f"   {len(names)}  ·  {shown}" if names else "   none left",
-                "   " + (p.get("place_name") or f"Place {p.get('place')}")))
+                "   " + (clean_name(p.get("place_name")) or f"Place {p.get('place')}")))
         if chosen and self.tree.exists(chosen):
             self.tree.selection_set(chosen)
         elif self.profiles():
@@ -4146,6 +4193,7 @@ class App:
         self.tree.bind("<Return>", lambda _e: self.join_selected())
         self.tree.bind("<Delete>", lambda _e: self.remove_selected())
         self.tree.bind("<Control-a>", lambda _e: self.tree.selection_set(self.account_rows()))
+        self.tree.bind("<Button-1>", self.tree_click)
         self.tree.bind("<<TreeviewOpen>>", lambda _e: self.group_toggled(True))
         self.tree.bind("<<TreeviewClose>>", lambda _e: self.group_toggled(False))
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self.update_join_label())
@@ -4231,7 +4279,7 @@ class App:
             (["muted"] if acc["id"] in self.flagged("muted") else [])
         fps = "".join(f" · {e}" for e in extras)
         if kind == 2:
-            where = p.get("lastLocation") or "a game"
+            where = clean_name(p.get("lastLocation")) or "a game"
             return (f"● In game · {where}" + ("" if running else " (another device)")
                     + (fps if running else "")), "ingame"
         if running:
@@ -4261,6 +4309,7 @@ class App:
             members = [a for a in self.accounts if self.group_of(a) == group]
             parents[group] = self.tree.insert(
                 "", "end", iid=GROUP_PREFIX + group, open=group not in collapsed, tags=("group",),
+                image=self.chevron(group not in collapsed),
                 values=(f"{group}   ·   {len(members)} account{'s' if len(members) != 1 else ''}", "", "", ""))
         stream = self.stream_var.get()   # names and avatars stay off screen
         for acc in self.accounts:
@@ -4301,10 +4350,24 @@ class App:
             rows += list(self.tree.get_children(iid)) if iid.startswith(GROUP_PREFIX) else [iid]
         return rows
 
-    def group_toggled(self, opened):
-        iid = self.tree.focus()
+    def chevron(self, opened):
+        return self.root.altvault_images["tree-open" if opened else "tree-closed"]
+
+    def tree_click(self, event):
+        """Clicking a group's chevron opens or closes it without selecting the whole group."""
+        row = self.tree.identify_row(event.y)
+        if row.startswith(GROUP_PREFIX) and "image" in self.tree.identify_element(event.x, event.y):
+            opened = not self.tree.item(row, "open")
+            self.tree.item(row, open=opened)
+            self.group_toggled(opened, row)
+            return "break"
+        return None
+
+    def group_toggled(self, opened, iid=None):
+        iid = iid or self.tree.focus()
         if not iid.startswith(GROUP_PREFIX):
             return
+        self.tree.item(iid, image=self.chevron(opened))
         collapsed = set(self.settings.get("collapsed_groups") or [])
         (collapsed.discard if opened else collapsed.add)(iid[len(GROUP_PREFIX):])
         self.settings["collapsed_groups"] = sorted(collapsed)
@@ -4347,14 +4410,16 @@ class App:
         return menu
 
     def recents(self):
-        items = self.settings.get("recents")
-        return [r for r in items if isinstance(r, dict) and "id" in r and "name" in r] \
-            if isinstance(items, list) else []
+        return self.saved_games("recents")
 
     def favorites(self):
-        items = self.settings.get("favorites")
-        return [f for f in items if isinstance(f, dict) and "id" in f and "name" in f] \
-            if isinstance(items, list) else []
+        return self.saved_games("favorites")
+
+    def saved_games(self, key):
+        """Saved recent or favourite games, with names made drawable (older saves kept emoji)."""
+        items = self.settings.get(key)
+        return [{**g, "name": clean_name(g["name"]) or f"Place {g['id']}"} for g in items
+                if isinstance(g, dict) and "id" in g and "name" in g] if isinstance(items, list) else []
 
     def update_recents_box(self):
         """Favourites first (starred), then recent games that aren't favourites."""
