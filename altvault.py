@@ -5,6 +5,7 @@ Everything lives in %LOCALAPPDATA%\\AltVault. Account cookies are encrypted with
 DPAPI (only your Windows user on this PC can decrypt them) and are never written to the log.
 """
 import base64
+import collections
 import ctypes
 import ctypes.wintypes as wt
 import hashlib
@@ -37,6 +38,7 @@ APP_DIR = os.path.join(os.environ["LOCALAPPDATA"], "AltVault")
 DATA_FILE = os.path.join(APP_DIR, "accounts.dat")
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
 AVATAR_DIR = os.path.join(APP_DIR, "avatars")
+ICON_DIR = os.path.join(APP_DIR, "game-icons")
 LOG_FILE = os.path.join(APP_DIR, "altvault.log")
 LEGACY_APP_DIR = os.path.join(os.environ["LOCALAPPDATA"], "PyRAM")   # AltVault's name before v2
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -689,6 +691,101 @@ class CpuMeter:
         return 100 * total / (os.cpu_count() or 1) if known else None
 
 
+_kernel32.GetSystemTimes.argtypes = [ctypes.POINTER(wt.FILETIME)] * 3
+
+
+def system_times():
+    """(idle, busy) CPU seconds for the whole PC since it started."""
+    idle, kernel, user = (wt.FILETIME() for _ in range(3))
+    _kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user))
+    i, k, u = ((t.dwHighDateTime << 32 | t.dwLowDateTime) / 1e7 for t in (idle, kernel, user))
+    return i, k + u - i   # kernel time includes idle time
+
+
+class PcMeter:
+    """The whole PC's CPU use between two calls, as a percentage (None on the first call)."""
+
+    def __init__(self):
+        self.last = None
+
+    def percent(self, times=None):
+        idle, busy = times or system_times()
+        last, self.last = self.last, (idle, busy)
+        if not last or idle + busy <= sum(last):
+            return None
+        return 100 * (busy - last[1]) / (idle + busy - sum(last))
+
+
+HISTORY_FILE = os.path.join(APP_DIR, "history.json")
+HISTORY_HOURS = 24 * 7
+
+
+class History:
+    """Hour-by-hour totals for the Stats and Pulse pages, kept for a week in history.json.
+    Only numbers are stored: never names, cookies or window titles."""
+
+    def __init__(self, path=None):
+        self.path = path or HISTORY_FILE
+        self.hours = {}   # hour number (Unix time // 3600) -> {field: total}
+        self.dirty = False
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                data = json.load(f)
+            self.hours = {int(h): {k: v for k, v in b.items() if isinstance(v, (int, float))}
+                          for h, b in data.items() if isinstance(b, dict)}
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+
+    @staticmethod
+    def hour(now=None):
+        return int((time.time() if now is None else now) // 3600)
+
+    def add(self, now=None, **amounts):
+        bucket = self.hours.setdefault(self.hour(now), {})
+        for field, n in amounts.items():
+            if n is not None:
+                bucket[field] = bucket.get(field, 0) + n
+        self.dirty = True
+
+    def series(self, field, hours, now=None, per=None):
+        """Oldest-first values of `field` for each of the last `hours` hours. With per='samples',
+        each is an average (field total / samples that hour), None where there were none."""
+        end = self.hour(now)
+        out = []
+        for h in range(end - hours + 1, end + 1):
+            bucket = self.hours.get(h, {})
+            if per:
+                n = bucket.get(per, 0)
+                out.append(bucket.get(field, 0) / n if n else None)
+            else:
+                out.append(bucket.get(field, 0))
+        return out
+
+    def sample(self, now=None, **values):
+        """Adds readings to be averaged: each value goes into its field, and 1 into field_n."""
+        known = {k: v for k, v in values.items() if v is not None}
+        self.add(now, **known, **{k + "_n": 1 for k in known})
+
+    def total(self, field, hours, now=None):
+        return sum(self.series(field, hours, now))
+
+    def save(self, now=None):
+        if not self.dirty:
+            return
+        oldest = self.hour(now) - HISTORY_HOURS
+        self.hours = {h: b for h, b in self.hours.items() if h > oldest}
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({str(h): b for h, b in sorted(self.hours.items())}, f)
+        os.replace(tmp, self.path)
+        self.dirty = False
+
+
+def percent_of(part, whole):
+    return None if not whole else 100 * part / whole
+
+
 def short_number(n):
     """1234 -> '1,234', 98765 -> '98.8K', 2500000 -> '2.5M'."""
     for above, size, suffix in ((1e12, 1e12, "T"), (1e9, 1e9, "B"), (1e6, 1e6, "M"), (1e4, 1e3, "K")):
@@ -758,13 +855,14 @@ ICON_SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
 ICON_VERSION = 1
 
 
-def _png(size, rgba):
+def _png(size, rgba, height=None):
     def chunk(kind, data):
         return (struct.pack(">I", len(data)) + kind + data
                 + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+    height = height or size
     stride = size * 4
-    raw = b"".join(b"\0" + rgba[y * stride:(y + 1) * stride] for y in range(size))
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
+    raw = b"".join(b"\0" + rgba[y * stride:(y + 1) * stride] for y in range(height))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, height, 8, 6, 0, 0, 0))
             + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
 
 
@@ -1788,40 +1886,170 @@ FONT = ("Segoe UI", 10)
 NAV_HOVER = "#35373c"
 
 
+def _rgb(color):
+    return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def _segment_distance(px, py, ax, ay, bx, by):
+    dx, dy = bx - ax, by - ay
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+    return math.hypot(px - ax - t * dx, py - ay - t * dy)
+
+
+TICK = ((0.26, 0.52), (0.43, 0.69), (0.75, 0.33))
+CHEVRON = ((0.3, 0.4), (0.5, 0.6), (0.7, 0.4))
+
+
+def shape_image(w, h, radius, fill=None, border=None, border_w=1.0, box=None, check=None, check_w=1.5, mark=TICK):
+    """A PNG (bytes) of an anti-aliased rounded rectangle, the building block of AltVault's
+    buttons, boxes, checkboxes and scrollbars. `box` is (x, y, w, h) inside the image (default:
+    all of it); `fill`/`border` are '#rrggbb' or None for see-through; `check` draws a tick in
+    that colour (or another two-stroke `mark`). Like the app icon, it's a signed-distance field, so edges are smooth at any size."""
+    bx, by, bw, bh = box or (0, 0, w, h)
+    fill_c, border_c, check_c = (_rgb(c) if c else None for c in (fill, border, check))
+    tick = [(bx + bw * fx, by + bh * fy) for fx, fy in mark]
+    out = bytearray()
+    for j in range(h):
+        y = j + 0.5
+        for i in range(w):
+            x = i + 0.5
+            qx = abs(x - bx - bw / 2) - (bw / 2 - radius)
+            qy = abs(y - by - bh / 2) - (bh / 2 - radius)
+            d = math.hypot(max(qx, 0), max(qy, 0)) + min(max(qx, qy), 0) - radius
+            outer = min(max(0.5 - d, 0), 1)
+            if not outer:
+                out += b"\0\0\0\0"
+                continue
+            inner = min(max(0.5 - (d + border_w), 0), 1) if border_c else 1
+            # Mix fill (inside) and border (the rim), tracking how opaque the result is.
+            rgb, alpha = (0, 0, 0), 0.0
+            if fill_c:
+                rgb, alpha = fill_c, inner
+            if border_c and inner < 1:
+                rim = 1 - inner
+                total = alpha + rim * (1 - alpha)
+                rgb = tuple((c1 * alpha + c2 * rim * (1 - alpha)) / total for c1, c2 in zip(rgb, border_c))
+                alpha = total
+            if check_c:
+                dist = min(_segment_distance(x, y, *tick[k], *tick[k + 1]) for k in (0, 1)) - check_w / 2
+                ink = min(max(0.5 - dist, 0), 1)
+                if ink:
+                    total = ink + alpha * (1 - ink)
+                    rgb = tuple((c2 * ink + c1 * alpha * (1 - ink)) / total for c1, c2 in zip(rgb, check_c))
+                    alpha = total
+            out += bytes((*(round(c) for c in rgb), round(255 * alpha * outer)))
+    return _png(w, bytes(out), h)
+
+
+# Colours of the drawn widgets, per state.
+BUTTON = {"normal": C["panel"], "active": "#35373c", "pressed": C["sel"], "disabled": "#232428"}
+ACCENT = {"normal": C["accent"], "active": "#4752c4", "pressed": "#3c45a5", "disabled": C["panel"]}
+PANEL_BUTTON = {"normal": C["field"], "active": C["sel"], "pressed": "#4a4c53", "disabled": "#303237"}
+
+
 def apply_theme(root, scale):
+    """Discord-like dark theme. Buttons, boxes, checkboxes and scrollbars are drawn as rounded
+    images with their own hover, pressed and focus looks; Tk's stock widgets are square and flat."""
     s = ttk.Style(root)
     s.theme_use("clam")
     root.configure(bg=C["bg"])
+    images = root.altvault_images = {}
+
+    def image(name, *args, **kw):
+        images[name] = tk.PhotoImage(master=root, data=base64.b64encode(shape_image(*args, **kw)))
+        return images[name]
+
+    r = max(round(6 * scale), 3)
+    side = 2 * r + 4
+
+    def button_element(name, colors):
+        imgs = {state: image(f"{name}-{state}", side, side, r, color) for state, color in colors.items()}
+        s.element_create(f"{name}.bg", "image", imgs["normal"], ("disabled", imgs["disabled"]),
+                         ("pressed", imgs["pressed"]), ("active", imgs["active"]), border=r + 1, sticky="nsew")
+        return f"{name}.bg"
+
     s.configure(".", background=C["bg"], foreground=C["fg"], fieldbackground=C["field"],
                 bordercolor=C["bg"], lightcolor=C["bg"], darkcolor=C["bg"], troughcolor=C["bg"],
                 focuscolor=C["accent"], selectbackground=C["accent"], selectforeground="white",
                 insertcolor=C["fg"], font=FONT)
-    s.configure("TButton", background=C["panel"], padding=(12, 6), borderwidth=0)
-    s.map("TButton", background=[("disabled", C["bg"]), ("pressed", C["sel"]), ("active", C["sel"])],
-          foreground=[("disabled", C["muted"])])
-    s.configure("Accent.TButton", background=C["accent"], foreground="white", font=("Segoe UI Semibold", 10))
-    s.map("Accent.TButton", background=[("disabled", C["panel"]), ("pressed", C["accent_hover"]),
-                                        ("active", C["accent_hover"])])
-    s.configure("TEntry", padding=6, borderwidth=0)
-    s.configure("TCombobox", padding=5, borderwidth=0, background=C["field"], arrowcolor=C["muted"])
-    s.map("TCombobox", fieldbackground=[("readonly", C["field"])], background=[("active", C["sel"])],
-          arrowcolor=[("active", C["fg"])])
+    for style, name, colors in (("TButton", "AVButton", BUTTON), ("Accent.TButton", "AVAccent", ACCENT),
+                                ("Panel.TButton", "AVPanelButton", PANEL_BUTTON)):
+        element = button_element(name, colors)
+        s.layout(style, [("Button.background", {"sticky": "nsew", "children": [(element, {"sticky": "nsew", "children": [
+            ("Button.padding", {"sticky": "nsew", "children": [("Button.label", {"sticky": "nsew"})]})]})]})])
+    s.configure("TButton", padding=(13, 5), borderwidth=0, anchor="center")
+    s.map("TButton", foreground=[("disabled", "#6d6f78")], background=[("active", C["bg"])])
+    s.configure("Accent.TButton", foreground="white", font=("Segoe UI Semibold", 10))
+    s.map("Accent.TButton", foreground=[("disabled", "#6d6f78")])
+    s.configure("Panel.TButton", background=C["panel"])
+    s.map("Panel.TButton", background=[("active", C["panel"])])
+
+    # Text boxes and drop-downs: a rounded field whose rim lights up on hover and on focus.
+    field = {"normal": image("field", side, side, r, C["field"]),
+             "hover": image("field-hover", side, side, r, C["field"], "#55575f"),
+             "focus": image("field-focus", side, side, r, C["field"], C["accent"], border_w=max(1.5 * scale, 1.2))}
+    s.element_create("AVField.field", "image", field["normal"], ("focus", field["focus"]),
+                     ("hover", field["hover"]), border=r + 1, sticky="nsew")
+    s.layout("TEntry", [("AVField.field", {"sticky": "nsew", "children": [
+        ("Entry.padding", {"sticky": "nsew", "children": [("Entry.textarea", {"sticky": "nsew"})]})]})])
+    s.configure("TEntry", padding=(8, 6), borderwidth=0)
+    s.layout("TCombobox", [("AVField.field", {"sticky": "nsew", "children": [
+        ("AVCombo.arrow", {"side": "right", "sticky": ""}),
+        ("Combobox.padding", {"sticky": "nsew", "children": [("Combobox.textarea", {"sticky": "nsew"})]})]})])
+    aw = max(round(22 * scale), 16)
+    chevrons = [image(f"chevron{i}", aw, aw, 0, None, check=color, check_w=1.6 * scale, mark=CHEVRON,
+                      box=(aw * 0.22, aw * 0.22, aw * 0.56, aw * 0.56)) for i, color in enumerate((C["muted"], C["fg"]))]
+    s.element_create("AVCombo.arrow", "image", chevrons[0], ("hover", chevrons[1]), ("focus", chevrons[1]))
+    s.configure("TCombobox", padding=(8, 5), borderwidth=0, background=C["field"], arrowcolor=C["muted"],
+                arrowsize=int(12 * scale))
+    s.map("TCombobox", fieldbackground=[("readonly", C["field"])], background=[("active", C["field"])],
+          arrowcolor=[("active", C["fg"])], selectbackground=[("readonly", C["field"])],
+          selectforeground=[("readonly", C["fg"])])
     root.option_add("*TCombobox*Listbox.background", C["field"])
     root.option_add("*TCombobox*Listbox.foreground", C["fg"])
     root.option_add("*TCombobox*Listbox.selectBackground", C["accent"])
+    root.option_add("*TCombobox*Listbox.borderWidth", 0)
     root.option_add("*TCombobox*Listbox.font", FONT)
-    s.configure("TCheckbutton", indicatorbackground=C["field"], indicatorforeground="white", padding=2)
-    s.map("TCheckbutton", indicatorbackground=[("selected", C["accent"])], background=[("active", C["bg"])])
+
+    # Checkboxes: a rounded square that fills with the accent colour and a tick when on.
+    box = max(round(17 * scale), 12)
+    gap = round(8 * scale)
+    br = max(round(4 * scale), 2)
+    rim = max(1.4 * scale, 1.1)
+    kw = {"box": (0.5, 0.5, box - 1, box - 1)}
+    checks = {"off": image("check-off", box + gap, box, br, None, "#80848e", border_w=rim, **kw),
+              "off-hover": image("check-off-hover", box + gap, box, br, None, C["fg"], border_w=rim, **kw),
+              "on": image("check-on", box + gap, box, br, C["accent"], check="#ffffff", check_w=1.8 * scale, **kw),
+              "on-hover": image("check-on-hover", box + gap, box, br, "#6b77ff", check="#ffffff",
+                                check_w=1.8 * scale, **kw)}
+    s.element_create("AVCheck.indicator", "image", checks["off"], ("selected active", checks["on-hover"]),
+                     ("selected", checks["on"]), ("active", checks["off-hover"]), sticky="w")
+    s.layout("TCheckbutton", [("Checkbutton.padding", {"sticky": "nsew", "children": [
+        ("AVCheck.indicator", {"side": "left", "sticky": ""}),
+        ("Checkbutton.label", {"side": "left", "sticky": "nsew"})]})])
+    s.configure("TCheckbutton", padding=(0, 3))
+    s.map("TCheckbutton", background=[("active", C["bg"])], foreground=[("active", "#ffffff")])
+
+    # Slim scrollbars: a rounded thumb, no arrows.
+    tw, th = max(round(10 * scale), 8), max(round(24 * scale), 16)
+    inset = max(round(2.5 * scale), 2)
+    thumb_box = (inset, inset, tw - 2 * inset, th - 2 * inset)
+    thumb = image("thumb", tw, th, (tw - 2 * inset) / 2, "#4e5058", box=thumb_box)
+    thumb_hover = image("thumb-hover", tw, th, (tw - 2 * inset) / 2, "#6d6f78", box=thumb_box)
+    s.element_create("AVScroll.thumb", "image", thumb, ("active", thumb_hover), ("pressed", thumb_hover),
+                     border=(0, tw // 2 + 1), sticky="nsew")
+    s.layout("Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+        ("AVScroll.thumb", {"expand": "1", "sticky": "nsew"})]})])
+    s.configure("Vertical.TScrollbar", troughcolor=C["panel"], background=C["panel"], borderwidth=0,
+                arrowsize=tw)
+
     s.configure("Treeview", background=C["panel"], fieldbackground=C["panel"], borderwidth=0,
                 rowheight=int(50 * scale))
     s.map("Treeview", background=[("selected", C["sel"])], foreground=[("selected", C["fg"])])
     s.configure("Treeview.Heading", background=C["panel"], foreground=C["muted"], borderwidth=0,
                 padding=(6, 6), font=("Segoe UI Semibold", 9))
-    s.map("Treeview.Heading", background=[("active", C["panel"])])
+    s.map("Treeview.Heading", background=[("active", C["panel"])], foreground=[("active", C["fg"])])
     s.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
-    s.configure("Vertical.TScrollbar", background=C["sel"], troughcolor=C["panel"], arrowcolor=C["muted"],
-                bordercolor=C["panel"], lightcolor=C["sel"], darkcolor=C["sel"], borderwidth=0)
-    s.map("Vertical.TScrollbar", background=[("active", C["field"])])
     s.configure("Muted.TLabel", foreground=C["muted"])
     s.configure("Small.TLabel", foreground=C["muted"], font=("Segoe UI", 9))
     s.configure("Title.TLabel", font=("Segoe UI Semibold", 16))
@@ -1829,6 +2057,10 @@ def apply_theme(root, scale):
     s.configure("Error.TLabel", foreground=C["red"])
     s.configure("Hint.TLabel", background=C["field"], foreground=C["muted"])
     s.configure("Success.TLabel", foreground=C["green"])
+    s.configure("Panel.TLabel", background=C["panel"])
+    s.configure("PanelMuted.TLabel", background=C["panel"], foreground=C["muted"])
+    s.configure("PanelSmall.TLabel", background=C["panel"], foreground=C["muted"], font=("Segoe UI", 9))
+    s.configure("Card.TFrame", background=C["panel"])
 
 
 def add_placeholder(entry, var, text):
@@ -1841,15 +2073,15 @@ def add_placeholder(entry, var, text):
         if var.get():
             hint.place_forget()
         else:
-            hint.place(x=7, rely=0.5, anchor="w")
+            hint.place(x=9, rely=0.5, anchor="w")
     var.trace_add("write", update)
     update()
     return hint
 
 
 def themed_menu(root):
-    return tk.Menu(root, tearoff=0, bg=C["panel"], fg=C["fg"], activebackground=C["accent"],
-                   activeforeground="white", bd=0, font=FONT)
+    return tk.Menu(root, tearoff=0, bg="#111214", fg=C["fg"], activebackground=C["accent"],
+                   activeforeground="white", bd=0, relief="flat", activeborderwidth=4, font=FONT)
 
 
 # ---------------------------------------------------------------- UI
@@ -2293,12 +2525,14 @@ class LivePage(ttk.Frame):
             return tk.Label(parent, text=text, bg=P, fg=fg, font=font, **kw)
 
         def section(title):
-            label(self.panel, title, font=("Segoe UI Semibold", 9)).pack(anchor="w", padx=pad,
-                                                                         pady=(int(14 * s), int(2 * s)))
+            row = tk.Frame(self.panel, bg=P)
+            row.pack(fill="x", padx=pad, pady=(int(11 * s), int(1 * s)))
+            label(row, title, font=("Segoe UI Semibold", 9)).pack(side="left")
+            return row
 
         def stat(key, text, dot=None):
             row = tk.Frame(self.panel, bg=P)
-            row.pack(fill="x", padx=pad, pady=(int(2 * s), 0))
+            row.pack(fill="x", padx=pad, pady=(int(1 * s), 0))
             if dot:
                 label(row, "●", fg=dot, font=small).pack(side="left", padx=(0, int(6 * s)))
             label(row, text, fg=C["muted"] if not dot else C["fg"]).pack(side="left")
@@ -2307,8 +2541,8 @@ class LivePage(ttk.Frame):
 
         # Headline: how many windows are in a game, and a one-line verdict.
         top = tk.Frame(self.panel, bg=P)
-        top.pack(fill="x", padx=pad, pady=(pad, 0))
-        self.big = label(top, "0", font=("Segoe UI Semibold", 24))
+        top.pack(fill="x", padx=pad, pady=(int(10 * s), 0))
+        self.big = label(top, "0", font=("Segoe UI Semibold", 22))
         self.big.pack(side="left")
         self.big_of = label(top, " / 0", fg=C["muted"], font=("Segoe UI Semibold", 14))
         self.big_of.pack(side="left", anchor="s", pady=(0, int(5 * s)))
@@ -2357,9 +2591,16 @@ class LivePage(ttk.Frame):
         self.hatch_hint.pack(anchor="w", padx=pad, pady=(int(3 * s), 0))
         self.paint_units()
 
-        section("Anti-AFK")
-        stat("afk_last", "Last ping")
-        stat("afk_next", "Next ping")
+        head = section("Last 24 hours")
+        link = label(head, "Open Stats  ›", fg=C["accent_text"], font=small, cursor="hand2")
+        link.pack(side="right")
+        link.bind("<Button-1>", lambda _e: self.app.show_page("stats"))
+        link.bind("<Enter>", lambda _e: link.config(fg=C["fg"], font=small + ("underline",)))
+        link.bind("<Leave>", lambda _e: link.config(fg=C["accent_text"], font=small))
+        stat("day_ingame", "In a game", C["green"])
+        stat("day_launch", "Launches that worked", C["accent"])
+        stat("day_pings", "Anti-AFK pings", C["accent_text"])
+        stat("day_closed", "Closed outside AltVault", C["red"])
 
     def set_unit(self, unit):
         self.unit = unit
@@ -2452,10 +2693,14 @@ class LivePage(ttk.Frame):
         self.ram_used = 1 - free / total if total else None
         self.draw_ram_bar()
         app = self.app
-        last, nxt = app.afk_last_ping_at, app.afk_next_at
-        self.values["afk_last"].config(text=time.strftime("%H:%M", time.localtime(last)) if last else "—")
-        self.values["afk_next"].config(text=time.strftime("~%H:%M", time.localtime(nxt))
-                                       if app.anti_afk_var.get() and nxt else "off" if not app.anti_afk_var.get() else "—")
+        h = app.history
+        day = lambda f: h.total(f, 24)
+        ingame, ok, failed = percent_of(day("ingame"), day("open")), day("launch_ok"), day("launch_fail")
+        launch = percent_of(ok, ok + failed)
+        self.values["day_ingame"].config(text="—" if ingame is None else f"{ingame:.1f}%")
+        self.values["day_launch"].config(text="—" if launch is None else f"{launch:.1f}%")
+        self.values["day_pings"].config(text=short_number(day("pings")))
+        self.values["day_closed"].config(text=f"{day('closed'):g}")
         self.sample_job = self.after(1000 if cpu is None and pids else self.SAMPLE_MS, self.sample)
 
     # ------------------------------------------------------------ tiles
@@ -2570,7 +2815,7 @@ class LivePage(ttk.Frame):
         tile = self.tiles.get(hwnd)
         if tile and messagebox.askyesno("Close Roblox", f"Close {tile.label.cget('text')}'s Roblox window?",
                                         parent=self.app.root):
-            kill_process(tile.pid)
+            self.app.close_windows([tile.pid])
 
 
 class LiveTile(tk.Frame):
@@ -2597,6 +2842,8 @@ class LiveTile(tk.Frame):
             btn.bind("<Enter>", lambda _e, b=btn: b.config(fg=C["fg"], bg=C["sel"]))
             btn.bind("<Leave>", lambda _e, b=btn: b.config(fg=C["muted"], bg=C["panel"]))
             btn.bind("<Button-1>", lambda _e, a=action: a(hwnd) or "break")
+            btn.bind("<Enter>", lambda _e: self.config(bg="#5c5f66"), add="+")
+            btn.bind("<Leave>", self.leave, add="+")
         self.dot = tk.Label(head, text="●", font=("Segoe UI", 9), bg=C["panel"], fg=C["muted"])
         self.dot.pack(side="left", padx=(int(8 * s), 0))
         self.label = tk.Label(head, text="", font=("Segoe UI Semibold", 9), bg=C["panel"], fg=C["fg"], anchor="w")
@@ -2606,6 +2853,16 @@ class LiveTile(tk.Frame):
         self.note = tk.Label(self.body, text="", bg="#111214", fg=C["muted"], font=FONT)
         for widget in (self, head, self.dot, self.label, self.body, self.note):
             widget.bind("<Button-1>", lambda _e: page.show_window(hwnd))
+            widget.bind("<Enter>", lambda _e: self.config(bg="#5c5f66"), add="+")
+            widget.bind("<Leave>", self.leave, add="+")
+
+    def leave(self, _event):
+        """The outline stays lit while the pointer is anywhere on the tile, buttons included."""
+        under = self.winfo_containing(*self.winfo_pointerxy())
+        while under is not None and under is not self:
+            under = under.master
+        if under is None:
+            self.config(bg=C["panel"])
 
     def update_state(self, color, name):
         if color != self.color:
@@ -2737,6 +2994,776 @@ class ServerBrowser(tk.Toplevel):
         self.join(server["id"])
 
 
+def blend(c1, c2, t):
+    """The colour t of the way from c1 to c2."""
+    a, b = _rgb(c1), _rgb(c2)
+    return "#%02x%02x%02x" % tuple(round(x + (y - x) * t) for x, y in zip(a, b))
+
+
+def page_header(page, title, subtitle):
+    """A page's title over a one-line explanation. Returns the header frame (for extra controls
+    on the right) and the subtitle label."""
+    header = ttk.Frame(page)
+    header.pack(fill="x")
+    text = ttk.Frame(header)
+    text.pack(side="left", fill="x", expand=True)
+    ttk.Label(text, text=title, style="Title.TLabel").pack(anchor="w")
+    sub = ttk.Label(text, text=subtitle, style="Small.TLabel")
+    sub.pack(anchor="w")
+    return header, sub
+
+
+class Segmented(tk.Frame):
+    """A row of mutually exclusive options (like '24 hours | 7 days') with hover and selected looks."""
+
+    def __init__(self, parent, options, value, command, scale, bg=None, font=("Segoe UI", 9)):
+        super().__init__(parent, bg=C["field"], padx=2, pady=2)
+        self.value, self.command, self.labels = value, command, {}
+        for key, text in options:
+            lbl = tk.Label(self, text=text, bg=C["field"], fg=C["muted"], font=font, cursor="hand2",
+                           padx=int(10 * scale), pady=int(3 * scale))
+            lbl.pack(side="left", fill="x", expand=True)
+            lbl.bind("<Button-1>", lambda _e, k=key: self.set(k, notify=True))
+            lbl.bind("<Enter>", lambda _e, k=key: self.paint(hover=k))
+            lbl.bind("<Leave>", lambda _e: self.paint())
+            self.labels[key] = lbl
+        self.paint()
+
+    def set(self, key, notify=False):
+        self.value = key
+        self.paint(hover=key)
+        if notify:
+            self.command(key)
+
+    def paint(self, hover=None):
+        for key, lbl in self.labels.items():
+            on = key == self.value
+            lbl.config(bg=C["sel"] if on else NAV_HOVER if key == hover else C["field"],
+                       fg=C["fg"] if on or key == hover else C["muted"])
+
+
+class StatCard(tk.Frame):
+    """A panel with a small title, one big number and a line under it."""
+
+    def __init__(self, parent, title, scale):
+        super().__init__(parent, bg=C["panel"], padx=int(16 * scale), pady=int(12 * scale))
+        tk.Label(self, text=title, bg=C["panel"], fg=C["muted"], font=("Segoe UI", 9)).pack(anchor="w")
+        self.value = tk.Label(self, text="—", bg=C["panel"], fg=C["fg"], font=("Segoe UI Semibold", 20))
+        self.value.pack(anchor="w")
+        self.sub = tk.Label(self, text="", bg=C["panel"], fg=C["muted"], font=("Segoe UI", 9))
+        self.sub.pack(anchor="w")
+
+    def set(self, value, sub="", color=None):
+        self.value.config(text=value, fg=color or C["fg"])
+        self.sub.config(text=sub)
+
+
+class Chart(tk.Canvas):
+    """A line or bar chart on a canvas. Hovering shows the values under the pointer. Series are
+    [(values, colour, name)], oldest first; None means no data for that point."""
+
+    def __init__(self, parent, scale, kind="line", unit="%", top=None):
+        super().__init__(parent, bg=C["panel"], highlightthickness=0, bd=0, height=int(150 * scale))
+        self.scale, self.kind, self.unit, self.fixed_top = scale, kind, unit, top
+        self.series, self.labels, self.point_labels = [], ("", ""), []
+        self.bind("<Configure>", lambda _e: self.draw())
+        self.bind("<Motion>", self.hover)
+        self.bind("<Leave>", lambda _e: self.delete("hover"))
+
+    def set(self, series, labels, point_labels=()):
+        self.series, self.labels, self.point_labels = series, labels, list(point_labels)
+        self.draw()
+
+    def geometry(self):
+        s = self.scale
+        return int(40 * s), int(22 * s), max(self.winfo_width() - int(10 * s), 1), max(self.winfo_height() - int(22 * s), 1)
+
+    def top(self):
+        if self.fixed_top:
+            return self.fixed_top
+        peak = max([v for values, _, _ in self.series for v in values if v is not None] or [0])
+        if peak <= 0:
+            return 1
+        step = 10 ** math.floor(math.log10(peak))
+        return next(m * step for m in (1, 2, 2.5, 5, 10) if m * step >= peak)
+
+    def fmt(self, v):
+        return f"{v:.0f}{self.unit}" if self.unit == "%" else short_number(v) + self.unit
+
+    def x_of(self, i, n, left, right):
+        if self.kind == "bars":
+            return left + (i + 0.5) * (right - left) / n
+        return left + i * (right - left) / max(n - 1, 1)
+
+    def draw(self):
+        self.delete("all")
+        left, top_y, right, bottom = self.geometry()
+        if right - left < 20 or bottom - top_y < 20:
+            return
+        top = self.top()
+        small = ("Segoe UI", 8)
+        for frac in (0, 0.5, 1):
+            y = bottom - frac * (bottom - top_y)
+            self.create_line(left, y, right, y, fill="#35373c")
+            self.create_text(left - int(6 * self.scale), y, text=self.fmt(top * frac), anchor="e", fill=C["muted"], font=small)
+        self.create_text(left, bottom + int(4 * self.scale), text=self.labels[0], anchor="nw", fill=C["muted"], font=small)
+        self.create_text(right, bottom + int(4 * self.scale), text=self.labels[1], anchor="ne", fill=C["muted"], font=small)
+        x = right   # legend, right-aligned above the chart
+        for _, color, name in reversed(self.series):
+            item = self.create_text(x, int(9 * self.scale), text=name, anchor="e", fill=C["muted"], font=small)
+            x = self.bbox(item)[0] - int(6 * self.scale)
+            dot = int(4 * self.scale)
+            self.create_oval(x - 2 * dot, int(9 * self.scale) - dot, x, int(9 * self.scale) + dot, fill=color, width=0)
+            x -= 2 * dot + int(14 * self.scale)
+        n = max((len(v) for v, _, _ in self.series), default=0)
+        if not n:
+            return
+        y_of = lambda v: bottom - min(v / top, 1) * (bottom - top_y)
+        if self.kind == "bars":
+            width = max((right - left) / n * 0.62, 1)
+            for values, color, _ in self.series:   # later series are drawn over earlier ones
+                for i, v in enumerate(values):
+                    if v:
+                        cx = self.x_of(i, n, left, right)
+                        self.create_rectangle(cx - width / 2, y_of(v), cx + width / 2, bottom, fill=color, width=0)
+            return
+        for values, color, _ in self.series:
+            runs, run = [], []
+            for i, v in enumerate(values):
+                if v is None:
+                    if run:
+                        runs.append(run)
+                    run = []
+                else:
+                    run.append((self.x_of(i, n, left, right), y_of(v)))
+            if run:
+                runs.append(run)
+            for run in runs:
+                if len(run) == 1:
+                    (px, py), = run
+                    self.create_oval(px - 2, py - 2, px + 2, py + 2, fill=color, width=0)
+                    continue
+                area = [run[0][0], bottom] + [c for pt in run for c in pt] + [run[-1][0], bottom]
+                self.create_polygon(area, fill=blend(C["panel"], color, 0.18), width=0)
+                self.create_line([c for pt in run for c in pt], fill=color, width=max(2 * self.scale, 1.5))
+
+    def hover(self, event):
+        self.delete("hover")
+        left, top_y, right, bottom = self.geometry()
+        n = max((len(v) for v, _, _ in self.series), default=0)
+        if not n or not left <= event.x <= right:
+            return
+        if self.kind == "bars":
+            i = min(int((event.x - left) / (right - left) * n), n - 1)
+        else:
+            i = round((event.x - left) / (right - left) * (n - 1))
+        x = self.x_of(i, n, left, right)
+        self.create_line(x, top_y, x, bottom, fill=C["muted"], dash=(2, 3), tags="hover")
+        lines = [self.point_labels[i]] if i < len(self.point_labels) else []
+        lines += [f"{name}: {'—' if values[i] is None else self.fmt(values[i])}" for values, _, name in self.series]
+        text = self.create_text(0, 0, text="\n".join(lines), anchor="nw", fill=C["fg"], font=("Segoe UI", 8),
+                                justify="left", tags="hover")
+        x0, y0, x1, y1 = self.bbox(text)
+        pad = int(6 * self.scale)
+        tx = x + pad * 2 if x + pad * 2 + (x1 - x0) < right else x - pad * 2 - (x1 - x0)
+        self.coords(text, tx, top_y + pad)
+        x0, y0, x1, y1 = self.bbox(text)
+        box = self.create_rectangle(x0 - pad, y0 - pad, x1 + pad, y1 + pad, fill="#111214", outline=C["sel"], tags="hover")
+        self.tag_raise(text, box)
+
+
+def chart_card(parent, title, chart_args, scale):
+    """A panel holding a titled chart; returns (frame, chart)."""
+    card = tk.Frame(parent, bg=C["panel"], padx=int(16 * scale), pady=int(12 * scale))
+    tk.Label(card, text=title, bg=C["panel"], fg=C["fg"], font=("Segoe UI Semibold", 10)).pack(anchor="w")
+    chart = Chart(card, scale, **chart_args)
+    chart.pack(fill="both", expand=True, pady=(int(4 * scale), 0))
+    return card, chart
+
+
+def hour_labels(hours, now=None):
+    """Hover labels for hourly points, oldest first: 'Tue 14:00'."""
+    end = History.hour(now)
+    return [time.strftime("%a %H:00", time.localtime(h * 3600)) for h in range(end - hours + 1, end + 1)]
+
+
+RANGES = (("day", "24 hours"), ("week", "7 days"))
+RANGE_HOURS = {"day": 24, "week": 24 * 7}
+
+
+class StatsPage(ttk.Frame):
+    """How the farm has been doing: time in game, launches, Anti-AFK and unexpected closes, from
+    History's hourly totals. Redrawn when shown and once a minute while visible."""
+
+    def __init__(self, app, parent):
+        super().__init__(parent)
+        self.app, self.job = app, None
+        s = app.scale
+        header, _ = page_header(self, "Stats", "How your accounts have been doing. Counted by AltVault while it runs.")
+        self.range = Segmented(header, RANGES, "day", lambda _k: self.refresh(), s)
+        self.range.pack(side="right", anchor="s")
+        cards = ttk.Frame(self)
+        cards.pack(fill="x", pady=(int(14 * s), 0))
+        self.cards = {}
+        for i, (key, title) in enumerate((("ingame", "Time in a game"), ("launches", "Launches that worked"),
+                                          ("pings", "Anti-AFK pings"), ("closed", "Closed outside AltVault"))):
+            self.cards[key] = StatCard(cards, title, s)
+            self.cards[key].grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else int(10 * s), 0))
+            cards.columnconfigure(i, weight=1, uniform="card")
+        charts = ttk.Frame(self)
+        charts.pack(fill="both", expand=True, pady=(int(10 * s), 0))
+        card, self.windows_chart = chart_card(charts, "Roblox windows", {"kind": "bars", "unit": ""}, s)
+        card.pack(fill="both", expand=True)
+        card, self.afk_chart = chart_card(charts, "Anti-AFK", {"kind": "bars", "unit": ""}, s)
+        card.pack(fill="both", expand=True, pady=(int(10 * s), 0))
+
+    def on_show(self):
+        self.refresh()
+
+    def on_hide(self):
+        if self.job:
+            self.after_cancel(self.job)
+            self.job = None
+
+    def refresh(self):
+        if self.job:
+            self.after_cancel(self.job)
+        self.job = self.after(60_000, self.refresh)
+        h = self.app.history
+        hours = RANGE_HOURS[self.range.value]
+        span = "24 hours" if hours == 24 else "7 days"
+        total = lambda f: h.total(f, hours)
+        ingame = percent_of(total("ingame"), total("open"))
+        self.cards["ingame"].set("—" if ingame is None else f"{ingame:.1f}%",
+                                 f"of the time Roblox was open, last {span}",
+                                 None if ingame is None else C["green"] if ingame >= 95 else C["yellow"] if ingame >= 80 else C["red"])
+        ok, failed = total("launch_ok"), total("launch_fail")
+        rate = percent_of(ok, ok + failed)
+        self.cards["launches"].set("—" if rate is None else f"{rate:.1f}%",
+                                   f"{ok + failed:g} launch{'es' if ok + failed != 1 else ''}, {failed:g} failed")
+        pings, missed = total("pings"), total("missed")
+        self.cards["pings"].set(short_number(pings), f"{missed:g} missed and retried")
+        closed = total("closed")
+        self.cards["closed"].set(f"{closed:g}", "crashes, kicks or closed by hand",
+                                 C["red"] if closed else None)
+        labels = hour_labels(hours)
+        ends = (f"{span} ago", "now")
+        self.windows_chart.set([(h.series("open", hours, per="open_n"), "#4e5058", "Open"),
+                                (h.series("ingame", hours, per="ingame_n"), C["green"], "In a game")], ends, labels)
+        self.afk_chart.set([(h.series("pings", hours), C["accent"], "Pings"),
+                            (h.series("missed", hours), C["red"], "Missed")], ends, labels)
+
+
+PULSE_RANGES = (("hour", "Last hour"), ("day", "24 hours"), ("week", "7 days"))
+
+
+class PulsePage(ttk.Frame):
+    """Your PC and Roblox: CPU and memory now (every 2 s while this page is open) and over time
+    (a sample a minute, kept by App whether or not the page is open)."""
+
+    LIVE_MS = 2000
+
+    def __init__(self, app, parent):
+        super().__init__(parent)
+        self.app, self.job = app, None
+        self.pc, self.rbx = PcMeter(), CpuMeter()
+        s = app.scale
+        header, _ = page_header(self, "Pulse", "Your PC and Roblox. Live while this page is open, "
+                                "and sampled once a minute otherwise.")
+        self.range = Segmented(header, PULSE_RANGES, "hour", lambda _k: self.draw_charts(), s)
+        self.range.pack(side="right", anchor="s")
+        cards = ttk.Frame(self)
+        cards.pack(fill="x", pady=(int(14 * s), 0))
+        self.cards = {}
+        for i, (key, title) in enumerate((("pc_cpu", "PC CPU"), ("pc_ram", "PC memory"),
+                                          ("rbx_cpu", "Roblox CPU"), ("rbx_ram", "Roblox memory"))):
+            self.cards[key] = StatCard(cards, title, s)
+            self.cards[key].grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else int(10 * s), 0))
+            cards.columnconfigure(i, weight=1, uniform="card")
+        charts = ttk.Frame(self)
+        charts.pack(fill="both", expand=True, pady=(int(10 * s), 0))
+        card, self.cpu_chart = chart_card(charts, "CPU", {"top": 100}, s)
+        card.pack(fill="both", expand=True)
+        card, self.ram_chart = chart_card(charts, "Memory", {"top": 100}, s)
+        card.pack(fill="both", expand=True, pady=(int(10 * s), 0))
+
+    def on_show(self):
+        self.pc.last = None
+        self.rbx.last.clear()
+        self.live()
+        self.draw_charts()
+
+    def on_hide(self):
+        if self.job:
+            self.after_cancel(self.job)
+            self.job = None
+
+    def live(self):
+        self.job = None
+        if self.app.root.state() in ("iconic", "withdrawn") or self.app.page != "pulse":
+            return
+        sample = measure(roblox_windows(), self.pc, self.rbx)
+        free, total = sample["free"], sample["total"]
+        gb = 2 ** 30
+        fmt = lambda v: "…" if v is None else f"{v:.0f}%"
+        self.cards["pc_cpu"].set(fmt(sample["pc_cpu"]), f"{os.cpu_count() or 1} logical processors")
+        self.cards["pc_ram"].set(fmt(sample["pc_ram"]), f"{(total - free) / gb:.1f} of {total / gb:.0f} GB in use",
+                                 C["red"] if free < 0.1 * total else C["yellow"] if free < 0.25 * total else None)
+        n = sample["windows"]
+        self.cards["rbx_cpu"].set(fmt(sample["rbx_cpu"]) if n else "—", f"{n} window{'s' if n != 1 else ''}")
+        ram = sample["rbx_bytes"]
+        self.cards["rbx_ram"].set("—" if ram is None or not n else f"{ram / gb:.1f} GB",
+                                  f"{ram / n / 2 ** 20:,.0f} MB per window" if ram and n else "")
+        self.job = self.after(self.LIVE_MS, self.live)
+
+    def draw_charts(self):
+        h = self.app.history
+        key = self.range.value
+        if key == "hour":
+            recent = list(self.app.recent)
+            now = time.time()
+            ends = ("60 min ago", "now")
+            # One point per minute; the newest samples go on the right, gaps stay empty.
+            slots = {round((now - t) / 60): sample for t, sample in recent}
+            points = [slots.get(m) for m in range(59, -1, -1)]
+            pick = lambda f: [p[f] if p else None for p in points]
+            labels = [time.strftime("%H:%M", time.localtime(now - m * 60)) for m in range(59, -1, -1)]
+            cpu = [(pick("pc_cpu"), C["accent"], "PC"), (pick("rbx_cpu"), C["green"], "Roblox")]
+            ram = [(pick("pc_ram"), C["accent"], "PC"), (pick("rbx_ram"), C["green"], "Roblox")]
+        else:
+            hours = RANGE_HOURS[key]
+            ends = ("24 hours ago" if key == "day" else "7 days ago", "now")
+            labels = hour_labels(hours)
+            avg = lambda f: h.series(f, hours, per=f + "_n")
+            cpu = [(avg("pc_cpu"), C["accent"], "PC"), (avg("rbx_cpu"), C["green"], "Roblox")]
+            ram = [(avg("pc_ram"), C["accent"], "PC"), (avg("rbx_ram"), C["green"], "Roblox")]
+        self.cpu_chart.set(cpu, ends, labels)
+        self.ram_chart.set(ram, ends, labels)
+
+
+def measure(windows, pc_meter, rbx_meter):
+    """One reading of the PC and the Roblox windows. CPU values are None on a meter's first call."""
+    usage = {pid: process_usage(pid) for _, pid, _ in windows}
+    rams = [u[1] if u else None for u in usage.values()]
+    free, total = memory_status()
+    rbx_bytes = None if None in rams else sum(rams)
+    return {"windows": len(windows), "free": free, "total": total,
+            "pc_cpu": pc_meter.percent(), "pc_ram": percent_of(total - free, total),
+            "rbx_cpu": rbx_meter.percent({pid: u[0] for pid, u in usage.items() if u and u[0] is not None})
+            if usage else 0.0,
+            "rbx_bytes": rbx_bytes, "rbx_ram": percent_of(rbx_bytes, total) if rbx_bytes is not None else None}
+
+
+def get_game_icons(place_ids):
+    """{place_id (str): png_bytes} of games' icons. Public, so no cookie is sent."""
+    ids = ",".join(str(int(i)) for i in place_ids)
+    status, _, body = _request("https://thumbnails.roblox.com/v1/places/gameicons"
+                               f"?placeIds={ids}&returnPolicy=PlaceHolder&size=50x50&format=Png&isCircular=false")
+    if status != 200:
+        return {}
+    result = {}
+    for item in json.loads(body).get("data", []):
+        if item.get("state") == "Completed" and item.get("imageUrl"):
+            img_status, _, png = _request(item["imageUrl"])
+            if img_status == 200:
+                result[str(item["targetId"])] = png
+    return result
+
+
+class GamesPage(ttk.Frame):
+    """Favourite and recent games in one list, with their icons. Pick one to join it from the
+    Accounts page, browse its servers, star it, or open it on roblox.com."""
+
+    def __init__(self, app, parent):
+        super().__init__(parent)
+        self.app = app
+        self.icons = {}   # place id -> PhotoImage
+        s = app.scale
+        page_header(self, "Games", "Favourites first, then the games you've played. Double-click one to pick it for joining.")
+        add = ttk.Frame(self)
+        add.pack(fill="x", pady=(int(14 * s), 0))
+        self.add_var = tk.StringVar()
+        entry = ttk.Entry(add, textvariable=self.add_var)
+        entry.pack(side="left", fill="x", expand=True)
+        entry.bind("<Return>", lambda _e: self.add_game())
+        add_placeholder(entry, self.add_var, "Paste a game link or place ID to add it to favourites")
+        ttk.Button(add, text="Add to favourites", command=self.add_game).pack(side="left", padx=(8, 0))
+
+        btns = ttk.Frame(self)
+        btns.pack(side="bottom", fill="x", pady=(int(12 * s), 0))
+        self.pick_btn = ttk.Button(btns, text="Pick for joining", style="Accent.TButton", command=self.pick)
+        self.pick_btn.pack(side="right")
+        self.star_btn = ttk.Button(btns, text="☆ Favourite", command=self.toggle_star)
+        self.star_btn.pack(side="right", padx=(0, 6))
+        self.servers_btn = ttk.Button(btns, text="Servers...", command=self.servers)
+        self.servers_btn.pack(side="right", padx=(0, 6))
+        self.open_btn = ttk.Button(btns, text="Open on Roblox", command=self.open_page)
+        self.open_btn.pack(side="left")
+        self.remove_btn = ttk.Button(btns, text="Remove", command=self.remove)
+        self.remove_btn.pack(side="left", padx=(6, 0))
+
+        table = ttk.Frame(self)
+        table.pack(fill="both", expand=True, pady=(int(12 * s), 0))
+        self.tree = ttk.Treeview(table, columns=("name", "kind", "id"), show="tree headings", selectmode="browse",
+                                 style="Games.Treeview")
+        ttk.Style(self).configure("Games.Treeview", rowheight=max(int(62 * s), 58))
+        self.tree.column("#0", width=int(80 * s), stretch=False, anchor="center")
+        for col, title, width in (("name", "Game", 360), ("kind", "", 120), ("id", "Place ID", 160)):
+            self.tree.heading(col, text=title, anchor="w")
+            self.tree.column(col, width=int(width * s), anchor="w", stretch=col == "name")
+        self.tree.tag_configure("fav", foreground=C["fg"])
+        self.tree.tag_configure("recent", foreground=C["muted"])
+        scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        add_row_hover(self.tree)
+        self.empty = ttk.Label(table, text="No games yet. Join one from Accounts, or paste a link above.",
+                               style="PanelMuted.TLabel")
+        self.tree.bind("<Double-1>", lambda e: self.tree.identify_row(e.y) and self.pick())
+        self.tree.bind("<Return>", lambda _e: self.pick())
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self.update_buttons())
+        self.blank = tk.PhotoImage(width=50, height=50)
+
+    def on_show(self):
+        self.refresh()
+
+    def games(self):
+        """[(place_id, name, starred)]: favourites, then recents that aren't favourites."""
+        favs = self.app.favorites()
+        ids = {f["id"] for f in favs}
+        return [(f["id"], f["name"], True) for f in favs] + \
+            [(r["id"], r["name"], False) for r in self.app.recents() if r["id"] not in ids]
+
+    def refresh(self):
+        chosen = self.chosen()
+        self.tree.delete(*self.tree.get_children())
+        games = self.games()
+        for place, name, starred in games:
+            self.tree.insert("", "end", iid=place, image=self.icons.get(place, self.blank),
+                             values=("  " + name, "★ Favourite" if starred else "Recent", place),
+                             tags=("fav" if starred else "recent",))
+        if chosen and self.tree.exists(chosen):
+            self.tree.selection_set(chosen)
+        elif games:
+            self.tree.selection_set(games[0][0])
+        if games:
+            self.empty.place_forget()
+        else:
+            self.empty.place(relx=0.5, rely=0.5, anchor="center")
+        self.update_buttons()
+        self.load_icons([g[0] for g in games])
+
+    def load_icons(self, places):
+        """Shows cached icons straight away and fetches missing ones in the background."""
+        missing = []
+        for place in places:
+            if place in self.icons:
+                continue
+            path = os.path.join(ICON_DIR, f"{place}.png")
+            try:
+                self.icons[place] = tk.PhotoImage(file=path)
+                if self.tree.exists(place):
+                    self.tree.item(place, image=self.icons[place])
+            except tk.TclError:
+                missing.append(place)
+        if not missing:
+            return
+
+        def work():
+            try:
+                pngs = get_game_icons(missing[:100])
+            except (RobloxError, ValueError):
+                return
+            os.makedirs(ICON_DIR, exist_ok=True)
+            for place, png in pngs.items():
+                with open(os.path.join(ICON_DIR, f"{place}.png"), "wb") as f:
+                    f.write(png)
+            self.app.ui(lambda: self.load_icons([p for p in missing if p in pngs]))
+        threading.Thread(target=work, daemon=True).start()
+
+    def chosen(self):
+        sel = self.tree.selection()
+        return sel[0] if sel else None
+
+    def update_buttons(self):
+        place = self.chosen()
+        state = "normal" if place else "disabled"
+        for btn in (self.pick_btn, self.star_btn, self.servers_btn, self.open_btn, self.remove_btn):
+            btn.config(state=state)
+        starred = place in {f["id"] for f in self.app.favorites()}
+        self.star_btn.config(text="★ Unfavourite" if starred else "☆ Favourite")
+
+    def name_of(self, place):
+        return next((name for p, name, _ in self.games() if p == place), f"Place {place}")
+
+    def pick(self):
+        place = self.chosen()
+        if place:
+            self.app.place_var.set(f"{self.name_of(place)}  ({place})")
+            self.app.job_var.set("")
+            self.app.show_page("accounts")
+            self.app.status.config(text=f"Picked {self.name_of(place)}. Select accounts and Join.")
+
+    def servers(self):
+        if self.chosen():
+            ServerBrowser(self.app, self.chosen())
+
+    def open_page(self):
+        if self.chosen():
+            webbrowser.open(f"https://www.roblox.com/games/{int(self.chosen())}")
+
+    def toggle_star(self):
+        place = self.chosen()
+        if not place:
+            return
+        favs = self.app.favorites()
+        if place in {f["id"] for f in favs}:
+            self.app.settings["favorites"] = [f for f in favs if f["id"] != place]
+        else:
+            self.app.settings["favorites"] = favs + [{"id": place, "name": self.name_of(place)}]
+        save_settings(self.app.settings)
+        self.app.update_recents_box()
+        self.refresh()
+
+    def remove(self):
+        place = self.chosen()
+        if not place:
+            return
+        self.app.settings["favorites"] = [f for f in self.app.favorites() if f["id"] != place]
+        self.app.settings["recents"] = [r for r in self.app.recents() if r["id"] != place]
+        save_settings(self.app.settings)
+        self.app.update_recents_box()
+        self.refresh()
+
+    def add_game(self):
+        text = self.add_var.get()
+        if parse_private_server(text):
+            self.app.status.config(text="Private server links aren't saved. Paste them on the Accounts page.")
+            return
+        place = parse_place_id(text)
+        if not place:
+            self.app.status.config(text="That isn't a game link or place ID.")
+            return
+        self.add_var.set("")
+        cookie = next((a["cookie"] for a in self.app.accounts if a["id"] not in self.app.expired), None)
+
+        def save(name):
+            favs = [f for f in self.app.favorites() if f["id"] != place]
+            self.app.settings["favorites"] = favs + [{"id": place, "name": name or f"Place {place}"}]
+            save_settings(self.app.settings)
+            self.app.update_recents_box()
+            self.refresh()
+            self.tree.selection_set(place)
+            self.app.status.config(text=f"Added {name or 'the game'} to favourites.")
+        threading.Thread(target=lambda: self.app.ui(save, get_place_name(cookie, place) if cookie else None),
+                         daemon=True).start()
+
+
+class ProfilesPage(ttk.Frame):
+    """Saved setups: a name, a set of accounts and a game. Launching one selects those accounts and
+    joins them, exactly as if you'd done it on the Accounts page."""
+
+    def __init__(self, app, parent):
+        super().__init__(parent)
+        self.app = app
+        s = app.scale
+        page_header(self, "Profiles", "Saved setups: which accounts go to which game. Launch one with a click.")
+        btns = ttk.Frame(self)
+        btns.pack(side="bottom", fill="x", pady=(int(12 * s), 0))
+        ttk.Button(btns, text="+ New profile", command=lambda: self.edit(None)).pack(side="left")
+        self.launch_btn = ttk.Button(btns, text="Launch", style="Accent.TButton", command=self.launch)
+        self.launch_btn.pack(side="right")
+        self.edit_btn = ttk.Button(btns, text="Edit...", command=lambda: self.edit(self.chosen()))
+        self.edit_btn.pack(side="right", padx=(0, 6))
+        self.delete_btn = ttk.Button(btns, text="Delete", command=self.delete)
+        self.delete_btn.pack(side="right", padx=(0, 6))
+        table = ttk.Frame(self)
+        table.pack(fill="both", expand=True, pady=(int(14 * s), 0))
+        self.tree = ttk.Treeview(table, columns=("name", "accounts", "game"), show="headings", selectmode="browse",
+                                 style="Rows.Treeview")
+        ttk.Style(self).configure("Rows.Treeview", rowheight=int(40 * s))
+        for col, title, width in (("name", "Profile", 220), ("accounts", "Accounts", 320), ("game", "Game", 260)):
+            self.tree.heading(col, text="   " + title, anchor="w")
+            self.tree.column(col, width=int(width * s), anchor="w")
+        self.tree.pack(side="left", fill="both", expand=True)
+        add_row_hover(self.tree)
+        self.empty = ttk.Label(table, text="No profiles yet. Click “+ New profile” to save a setup, for example\n"
+                               "“Farm: 12 alts in Pet Simulator”.", style="PanelMuted.TLabel", justify="center")
+        self.tree.bind("<Double-1>", lambda e: self.tree.identify_row(e.y) and self.launch())
+        self.tree.bind("<Return>", lambda _e: self.launch())
+        self.tree.bind("<Delete>", lambda _e: self.delete())
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self.update_buttons())
+
+    def on_show(self):
+        self.refresh()
+
+    def profiles(self):
+        items = self.app.settings.get("profiles")
+        return [p for p in items if isinstance(p, dict) and isinstance(p.get("name"), str)
+                and isinstance(p.get("accounts"), list)] if isinstance(items, list) else []
+
+    def save(self, profiles):
+        self.app.settings["profiles"] = profiles
+        save_settings(self.app.settings)
+        self.refresh()
+
+    def refresh(self):
+        chosen = self.chosen()
+        self.tree.delete(*self.tree.get_children())
+        for i, p in enumerate(self.profiles()):
+            accounts = [self.app.account(a) for a in p["accounts"]]
+            names = [self.app.who(a) for a in accounts if a]
+            shown = ", ".join(names[:4]) + (f" +{len(names) - 4} more" if len(names) > 4 else "")
+            self.tree.insert("", "end", iid=str(i), values=(
+                "   " + p["name"], f"   {len(names)}  ·  {shown}" if names else "   none left",
+                "   " + (p.get("place_name") or f"Place {p.get('place')}")))
+        if chosen and self.tree.exists(chosen):
+            self.tree.selection_set(chosen)
+        elif self.profiles():
+            self.tree.selection_set("0")
+        if self.profiles():
+            self.empty.place_forget()
+        else:
+            self.empty.place(relx=0.5, rely=0.5, anchor="center")
+        self.update_buttons()
+
+    def chosen(self):
+        sel = self.tree.selection()
+        return sel[0] if sel else None
+
+    def update_buttons(self):
+        state = "normal" if self.chosen() else "disabled"
+        for btn in (self.launch_btn, self.edit_btn, self.delete_btn):
+            btn.config(state=state)
+
+    def edit(self, iid):
+        profiles = self.profiles()
+        current = profiles[int(iid)] if iid is not None else None
+        result = ProfileDialog(self.app, current).result
+        if result is None:
+            return
+        if current is None:
+            profiles.append(result)
+        else:
+            profiles[int(iid)] = result
+        self.save(profiles)
+        self.tree.selection_set(str(profiles.index(result)))
+
+    def delete(self):
+        iid = self.chosen()
+        if iid is None:
+            return
+        profiles = self.profiles()
+        if messagebox.askyesno("Delete profile", f"Delete the profile “{profiles[int(iid)]['name']}”?\n\n"
+                               "The accounts themselves stay.", parent=self.app.root):
+            del profiles[int(iid)]
+            self.save(profiles)
+
+    def launch(self):
+        iid = self.chosen()
+        if iid is not None:
+            self.app.launch_profile(self.profiles()[int(iid)])
+
+
+class ProfileDialog(tk.Toplevel):
+    """Create or edit a profile. .result is the saved profile dict, or None if cancelled."""
+
+    def __init__(self, app, profile=None):
+        super().__init__(app.root, bg=C["bg"])
+        self.app, self.result = app, None
+        s = app.scale
+        self.title("Edit profile" if profile else "New profile")
+        self.transient(app.root)
+        self.geometry(f"{int(460 * s)}x{int(560 * s)}")
+        self.minsize(int(380 * s), int(420 * s))
+        frm = ttk.Frame(self, padding=18)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="Edit profile" if profile else "New profile", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(frm, text="Name", style="Muted.TLabel").pack(anchor="w", pady=(12, 2))
+        self.name_var = tk.StringVar(value=profile["name"] if profile else "")
+        name = ttk.Entry(frm, textvariable=self.name_var)
+        name.pack(fill="x")
+        ttk.Label(frm, text="Game", style="Muted.TLabel").pack(anchor="w", pady=(10, 2))
+        place = profile.get("place") if profile else None
+        self.place_var = tk.StringVar(value=f"{profile.get('place_name') or 'Place'}  ({place})" if place else "")
+        game = ttk.Combobox(frm, textvariable=self.place_var, values=app.place_box["values"])
+        game.pack(fill="x")
+        add_placeholder(game, self.place_var, "Paste a game link, or pick one")
+        ttk.Label(frm, text="Accounts (click to tick)", style="Muted.TLabel").pack(anchor="w", pady=(10, 2))
+        btns = ttk.Frame(frm)
+        btns.pack(side="bottom", fill="x", pady=(12, 0))
+        ttk.Button(btns, text="Save", style="Accent.TButton", command=self.save).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right", padx=(0, 6))
+        self.error = ttk.Label(btns, text="", style="Error.TLabel")
+        self.error.pack(side="left")
+        listing = ttk.Frame(frm)
+        listing.pack(fill="both", expand=True)
+        self.list = tk.Listbox(listing, selectmode="multiple", activestyle="none", bg=C["panel"], fg=C["fg"],
+                               selectbackground=C["accent"], selectforeground="white", highlightthickness=0,
+                               bd=0, font=FONT, exportselection=False)
+        scroll = ttk.Scrollbar(listing, orient="vertical", command=self.list.yview)
+        self.list.configure(yscrollcommand=scroll.set)
+        self.list.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        chosen = set(profile["accounts"]) if profile else {a["id"] for a in app.selected_accounts()}
+        for i, acc in enumerate(app.accounts):
+            group = app.group_of(acc)
+            self.list.insert("end", f"  {app.who(acc)}" + (f"   ·  {group}" if group else ""))
+            if acc["id"] in chosen:
+                self.list.selection_set(i)
+        self.bind("<Escape>", lambda _e: self.destroy())
+        name.bind("<Return>", lambda _e: self.save())
+        dark_title_bar(self)
+        self.grab_set()
+        name.focus_set()
+        self.wait_window()
+
+    def save(self):
+        name = self.name_var.get().strip()[:60]
+        text = self.place_var.get()
+        place = None if parse_private_server(text) else parse_place_id(text)
+        accounts = [self.app.accounts[i]["id"] for i in self.list.curselection()]
+        if not name:
+            self.error.config(text="Give the profile a name.")
+        elif parse_private_server(text):
+            self.error.config(text="Private server links aren't saved. Use a game link.")
+        elif not place:
+            self.error.config(text="Pick a game, or paste a game link.")
+        elif not accounts:
+            self.error.config(text="Tick at least one account.")
+        else:
+            m = re.match(r"\s*(?:★\s*)?(.+?)\s+\(\d+\)\s*$", text)
+            known = {r["id"]: r["name"] for r in self.app.recents() + self.app.favorites()}
+            self.result = {"name": name, "accounts": accounts, "place": place,
+                           "place_name": known.get(place) or (m.group(1) if m else f"Place {place}")}
+            self.destroy()
+
+
+def add_row_hover(tree):
+    """Highlights the row under the pointer, like a web list."""
+    tree.tag_configure("hover", background=NAV_HOVER)
+    state = {"row": None}
+
+    def clear():
+        row = state["row"]
+        if row and tree.exists(row):
+            tree.item(row, tags=tuple(t for t in tree.item(row, "tags") if t != "hover"))
+        state["row"] = None
+
+    def move(event):
+        row = tree.identify_row(event.y)
+        if row == state["row"]:
+            return
+        clear()
+        if row and row not in tree.selection():
+            tree.item(row, tags=tuple(tree.item(row, "tags")) + ("hover",))
+            state["row"] = row
+    tree.bind("<Motion>", move, add="+")
+    tree.bind("<Leave>", lambda _e: clear(), add="+")
+    tree.bind("<<TreeviewSelect>>", lambda _e: clear(), add="+")
+
+
 class App:
     def __init__(self, root, accounts):
         self.root = root
@@ -2763,10 +3790,14 @@ class App:
         self.afk_waiting_since = 0.0
         self.afk_waiting_logged = False
         self.afk_on = False           # mirrors the Anti-AFK box for the tray thread, which can't read Tk
-        self.afk_next_at = None       # wall-clock time of the next ping, and of the last one that landed,
-        self.afk_last_ping_at = None  # for the Live page
         self.tray = None              # set by main(); without it, closing the window quits
         self.taskbar_busy = False     # a worker is moving Roblox windows on or off the taskbar
+        self.history = History()      # hourly totals for Stats, Pulse and the Live panel
+        self.recent = collections.deque(maxlen=60)   # (time, measure()) once a minute, for Pulse
+        self.pc_meter, self.rbx_meter = PcMeter(), CpuMeter()
+        self.next_sample = time.monotonic() + 5
+        self.next_save = time.monotonic() + 300
+        self.expected_close = set()   # Roblox pids AltVault was asked to close, so they aren't counted
         self.tick_job = None
 
         apply_theme(root, self.scale)
@@ -2794,7 +3825,9 @@ class App:
         root.bind("<Map>", self.on_restore)
 
     # ------------------------------------------------------------ layout
-    NAV = (("accounts", "", "Accounts"), ("live", "", "Live"), ("settings", "", "Settings"))
+    NAV = (("accounts", "\uE716", "Accounts"), ("profiles", "\uE77B", "Profiles"), ("games", "\uE7FC", "Games"),
+           ("live", "\uE7F4", "Live"), ("stats", "\uE9D2", "Stats"), ("pulse", "\uE95E", "Pulse"),
+           ("settings", "\uE713", "Settings"))
 
     def build(self):
         s = self.scale
@@ -2830,12 +3863,14 @@ class App:
 
         host = ttk.Frame(main)
         host.pack(fill="both", expand=True)
-        self.pages = {"accounts": self.build_accounts(host), "live": LivePage(self, host),
-                      "settings": SettingsPage(self, host)}
+        self.pages = {"accounts": self.build_accounts(host), "profiles": ProfilesPage(self, host),
+                      "games": GamesPage(self, host), "live": LivePage(self, host), "stats": StatsPage(self, host),
+                      "pulse": PulsePage(self, host), "settings": SettingsPage(self, host)}
         self.page = None
         self.show_page("accounts")
-        for i, (key, _, _) in enumerate(self.NAV, 1):
+        for i, (key, _, _) in enumerate(self.NAV[:-1], 1):   # Ctrl+1..6; Settings is Ctrl+,
             self.root.bind(f"<Control-Key-{i}>", lambda _e, k=key: self.show_page(k))
+        self.root.bind("<Control-comma>", lambda _e: self.show_page("settings"))
 
     def nav_item(self, rail, key, glyph, label):
         """A sidebar entry: icon over a short label, with an accent bar while its page is open.
@@ -2894,8 +3929,9 @@ class App:
         self.summary.pack(side="left", padx=(12, 0), pady=(6, 0))
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *_: self.refresh())
-        ttk.Entry(header, textvariable=self.search_var, width=22).pack(side="right")
-        ttk.Label(header, text="Search", style="Muted.TLabel").pack(side="right", padx=(0, 6))
+        search = ttk.Entry(header, textvariable=self.search_var, width=28)
+        search.pack(side="right", anchor="s")
+        add_placeholder(search, self.search_var, "Search accounts")
 
         # Where to join: the game first; a specific server is optional and secondary.
         game = ttk.Frame(outer)
@@ -2957,6 +3993,7 @@ class App:
         self.tree.bind("<<TreeviewClose>>", lambda _e: self.group_toggled(False))
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self.update_join_label())
         self.tree.bind("<Button-3>", self.show_menu)
+        add_row_hover(self.tree)
         return outer
 
     def update_join_label(self):
@@ -3291,8 +4328,20 @@ class App:
                 if acc and title != self.window_title(acc) and responsive(hwnd):
                     _user32.SetWindowTextW(hwnd, self.window_title(acc))
             self.running = {pid: a for pid, a in self.running.items() if pid in alive}
+            gone = set(before) - alive
+            closed = len(gone - self.expected_close)
+            if closed:
+                self.history.add(closed=closed)
+            self.expected_close -= gone
             if self.running != before:
                 self.refresh()
+            now = time.monotonic()
+            if now >= self.next_sample:
+                self.next_sample = now + 60
+                self.sample_minute(windows)
+            if now >= self.next_save:
+                self.next_save = now + 300
+                self.save_history()
             want = not self.hide_taskbar_var.get()
             self.set_taskbar([hwnd for hwnd, _, _ in windows if on_taskbar(hwnd) != want], want)
             if self.page == "live" and self.root.state() not in ("iconic", "withdrawn"):
@@ -3300,6 +4349,46 @@ class App:
         except Exception:
             log.exception("Window check failed")
         self.tick_job = self.root.after(TICK_INTERVAL, self.tick)
+
+    def sample_minute(self, windows):
+        """Once a minute, AltVault or not on screen: one reading for Stats and Pulse. A few cheap
+        system calls; Roblox itself isn't touched."""
+        reading = measure(windows, self.pc_meter, self.rbx_meter)
+        ingame = sum(1 for _, pid, _ in windows
+                     if (self.presence.get(self.running.get(pid)) or {}).get("userPresenceType") == 2)
+        self.history.sample(open=len(windows), ingame=ingame if windows else None,
+                            pc_cpu=reading["pc_cpu"], pc_ram=reading["pc_ram"],
+                            rbx_cpu=reading["rbx_cpu"] if windows else None,
+                            rbx_ram=reading["rbx_ram"] if windows else None)
+        self.recent.append((time.time(), reading))
+        if self.page == "pulse":
+            self.pages["pulse"].draw_charts()
+
+    def save_history(self):
+        try:
+            self.history.save()
+        except OSError as e:
+            log.warning("Couldn't save history: %s", e)
+
+    def close_windows(self, pids):
+        """Closes Roblox processes on purpose, so they don't count as unexpected closes."""
+        for pid in pids:
+            self.expected_close.add(pid)
+            kill_process(pid)
+
+    def launch_profile(self, profile):
+        accounts = [a for a in (self.account(i) for i in profile["accounts"]) if a]
+        if not accounts:
+            messagebox.showinfo("Launch profile", "None of this profile's accounts are in AltVault any more. "
+                                "Edit the profile to pick accounts.", parent=self.root)
+            return
+        self.search_var.set("")   # rows hidden by a search can't be selected
+        self.place_var.set(f"{profile.get('place_name') or 'Place'}  ({profile['place']})")
+        self.job_var.set("")
+        self.tree.selection_set([str(a["id"]) for a in accounts])
+        self.show_page("accounts")
+        self.update_join_label()
+        self.join_selected()
 
     # ------------------------------------------------------------ account actions
     def add_many(self, items):
@@ -3406,7 +4495,7 @@ class App:
             p = self.presence.get(acc["id"]) or {}
             if wins:
                 menu.add_command(label="Show Roblox window", command=lambda: focus_window(wins[0][0]))
-                menu.add_command(label="Close Roblox window", command=lambda: [kill_process(pid) for _, pid in wins])
+                menu.add_command(label="Close Roblox window", command=lambda: self.close_windows([pid for _, pid in wins]))
             if p.get("userPresenceType") == 2 and p.get("gameId"):
                 menu.add_command(label="Use this account's server for joining",
                                  command=lambda: self.use_server_of(p))
@@ -3661,7 +4750,7 @@ class App:
     def set_taskbar(self, hwnds, shown):
         """Moves windows on or off the taskbar on a worker thread, since each change waits on Roblox.
         Anything left over (a window that was frozen, say) is picked up by the next tick."""
-        if self.taskbar_busy or not hwnds:
+        if self.taskbar_busy or self.afk_busy or not hwnds:   # never hide a window mid-ping
             return
         self.taskbar_busy = True
 
@@ -3764,6 +4853,7 @@ class App:
             return
         if not messagebox.askyesno("Close all Roblox", "Close every Roblox window?", parent=self.root):
             return
+        self.expected_close |= {pid for _, pid, _ in roblox_windows()}
         close_all_roblox()
         if self.multi_var.get():
             self.root.after(1000, lambda: self.toggle_multi(quiet=True))
@@ -3806,7 +4896,6 @@ class App:
         if self.afk_job:
             self.root.after_cancel(self.afk_job)
         self.afk_job = self.root.after(int(seconds * 1000), self.afk_due)
-        self.afk_next_at = time.time() + seconds
 
     def afk_skip_ids(self):
         ids = self.settings.get("afk_skip")
@@ -3930,8 +5019,7 @@ class App:
         for h in pinged:
             self.afk_last[h] = now
             self.afk_misses.pop(h, None)
-        if pinged:
-            self.afk_last_ping_at = time.time()
+        self.history.add(pings=len(pinged), missed=len(missed))
         for h in missed:
             self.afk_misses[h] = self.afk_misses.get(h, 0) + 1
         parts = [f"pinged {len(pinged)}"]
@@ -4079,15 +5167,19 @@ class App:
                 except CookieExpired:
                     self.expired.add(acc["id"])
                     problems.append(f"{self.who(acc)}: login expired — right-click > Log in again.")
+                    self.ui(lambda: self.history.add(launch_fail=1))
                     continue
                 except (RobloxError, OSError) as e:
                     log.warning("Launch of %s failed: %s", acc["name"], e)
                     problems.append(f"{self.who(acc)}: {e}")
+                    self.ui(lambda: self.history.add(launch_fail=1))
                     continue
                 pid = self.wait_for_new_window(before)
                 if pid is None:
                     problems.append(f"{self.who(acc)}: Roblox didn't open a window within {WINDOW_TIMEOUT}s.")
+                    self.ui(lambda: self.history.add(launch_fail=1))
                     continue
+                self.ui(lambda: self.history.add(launch_ok=1))
                 self.ui(self.running.__setitem__, pid, acc["id"])
                 time.sleep(3)
                 if fps_file:   # the client has read its cap by now
@@ -4189,6 +5281,7 @@ class App:
         if self.root.state() != "withdrawn":
             self.settings["geometry"] = self.root.geometry()
         self.save_settings()
+        self.save_history()
         for hwnd, _, _ in roblox_windows():   # never leave Roblox windows without a taskbar button
             if not on_taskbar(hwnd):
                 set_on_taskbar(hwnd, True)

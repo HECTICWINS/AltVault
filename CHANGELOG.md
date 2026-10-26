@@ -4,7 +4,11 @@ Every release on the [Releases](../../releases) page is built by GitHub from the
 
 ## 2.7.0
 
-- **New look with a sidebar:** **Accounts**, **Live** and **Settings** pages, a bigger window, and the Anti-AFK switch on every page.
+- **New look with a sidebar:** **Accounts**, **Profiles**, **Games**, **Live**, **Stats**, **Pulse** and **Settings**, a bigger window, and the Anti-AFK switch on every page. Buttons, boxes, checkboxes and scrollbars are redrawn with rounded corners and hover, pressed and focus looks; lists highlight the row under the pointer.
+- **Profiles:** save a setup (a name, some accounts and a game) and launch it with one click.
+- **Games:** favourites and recent games in one list with their icons. Pick one for joining, browse its servers, star it or open it on roblox.com.
+- **Stats:** time in a game, launches that worked, Anti-AFK pings and windows closed outside AltVault, over 24 hours or 7 days, with hourly charts (hover for values). Only numbers are kept, in `history.json`, for a week.
+- **Pulse:** your PC's and Roblox's CPU and memory, live while the page is open and sampled once a minute otherwise, charted over the last hour, 24 hours or 7 days.
 - **Live page:** every Roblox window as a live tile with a status dot (in a game, loading, not responding). Click a tile to bring that window forward, or close it from its header. Tiles fill the space, no scrolling. Windows draws the previews itself, and only while the page is open.
 - **Stats panel:** how many windows are in a game, Roblox's CPU and RAM, your PC's free RAM, and Anti-AFK's last and next ping. Sampled every 3 seconds, and only while you're looking.
 - **Egg hatch calculator:** type one alt's speed in eggs/min, eggs/hour or seconds per egg and see the total per minute, hour and day for every account in a game.

@@ -101,7 +101,11 @@ Double-clicking `altvault.py` only works if `.py` files open with Python on your
 
 ## Finding your way around
 
-- **Sidebar:** **Accounts**, **Live** and **Settings** (also Ctrl+1, Ctrl+2, Ctrl+3).
+- **Sidebar:** **Accounts**, **Profiles**, **Games**, **Live**, **Stats** and **Pulse** (Ctrl+1 to Ctrl+6), and **Settings** at the bottom (Ctrl+,).
+- **Profiles page:** saved setups, a name plus some accounts and a game. **Launch** selects those accounts and joins them.
+- **Games page:** your favourite and recent games with their icons. **Pick for joining**, **Servers...**, star or remove them, or paste a link to add one.
+- **Stats page:** how the last 24 hours or 7 days went: time in a game, launches that worked, Anti-AFK pings and misses, and windows that closed without AltVault closing them (crashes, kicks or closed by hand). AltVault keeps only these numbers, per hour, for a week, in `history.json`.
+- **Pulse page:** your PC's and Roblox's CPU and memory, live every 2 seconds while the page is open, and charted over the last hour, day or week from a reading AltVault takes once a minute.
 - **Accounts page, top:** search the list.
 - **Game box:** what to join. **★** pins a game; **Servers...** shows its servers. The **Server** box under it is optional.
 - **Account list:** select accounts (Ctrl+click, Shift+click, Ctrl+A, or click a group's header). The **Join** button shows how many will launch.

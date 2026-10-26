@@ -210,6 +210,7 @@ class TestPrivateServers(unittest.TestCase):
                      "flagged", "client_overrides", "client_values_in_use", "client_state", "needs_client_settings", "apply_client_settings", "restore_client_settings"):
             setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
         fake.who = lambda acc: "@" + acc["name"]
+        fake.history = types.SimpleNamespace(add=lambda now=None, **k: None)
         fake.wait_for_server = lambda *a: self.fail("same-server logic ran for a private server")
         with mock.patch.object(av, "resolve_share_link", fake_resolve), \
                 mock.patch.object(av, "launch", fake_launch), \
@@ -304,6 +305,7 @@ class TestFpsCaps(unittest.TestCase):
         for name in ("fps_caps", "fps_cap_of", "flagged", "client_overrides", "client_values_in_use", "client_state", "needs_client_settings", "apply_client_settings", "restore_client_settings"):
             setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
         fake.who = lambda acc: "@" + acc["name"]
+        fake.history = types.SimpleNamespace(add=lambda now=None, **k: None)
         return fake
 
     def test_each_account_starts_with_its_own_cap(self):
@@ -395,6 +397,7 @@ class TestFpsCaps(unittest.TestCase):
                      "flagged", "client_overrides", "client_values_in_use", "client_state", "needs_client_settings", "apply_client_settings", "restore_client_settings"):
             setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
         fake.who = lambda acc: "@" + acc["name"]
+        fake.history = types.SimpleNamespace(add=lambda now=None, **k: None)
 
         def fake_launch(cookie, *a):
             events.append((cookie, av.read_fps_cap(self.path)))
@@ -555,6 +558,7 @@ class TestAntiAfkTiming(unittest.TestCase):
                      "afk_finished", "afk_next_delay", "afk_window_name", "afk_alert"):
             setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
         fake.ui = lambda fn, *a: fn(*a)
+        fake.history = av.History(os.path.join(av.APP_DIR, "history-test.json"))
 
         user32 = types.SimpleNamespace(IsIconic=lambda h: False, GetWindowThreadProcessId=lambda h, p: None)
         with mock.patch.object(av.time, "monotonic", lambda: clock[0]), \
@@ -1023,6 +1027,70 @@ class TestWindow(unittest.TestCase):
             self.app.settings.pop(key, None)
         self.app.refresh()
 
+    def test_every_sidebar_page_opens(self):
+        self.assertEqual([k for k, _, _ in self.app.NAV],
+                         ["accounts", "profiles", "games", "live", "stats", "pulse", "settings"])
+        with mock.patch.object(av, "roblox_windows", lambda: []):
+            for key, _, _ in self.app.NAV:
+                self.app.show_page(key)
+                self.assertEqual(self.app.page, key)
+            self.app.show_page("accounts")
+
+    def test_profile_launch_selects_its_accounts(self):
+        with mock.patch.object(self.app, "join_selected") as join:
+            self.app.search_var.set("alt4")
+            self.app.launch_profile({"name": "Farm", "accounts": [1, 2, 404], "place": "123", "place_name": "Egg Game"})
+        join.assert_called_once()
+        self.assertEqual(self.app.search_var.get(), "")
+        self.assertEqual([a["id"] for a in self.app.selected_accounts()], [1, 2])
+        self.assertEqual(av.parse_place_id(self.app.place_var.get()), "123")
+        self.app.tree.selection_set(())
+        self.app.place_var.set("")
+
+    def test_games_page_picks_a_game_for_joining(self):
+        page = self.app.pages["games"]
+        with mock.patch.object(av, "save_settings", lambda s: None), \
+                mock.patch.object(page, "load_icons", lambda places: None):
+            self.app.settings["recents"] = [{"id": "55", "name": "Egg Game"}]
+            page.refresh()
+            page.tree.selection_set("55")
+            page.toggle_star()
+            self.assertIn("55", {f["id"] for f in self.app.favorites()})
+            page.pick()
+        self.assertEqual(self.app.page, "accounts")
+        self.assertEqual(av.parse_place_id(self.app.place_var.get()), "55")
+        for key in ("recents", "favorites"):
+            self.app.settings.pop(key)
+        self.app.place_var.set("")
+        self.app.update_recents_box()
+
+    def test_stats_page_reads_the_history(self):
+        saved, self.app.history = self.app.history, av.History(os.path.join(av.APP_DIR, "history-window.json"))
+        try:
+            self.app.history.add(launch_ok=3, launch_fail=1, pings=40, missed=2, closed=1)
+            self.app.history.sample(open=4, ingame=3)
+            page = self.app.pages["stats"]
+            page.refresh()
+            page.on_hide()
+            self.assertEqual(page.cards["launches"].value.cget("text"), "75.0%")
+            self.assertEqual(page.cards["ingame"].value.cget("text"), "75.0%")
+            self.assertEqual(page.cards["pings"].value.cget("text"), "40")
+            self.assertEqual(page.cards["closed"].value.cget("text"), "1")
+        finally:
+            self.app.history = saved
+
+    def test_only_unexpected_closes_are_counted(self):
+        counted = []
+        self.app.running.update({500: 4, 501: 5})
+        self.app.expected_close.add(501)
+        with mock.patch.object(av, "roblox_windows", lambda: []), \
+                mock.patch.object(self.app.history, "add", lambda now=None, **k: counted.append(k)), \
+                mock.patch.object(self.app, "set_taskbar"):
+            self.app.tick()
+            self.root.after_cancel(self.app.tick_job)
+        self.assertEqual(counted, [{"closed": 1}])
+        self.assertEqual(self.app.expected_close, set())
+
     def test_export_payload_has_everything_import_reads(self):
         payload = self.app.export_payload()
         self.assertEqual(len(av.export_entries(payload)), len(self.app.accounts))
@@ -1111,6 +1179,51 @@ class TestLiveHelpers(unittest.TestCase):
         self.assertIsNone(meter.percent({1: 10.0}, now=100))
         with mock.patch.object(av.os, "cpu_count", lambda: 4):
             self.assertAlmostEqual(meter.percent({1: 12.0, 2: 5.0}, now=102), 25.0)   # 1 of 4 cores
+
+
+class TestHistory(unittest.TestCase):
+    def test_hourly_totals_averages_and_saving(self):
+        path = os.path.join(av.APP_DIR, "history-unit.json")
+        h = av.History(path)
+        now = 1_800_000_000
+        h.add(now - 3600, pings=5)
+        h.add(now, pings=2, missed=1)
+        h.sample(now, pc_cpu=30, open=4)
+        h.sample(now, pc_cpu=50, open=4, rbx_cpu=None)
+        self.assertEqual(h.series("pings", 3, now), [0, 5, 2])
+        self.assertEqual(h.total("pings", 24, now), 7)
+        self.assertEqual(h.series("pc_cpu", 2, now, per="pc_cpu_n"), [None, 40])
+        self.assertNotIn("rbx_cpu_n", h.hours[h.hour(now)], "a missing reading must not count")
+        h.add(now - 3600 * (av.HISTORY_HOURS + 5), pings=99)   # older than a week: dropped on save
+        h.save(now)
+        again = av.History(path)
+        self.assertEqual(again.total("pings", av.HISTORY_HOURS + 10, now), 7)
+        with open(path, encoding="utf-8") as f:
+            self.assertNotIn("alt", f.read())
+
+    def test_broken_file_starts_empty(self):
+        path = os.path.join(av.APP_DIR, "history-broken.json")
+        os.makedirs(av.APP_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        self.assertEqual(av.History(path).hours, {})
+
+    def test_pc_meter(self):
+        meter = av.PcMeter()
+        self.assertIsNone(meter.percent((100.0, 50.0)))
+        self.assertAlmostEqual(meter.percent((103.0, 51.0)), 25.0)   # 1 busy of 4 seconds
+
+    def test_drawn_shapes_are_real_pngs_with_clear_corners(self):
+        import tkinter
+        png = av.shape_image(20, 20, 6, "#5865f2", check="#ffffff")
+        self.assertTrue(png.startswith(b"\x89PNG"))
+        root = tkinter.Tk()
+        try:
+            img = tkinter.PhotoImage(master=root, data=av.base64.b64encode(png))
+            self.assertTrue(img.transparency_get(0, 0))
+            self.assertFalse(img.transparency_get(10, 3))
+        finally:
+            root.destroy()
 
 
 class TestRepoHygiene(unittest.TestCase):
