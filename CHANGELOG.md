@@ -2,6 +2,12 @@
 
 Every release on the [Releases](../../releases) page is built by GitHub from the tagged commit, comes with a build attestation, and is scanned by VirusTotal. See [Verify your download](README.md#verify-your-download).
 
+## 2.6.0
+
+- **Cleaner layout.** The game comes first, with the server box as a clearly optional second line. The **Join** button says how many accounts it will launch, and the footer holds only the Anti-AFK switch and status.
+- **Settings window (⚙)** for things you set once: Multi-Roblox, same server, arranging windows, and the Anti-AFK key, which can now be chosen without editing files.
+- **Right-click menu grouped** into **Performance** (FPS cap, lowest graphics, mute, Anti-AFK), **Group** and **Account**, with Join at the top and Remove at the bottom. Anti-AFK can now be switched off for several accounts at once.
+
 ## 2.5.0
 
 - **Server browser:** click **Servers...** to see a game's open servers with player counts, ping and FPS. Join one, or click **Join least busy** to pick the emptiest server with room for all selected accounts. The list loads without sending any login.

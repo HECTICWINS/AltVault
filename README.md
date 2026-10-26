@@ -73,7 +73,7 @@ Get-FileHash .\AltVault-*-win64.zip
 If you have the [GitHub CLI](https://cli.github.com), you can also confirm GitHub built the file from this repository:
 
 ```powershell
-gh attestation verify .\AltVault-2.5.0-win64.zip --repo HECTICWINS/AltVault
+gh attestation verify .\AltVault-2.6.0-win64.zip --repo HECTICWINS/AltVault
 ```
 
 The download includes its own copy of Python, so one or two lesser-known engines may flag it; that's a common false positive for Python apps.
@@ -95,9 +95,17 @@ Double-clicking `altvault.py` only works if `.py` files open with Python on your
 
 **Upgrading from PyRAM?** Close PyRAM, then start AltVault. Your saved accounts, settings and avatars move over automatically.
 
+## Finding your way around
+
+- **Top:** search, and **⚙ Settings** for things you set once (Multi-Roblox, same server, window arranging, the Anti-AFK key).
+- **Game box:** what to join. **★** pins a game; **Servers...** shows its servers. The **Server** box under it is optional.
+- **Account list:** select accounts (Ctrl+click, Shift+click, Ctrl+A, or click a group's header). The **Join** button shows how many will launch.
+- **Right-click** an account or group: **Join**, **Performance** (FPS cap, lowest graphics, mute, Anti-AFK), **Group**, **Account** (note, profile, log in again), and **Remove**.
+- **Bottom:** the **Anti-AFK** switch and what AltVault last did.
+
 ## Adding an account
 
-Click **Add account**, then **Log in with browser**.
+Click **+ Add account**, then **Log in with browser**.
 
 1. A private browser window opens on roblox.com. AltVault uses Chrome, Edge or Brave, whichever you have.
 2. Log in as usual. 2-step verification works too.
@@ -122,12 +130,12 @@ Prefer not to use a browser window? Choose **Paste a cookie instead**. To get th
 
 ## Joining a private server
 
-Paste the private server link into the **Game** box, select the accounts and click **Join selected**. Both kinds of link work:
+Paste the private server link into the **Game** box, select the accounts and click **Join**. Both kinds of link work:
 
 - share links, such as `https://www.roblox.com/share?code=...&type=Server`, which is what Roblox's **Copy link** button gives you now;
 - older links, such as `https://www.roblox.com/games/123456/Game-Name?privateServerLinkCode=...`.
 
-Every selected account joins that private server, so the **Server / Job ID** box and **Same server** are ignored.
+Every selected account joins that private server, so the **Server** box and the same-server setting are ignored.
 Each account must be allowed in: for a friends-only private server, every alt needs to be friends with the owner.
 A private server link works like an invite, so AltVault never saves it to `settings.json` or the log.
 
@@ -165,13 +173,13 @@ To check an FPS cap, press **Shift+F5** in that Roblox window to show its frame 
 
 ## Importing from Roblox Account Manager
 
-Click **Add account** > **Import from Roblox Account Manager...** and choose RAM's `AccountData.json`, which is in the folder RAM runs from.
+Click **+ Add account** > **Import from Roblox Account Manager...** and choose RAM's `AccountData.json`, which is in the folder RAM runs from.
 AltVault checks every login with Roblox and adds the ones that still work, along with their RAM groups and aliases. Saved passwords are never read.
 It works with RAM's normal encrypted file on the same PC and Windows account. If you set a password in RAM, turn that off in RAM first.
 
 ## Anti-AFK
 
-Tick **Anti-AFK** in the footer. Every 6–9 minutes AltVault:
+Tick **Anti-AFK** at the bottom of the window. Every 6–9 minutes AltVault:
 
 1. waits until you've stopped using your mouse and keyboard for 2 seconds,
 2. gives each Roblox window focus for a split second and holds Space (a jump),
@@ -191,9 +199,9 @@ Roblox ignores input sent to background windows, so a brief focus switch is the 
 Any Roblox window hidden behind your other apps is moved off-screen for that moment and put back exactly where it was, so you never see it flash.
 The key is only pressed once a Roblox window is confirmed to be in focus, so it never types into your other apps.
 
-- To exclude an account, right-click it and choose **Turn anti-AFK off for this account**.
+- To exclude accounts, select them, right-click and untick **Performance** > **Anti-AFK**.
 - Don't minimise Roblox windows; Windows can't send them input. Leave them behind other windows instead.
-- To change the key, set `"afk_key"` in `%LOCALAPPDATA%\AltVault\settings.json` to a letter, `"space"` or `"f13"`.
+- To change the key it presses, open **⚙ Settings** and pick a letter, Space or F13.
 
 ## Security and privacy
 

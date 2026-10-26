@@ -32,7 +32,7 @@ import zlib
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_TITLE = "AltVault"
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.6.0"
 APP_DIR = os.path.join(os.environ["LOCALAPPDATA"], "AltVault")
 DATA_FILE = os.path.join(APP_DIR, "accounts.dat")
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
@@ -1734,6 +1734,65 @@ def import_ram_into(app, path, report):
     app.ui(save)
 
 
+class SettingsDialog(tk.Toplevel):
+    """Options you set once. Everyday controls (Join, Anti-AFK) stay in the main window."""
+
+    def __init__(self, app):
+        super().__init__(app.root, bg=C["bg"])
+        self.app = app
+        self.title("Settings")
+        self.resizable(False, False)
+        self.transient(app.root)
+        frm = ttk.Frame(self, padding=18)
+        frm.pack(fill="both", expand=True)
+        wrap = int(420 * app.scale)
+        ttk.Label(frm, text="Settings", style="Title.TLabel").pack(anchor="w")
+
+        def option(var, title, detail, command):
+            ttk.Checkbutton(frm, text=title, variable=var, command=command).pack(anchor="w", pady=(12, 0))
+            ttk.Label(frm, text=detail, style="Small.TLabel", wraplength=wrap, justify="left").pack(
+                anchor="w", padx=(24, 0))
+
+        ttk.Label(frm, text="Joining", style="Muted.TLabel").pack(anchor="w", pady=(14, 0))
+        option(app.multi_var, "Multi-Roblox", "Run several Roblox windows at once. Turn off only if you "
+               "want each launch to replace the previous window.", app.toggle_multi)
+        option(app.same_server_var, "Put accounts in the same server",
+               "When joining several accounts with no server chosen, they all follow the first one.",
+               app.save_settings)
+        option(app.auto_tile_var, "Arrange windows after joining",
+               "Splits the screen evenly between every Roblox window, like the Tile button.", app.save_settings)
+
+        ttk.Label(frm, text="Anti-AFK", style="Muted.TLabel").pack(anchor="w", pady=(16, 0))
+        row = ttk.Frame(frm)
+        row.pack(anchor="w", pady=(8, 0))
+        ttk.Label(row, text="Key it presses").pack(side="left")
+        self.key_var = tk.StringVar(value=str(app.settings.get("afk_key", "space")).lower())
+        keys = ttk.Combobox(row, textvariable=self.key_var, state="readonly", width=8,
+                            values=["space", "f13"] + list("abcdefghijklmnopqrstuvwxyz"))
+        keys.pack(side="left", padx=(8, 0))
+        keys.bind("<<ComboboxSelected>>", lambda _e: self.set_key())
+        ttk.Label(frm, text="Space makes your character jump. F13 is a key no game uses, for games where "
+                  "jumping gets in the way.", style="Small.TLabel", wraplength=wrap, justify="left").pack(anchor="w")
+
+        ttk.Label(frm, text="About", style="Muted.TLabel").pack(anchor="w", pady=(16, 0))
+        ttk.Label(frm, text=f"AltVault {APP_VERSION}").pack(anchor="w", pady=(6, 0))
+        links = ttk.Frame(frm)
+        links.pack(anchor="w", pady=(6, 0))
+        ttk.Button(links, text="Open on GitHub",
+                   command=lambda: webbrowser.open("https://github.com/HECTICWINS/AltVault")).pack(side="left")
+        ttk.Button(links, text="Open log folder", command=lambda: os.startfile(APP_DIR)).pack(side="left", padx=(6, 0))
+
+        ttk.Button(frm, text="Close", command=self.destroy).pack(anchor="e", pady=(18, 0))
+        self.bind("<Escape>", lambda _e: self.destroy())
+        dark_title_bar(self)
+        self.after(50, lambda: self.winfo_exists() and dark_title_bar(self))
+
+    def set_key(self):
+        self.app.settings["afk_key"] = self.key_var.get()
+        save_settings(self.app.settings)
+        self.app.status.config(text=f"Anti-AFK will press {self.key_var.get().upper()}.")
+
+
 class ServerBrowser(tk.Toplevel):
     """A game's public servers with player counts, ping and FPS. Pick one to join with the selected
     accounts, or let AltVault pick the least busy one that has room for all of them."""
@@ -1903,63 +1962,60 @@ class App:
         outer = ttk.Frame(self.root, padding=(16, 14, 16, 12))
         outer.pack(fill="both", expand=True)
 
+        # Top bar: name and counts, search, settings.
         header = ttk.Frame(outer)
         header.pack(fill="x")
         ttk.Label(header, text=APP_TITLE, style="Title.TLabel").pack(side="left")
         self.summary = ttk.Label(header, text="", style="Muted.TLabel")
         self.summary.pack(side="left", padx=(12, 0), pady=(6, 0))
+        ttk.Button(header, text="⚙", width=3, command=lambda: SettingsDialog(self)).pack(side="right")
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *_: self.refresh())
-        search = ttk.Entry(header, textvariable=self.search_var, width=22)
-        search.pack(side="right")
+        ttk.Entry(header, textvariable=self.search_var, width=22).pack(side="right", padx=(0, 8))
         ttk.Label(header, text="Search", style="Muted.TLabel").pack(side="right", padx=(0, 6))
 
+        # Where to join: the game first; a specific server is optional and secondary.
         game = ttk.Frame(outer)
         game.pack(fill="x", pady=(12, 0))
         ttk.Label(game, text="Game", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(game, text="Server / Job ID (optional)", style="Muted.TLabel").grid(
-            row=0, column=1, sticky="w", padx=(10, 0))
         self.place_var = tk.StringVar(value=self.settings.get("place", ""))
         self.place_box = ttk.Combobox(game, textvariable=self.place_var)
         self.place_box.grid(row=1, column=0, sticky="ew", pady=(2, 0))
-        self.job_var = tk.StringVar()
-        ttk.Entry(game, textvariable=self.job_var).grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=(2, 0))
         self.star_btn = ttk.Button(game, text="☆", width=3, command=self.toggle_favorite)
-        self.star_btn.grid(row=1, column=2, padx=(6, 0), pady=(2, 0))
-        ttk.Button(game, text="Servers...", command=self.open_servers).grid(row=1, column=3, padx=(6, 0), pady=(2, 0))
+        self.star_btn.grid(row=1, column=1, padx=(6, 0), pady=(2, 0))
+        ttk.Button(game, text="Servers...", command=self.open_servers).grid(row=1, column=2, padx=(6, 0), pady=(2, 0))
         self.place_var.trace_add("write", lambda *_: self.update_star())
-        game.columnconfigure(0, weight=3)
-        game.columnconfigure(1, weight=2)
-        ttk.Label(game, text="Paste a place ID, a game link or a private server link, or pick a recent game.",
-                  style="Small.TLabel").grid(row=2, column=0, columnspan=2, sticky="w", pady=(3, 0))
+        game.columnconfigure(0, weight=1)
+        ttk.Label(game, text="A place ID, a game or private server link, or a recent or ★ game.",
+                  style="Small.TLabel").grid(row=2, column=0, columnspan=3, sticky="w", pady=(3, 0))
+        server = ttk.Frame(game)
+        server.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        ttk.Label(server, text="Server", style="Muted.TLabel").pack(side="left")
+        self.job_var = tk.StringVar()
+        ttk.Entry(server, textvariable=self.job_var, width=40).pack(side="left", padx=(8, 0))
+        ttk.Label(server, text="optional: leave empty for any server, or paste a Job ID", style="Small.TLabel").pack(
+            side="left", padx=(8, 0))
         self.update_recents_box()
 
-        # Footer and buttons are packed against the bottom first so the table can't squeeze them out.
+        # The Anti-AFK switch and the status line; set-once options live in Settings.
         footer = ttk.Frame(outer)
         footer.pack(side="bottom", fill="x", pady=(10, 0))
         self.multi_var = tk.BooleanVar(value=self.settings.get("multi", True))
-        ttk.Checkbutton(footer, text="Multi-Roblox", variable=self.multi_var,
-                        command=self.toggle_multi).pack(side="left")
         self.same_server_var = tk.BooleanVar(value=self.settings.get("same_server", True))
-        ttk.Checkbutton(footer, text="Same server",
-                        variable=self.same_server_var, command=self.save_settings).pack(side="left", padx=(14, 0))
         self.auto_tile_var = tk.BooleanVar(value=self.settings.get("auto_tile", True))
-        ttk.Checkbutton(footer, text="Auto-tile windows",
-                        variable=self.auto_tile_var, command=self.save_settings).pack(side="left", padx=(14, 0))
         self.anti_afk_var = tk.BooleanVar(value=self.settings.get("anti_afk", False))
         ttk.Checkbutton(footer, text="Anti-AFK", variable=self.anti_afk_var,
-                        command=self.toggle_anti_afk).pack(side="left", padx=(14, 0))
+                        command=self.toggle_anti_afk).pack(side="left")
         self.status = ttk.Label(footer, text="", style="Muted.TLabel")
         self.status.pack(side="right")
 
         btns = ttk.Frame(outer)
         btns.pack(side="bottom", fill="x", pady=(12, 0))
-        ttk.Button(btns, text="Add account", command=lambda: AddAccountDialog(self)).pack(side="left")
-        ttk.Button(btns, text="Remove", command=self.remove_selected).pack(side="left", padx=(6, 0))
-        self.join_btn = ttk.Button(btns, text="Join selected", style="Accent.TButton", command=self.join_selected)
+        ttk.Button(btns, text="+ Add account", command=lambda: AddAccountDialog(self)).pack(side="left")
+        self.join_btn = ttk.Button(btns, text="Join", style="Accent.TButton", command=self.join_selected)
         self.join_btn.pack(side="right")
-        ttk.Button(btns, text="Close all Roblox", command=self.close_all).pack(side="right", padx=(0, 6))
-        ttk.Button(btns, text="Tile windows", command=self.tile).pack(side="right", padx=(0, 6))
+        ttk.Button(btns, text="Close all", command=self.close_all).pack(side="right", padx=(0, 6))
+        ttk.Button(btns, text="Tile", command=self.tile).pack(side="right", padx=(0, 6))
 
         table = ttk.Frame(outer)
         table.pack(fill="both", expand=True, pady=(12, 0))
@@ -1978,7 +2034,7 @@ class App:
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
-        self.empty_hint = ttk.Label(table, text="No accounts yet — click “Add account” to start.",
+        self.empty_hint = ttk.Label(table, text="No accounts yet. Click “+ Add account” to start.",
                                     style="Muted.TLabel", background=C["panel"])
         # Double-clicking a group header only opens or closes it; it never launches the whole group.
         self.tree.bind("<Double-1>", self.on_double_click)
@@ -1987,7 +2043,15 @@ class App:
         self.tree.bind("<Control-a>", lambda _e: self.tree.selection_set(self.account_rows()))
         self.tree.bind("<<TreeviewOpen>>", lambda _e: self.group_toggled(True))
         self.tree.bind("<<TreeviewClose>>", lambda _e: self.group_toggled(False))
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self.update_join_label())
         self.tree.bind("<Button-3>", self.show_menu)
+
+    def update_join_label(self):
+        """The Join button says how many accounts it will launch."""
+        if self.joining:
+            return
+        n = len(self.selected_accounts())
+        self.join_btn.config(text="Join" if n == 0 else f"Join {n} account{'s' if n != 1 else ''}")
 
     # ------------------------------------------------------------ helpers
     def ui(self, fn, *args):
@@ -2348,59 +2412,65 @@ class App:
         return [(hwnd, pid) for hwnd, pid, _ in roblox_windows() if pid in pids]
 
     def show_menu(self, event):
+        """Right-click menu: the common action first, then grouped submenus."""
         row = self.tree.identify_row(event.y)
         if not row:
             return
         if row not in self.tree.selection():
             self.tree.selection_set(row)
         sel = self.selected_accounts()
-        menu = themed_menu(self.root)
-        if row.startswith(GROUP_PREFIX):
-            group = row[len(GROUP_PREFIX):]
-            menu.add_command(label=f"Join game ({len(sel)} accounts)", command=self.join_selected)
-            menu.add_command(label="Join a player's server...", command=lambda: self.ask_join_player(sel))
-            menu.add_cascade(label=f"FPS cap ({len(sel)} accounts)", menu=self.fps_menu(menu, sel))
-            self.add_performance_items(menu, sel)
-            menu.add_separator()
-            menu.add_command(label="Rename group...", command=lambda: self.rename_group(group))
-            menu.add_command(label="Ungroup (keeps the accounts)", command=lambda: self.set_group(sel, None))
-            menu.tk_popup(event.x_root, event.y_root)
+        if not sel:
             return
-        menu.add_command(label="Join game" if len(sel) == 1 else f"Join game ({len(sel)} accounts)",
-                         command=self.join_selected)
+        many = f" ({len(sel)} accounts)" if len(sel) > 1 else ""
+        menu = themed_menu(self.root)
+        menu.add_command(label="Join game" + many, command=self.join_selected)
         menu.add_command(label="Join a player's server...", command=lambda: self.ask_join_player(sel))
-        if len(sel) == 1:
+        if len(sel) == 1 and not row.startswith(GROUP_PREFIX):
             acc = sel[0]
             wins = self.windows_of(acc)
-            menu.add_command(label="Show Roblox window", state="normal" if wins else "disabled",
-                             command=lambda: focus_window(wins[0][0]))
-            menu.add_command(label="Close Roblox window", state="normal" if wins else "disabled",
-                             command=lambda: [kill_process(pid) for _, pid in wins])
             p = self.presence.get(acc["id"]) or {}
+            if wins:
+                menu.add_command(label="Show Roblox window", command=lambda: focus_window(wins[0][0]))
+                menu.add_command(label="Close Roblox window", command=lambda: [kill_process(pid) for _, pid in wins])
             if p.get("userPresenceType") == 2 and p.get("gameId"):
                 menu.add_command(label="Use this account's server for joining",
                                  command=lambda: self.use_server_of(p))
-            menu.add_separator()
-            menu.add_command(label="Copy username", command=lambda: self.copy(acc["name"]))
-            menu.add_command(label="Open profile", command=lambda: webbrowser.open(
-                f"https://www.roblox.com/users/{acc['id']}/profile"))
-            menu.add_command(label="Turn anti-AFK on for this account" if self.afk_skipped(acc)
-                             else "Turn anti-AFK off for this account",
-                             command=lambda: self.toggle_afk_skip(acc))
-            menu.add_cascade(label="FPS cap", menu=self.fps_menu(menu, sel))
-            self.add_performance_items(menu, sel)
-            menu.add_cascade(label="Group", menu=self.group_menu(menu, sel))
-            menu.add_command(label="Edit note", command=lambda: self.edit_note(acc))
-            menu.add_command(label="Log in again", command=lambda: AddAccountDialog(self, acc))
-            menu.add_command(label="Move up", command=lambda: self.move(acc, -1))
-            menu.add_command(label="Move down", command=lambda: self.move(acc, 1))
-        else:
-            menu.add_cascade(label=f"FPS cap ({len(sel)} accounts)", menu=self.fps_menu(menu, sel))
-            self.add_performance_items(menu, sel)
-            menu.add_cascade(label=f"Group ({len(sel)} accounts)", menu=self.group_menu(menu, sel))
         menu.add_separator()
-        menu.add_command(label="Remove", command=self.remove_selected)
+        menu.add_cascade(label="Performance", menu=self.performance_menu(menu, sel))
+        if row.startswith(GROUP_PREFIX):
+            group = row[len(GROUP_PREFIX):]
+            menu.add_separator()
+            menu.add_command(label="Rename group...", command=lambda: self.rename_group(group))
+            menu.add_command(label="Ungroup (keeps the accounts)", command=lambda: self.set_group(sel, None))
+        else:
+            menu.add_cascade(label="Group", menu=self.group_menu(menu, sel))
+            if len(sel) == 1:
+                menu.add_cascade(label="Account", menu=self.account_menu(menu, sel[0]))
+            menu.add_separator()
+            menu.add_command(label="Remove" + many + "...", command=self.remove_selected)
         menu.tk_popup(event.x_root, event.y_root)
+
+    def performance_menu(self, parent, accounts):
+        menu = themed_menu(parent)
+        menu.add_cascade(label="FPS cap", menu=self.fps_menu(menu, accounts))
+        self.add_performance_items(menu, accounts)
+        menu.add_separator()
+        on = not any(self.afk_skipped(a) for a in accounts)
+        menu.add_command(label=("✓ " if on else "") + "Anti-AFK",
+                         command=lambda: self.set_afk_skip(accounts, on))
+        return menu
+
+    def account_menu(self, parent, acc):
+        menu = themed_menu(parent)
+        menu.add_command(label="Copy username", command=lambda: self.copy(acc["name"]))
+        menu.add_command(label="Open profile", command=lambda: webbrowser.open(
+            f"https://www.roblox.com/users/{acc['id']}/profile"))
+        menu.add_command(label="Edit note...", command=lambda: self.edit_note(acc))
+        menu.add_command(label="Log in again...", command=lambda: AddAccountDialog(self, acc))
+        menu.add_separator()
+        menu.add_command(label="Move up", command=lambda: self.move(acc, -1))
+        menu.add_command(label="Move down", command=lambda: self.move(acc, 1))
+        return menu
 
     # ------------------------------------------------------------ FPS caps
     def fps_caps(self):
@@ -2573,7 +2643,7 @@ class App:
         text = self.place_var.get()
         if parse_private_server(text):
             messagebox.showinfo("Servers", "A private server link already points at one server, so there's "
-                                "no list to browse. Just click Join selected.", parent=self.root)
+                                "no list to browse. Just click Join.", parent=self.root)
             return
         place_id = parse_place_id(text)
         if not place_id:
@@ -2658,13 +2728,15 @@ class App:
     def afk_skipped(self, acc):
         return acc["id"] in self.afk_skip_ids()
 
-    def toggle_afk_skip(self, acc):
+    def set_afk_skip(self, accounts, skip_them):
         skip = self.afk_skip_ids()
-        skip ^= {acc["id"]}
+        for acc in accounts:
+            (skip.add if skip_them else skip.discard)(acc["id"])
         self.settings["afk_skip"] = sorted(skip)
         save_settings(self.settings)
         self.refresh()
-        self.status.config(text=f"Anti-AFK {'off' if acc['id'] in skip else 'on'} for @{acc['name']}.")
+        who = f"@{accounts[0]['name']}" if len(accounts) == 1 else f"{len(accounts)} accounts"
+        self.status.config(text=f"Anti-AFK {'off' if skip_them else 'on'} for {who}.")
 
     def afk_due(self):
         """Timer callback for the next ping. Whatever goes wrong, it always leaves a timer running
@@ -2988,7 +3060,8 @@ class App:
 
     def join_finished(self, problems):
         self.joining = False
-        self.join_btn.config(state="normal", text="Join selected")
+        self.join_btn.config(state="normal")
+        self.update_join_label()
         self.status.config(text="Done." if not problems else "Done, with problems.")
         self.refresh()
         if self.auto_tile_var.get() and len(roblox_windows()) > 1:

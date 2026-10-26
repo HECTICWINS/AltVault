@@ -884,6 +884,72 @@ class TestWindow(unittest.TestCase):
         for key in ("fps_caps", "low_graphics", "muted"):
             self.app.settings.pop(key)
 
+    def right_click(self, row):
+        """The labels of the menu a right-click on `row` opens, with its submenus' labels."""
+        shown = []
+
+        def labels(menu):
+            items = []
+            for i in range(menu.index("end") + 1):
+                if menu.type(i) == "separator":
+                    continue
+                label = menu.entrycget(i, "label")
+                if menu.type(i) == "cascade":
+                    sub = self.root.nametowidget(menu.entrycget(i, "menu"))
+                    items.append((label, labels(sub)))
+                else:
+                    items.append(label)
+            return items
+        self.app.tree.selection_set(row)
+        with mock.patch.object(self.app.tree, "identify_row", lambda y: row), \
+                mock.patch.object(av.tk.Menu, "tk_popup", lambda menu, x, y: shown.append(labels(menu))):
+            self.app.show_menu(types.SimpleNamespace(y=1, x_root=0, y_root=0))
+        return shown[0]
+
+    def test_account_menu_is_grouped(self):
+        top = self.right_click("4")
+        names = [item if isinstance(item, str) else item[0] for item in top]
+        self.assertEqual(names, ["Join game", "Join a player's server...", "Performance", "Group", "Account", "Remove..."])
+        performance = dict(i for i in top if isinstance(i, tuple))["Performance"]
+        self.assertEqual([i if isinstance(i, str) else i[0] for i in performance],
+                         ["FPS cap", "Lowest graphics", "Mute", "✓ Anti-AFK"])
+        account = dict(i for i in top if isinstance(i, tuple))["Account"]
+        self.assertIn("Log in again...", account)
+
+    def test_group_header_menu(self):
+        names = [i if isinstance(i, str) else i[0] for i in self.right_click("group:Farm")]
+        self.assertEqual(names, ["Join game (2 accounts)", "Join a player's server...", "Performance",
+                                 "Rename group...", "Ungroup (keeps the accounts)"])
+
+    def test_join_button_counts_the_selection(self):
+        self.app.tree.selection_set(["4", "5"])
+        self.app.update_join_label()
+        self.assertEqual(self.app.join_btn.cget("text"), "Join 2 accounts")
+        self.app.tree.selection_set("group:Farm")
+        self.app.update_join_label()
+        self.assertEqual(self.app.join_btn.cget("text"), "Join 2 accounts")
+        self.app.tree.selection_set(())
+        self.app.update_join_label()
+        self.assertEqual(self.app.join_btn.cget("text"), "Join")
+
+    def test_anti_afk_off_for_several_accounts(self):
+        with mock.patch.object(av, "save_settings", lambda s: None):
+            self.app.set_afk_skip([self.app.account(4), self.app.account(5)], True)
+            self.assertEqual(self.app.afk_skip_ids(), {4, 5})
+            self.app.set_afk_skip([self.app.account(4)], False)
+            self.assertEqual(self.app.afk_skip_ids(), {5})
+            self.app.set_afk_skip([self.app.account(5)], False)
+
+    def test_settings_window(self):
+        saved = []
+        with mock.patch.object(av, "save_settings", lambda s: saved.append(dict(s))):
+            dialog = av.SettingsDialog(self.app)
+            dialog.key_var.set("f13")
+            dialog.set_key()
+            dialog.destroy()
+        self.assertEqual(saved[-1]["afk_key"], "f13")
+        self.app.settings.pop("afk_key")
+
 
 class TestRepoHygiene(unittest.TestCase):
     def test_only_standard_library(self):
