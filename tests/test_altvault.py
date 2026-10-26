@@ -115,8 +115,144 @@ class TestCookieOnlyGoesToRoblox(unittest.TestCase):
         self.assertTrue(av._is_roblox_url(launcher), launcher)
 
 
+class TestPrivateServers(unittest.TestCase):
+    def test_link_detection(self):
+        cases = {
+            "https://www.roblox.com/games/920587237/Adopt-Me?privateServerLinkCode=1234567890abcDEF_-x":
+                {"place_id": "920587237", "link_code": "1234567890abcDEF_-x"},
+            "roblox.com/games/123/x?foo=1&privateServerLinkCode=ABCDEF":
+                {"place_id": "123", "link_code": "ABCDEF"},
+            "https://www.roblox.com/share?code=a1b2c3d4e5f6&type=Server": {"share_code": "a1b2c3d4e5f6"},
+            "https://www.roblox.com/share?type=Server&code=a1b2c3d4e5f6": {"share_code": "a1b2c3d4e5f6"},
+            "https://www.roblox.com/share?code=a1b2c3d4e5f6": {"share_code": "a1b2c3d4e5f6"},
+            "https://www.roblox.com/privateServerLinkCode=1234?x": None,   # not a query parameter
+        }
+        for text, want in cases.items():
+            self.assertEqual(av.parse_private_server(text), want, text)
+        for text in ("https://www.roblox.com/games/920587237/Adopt-Me", "920587237", "",
+                     "https://www.roblox.com/share?code=abcd1234&type=ExperienceDetails",
+                     "https://evil.com/games/1/x?privateServerLinkCode=ABCDEF",
+                     "https://notroblox.com/share?code=abcd1234&type=Server"):
+            self.assertIsNone(av.parse_private_server(text), text)
+
+    def test_private_link_is_not_a_public_game(self):
+        """The old behaviour: pasting a private link joined a public server. It must now be private."""
+        link = "https://www.roblox.com/games/920587237/Adopt-Me?privateServerLinkCode=ABCDEF123"
+        self.assertEqual(av.parse_place_id(link), "920587237")       # still the right game...
+        self.assertIsNotNone(av.parse_private_server(link))           # ...but recognised as private
+
+    def test_launch_request_for_private_server(self):
+        uri = av.build_launch_uri(FAKE_TICKET, "920587237", "ignored-job", "ABCDEF123")
+        launcher = urllib.parse.unquote(uri.split("placelauncherurl:")[1].split("+")[0])
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(launcher).query)
+        self.assertTrue(av._is_roblox_url(launcher))
+        self.assertEqual(query["request"], ["RequestPrivateGame"])
+        self.assertEqual(query["placeId"], ["920587237"])
+        self.assertEqual(query["linkCode"], ["ABCDEF123"])
+        self.assertNotIn("gameId", query)
+
+    def test_public_requests_are_unchanged(self):
+        for job, want in (("", "RequestGame"), ("0a1b2c3d-1111-2222-3333-444455556666", "RequestGameJob")):
+            uri = av.build_launch_uri(FAKE_TICKET, "1", job)
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(
+                urllib.parse.unquote(uri.split("placelauncherurl:")[1].split("+")[0])).query)
+            self.assertEqual(query["request"], [want])
+            self.assertNotIn("linkCode", query)
+
+    def _resolve(self, status, body):
+        calls = []
+
+        def fake_post(url, cookie, payload=None, extra_headers=None):
+            calls.append((url, payload))
+            return status, {}, body
+        with mock.patch.object(av, "_post", fake_post):
+            try:
+                return av.resolve_share_link(FAKE_COOKIE, "a1b2c3d4"), calls
+            except av.RobloxError as e:
+                return e, calls
+
+    def test_share_link_resolves(self):
+        body = b'{"privateServerInviteData": {"status": "Valid", "placeId": 920587237, "linkCode": "LC123"}}'
+        result, calls = self._resolve(200, body)
+        self.assertEqual(result, ("920587237", "LC123"))
+        url, payload = calls[0]
+        self.assertTrue(av._is_roblox_url(url))
+        self.assertEqual(payload, {"linkId": "a1b2c3d4", "linkType": "Server"})
+
+    def test_share_link_failures_are_clear_errors(self):
+        bad = [(200, b'{"privateServerInviteData": {"status": "Expired", "placeId": 1, "linkCode": "x"}}'),
+               (200, b'{"privateServerInviteData": {"status": "Valid", "placeId": null, "linkCode": "x"}}'),
+               (200, b'{"privateServerInviteData": null}'), (200, b"not json"), (200, b"[]"),
+               (400, b"{}"), (500, b"")]
+        for status, body in bad:
+            result, _ = self._resolve(status, body)
+            self.assertIsInstance(result, av.RobloxError, body)
+            self.assertNotIn("a1b2c3d4", str(result))
+
+    def run_join(self, accounts, private, expired_cookies=()):
+        launched, resolved, finished = [], [], []
+        windows = []
+
+        def fake_resolve(cookie, code):
+            resolved.append(cookie)
+            if cookie in expired_cookies:
+                raise av.CookieExpired()
+            return "920587237", "LC123"
+
+        def fake_launch(cookie, place_id, job_id="", link_code=""):
+            launched.append((cookie, place_id, job_id, link_code))
+            windows.append((1000 + len(windows), 2000 + len(windows), "Roblox"))
+
+        fake = types.SimpleNamespace(expired=set(), running={}, presence={},
+                                     set_status=lambda text: None, ui=lambda fn, *a: fn(*a),
+                                     join_finished=finished.append, remember_place=lambda c, p: None)
+        for name in ("join_worker", "resolve_private", "wait_for_new_window"):
+            setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
+        fake.wait_for_server = lambda *a: self.fail("same-server logic ran for a private server")
+        with mock.patch.object(av, "resolve_share_link", fake_resolve), \
+                mock.patch.object(av, "launch", fake_launch), \
+                mock.patch.object(av, "roblox_windows", lambda: list(windows)), \
+                mock.patch.object(av.time, "sleep", lambda s: None), \
+                mock.patch.object(av.threading, "Thread", lambda target, args=(), daemon=None:
+                                  types.SimpleNamespace(start=lambda: target(*args))):
+            fake.join_worker(accounts, None, "", True, private)
+        return launched, resolved, finished[0], fake
+
+    def test_whole_join_through_a_share_link(self):
+        accounts = [{"id": i, "name": f"alt{i}", "cookie": f"cookie{i}"} for i in range(3)]
+        launched, resolved, problems, _ = self.run_join(accounts, {"share_code": "a1b2c3d4"})
+        self.assertEqual(resolved, ["cookie0"], "the link should be resolved once")
+        self.assertEqual(launched, [(f"cookie{i}", "920587237", "", "LC123") for i in range(3)])
+        self.assertEqual(problems, [])
+
+    def test_share_link_falls_back_to_a_logged_in_account(self):
+        accounts = [{"id": i, "name": f"alt{i}", "cookie": f"cookie{i}"} for i in range(2)]
+        _, resolved, _, fake = self.run_join(accounts, {"share_code": "a1b2c3d4"}, expired_cookies={"cookie0"})
+        self.assertEqual(resolved, ["cookie0", "cookie1"])
+        self.assertIn(0, fake.expired)
+
+    def test_old_style_link_needs_no_resolving(self):
+        accounts = [{"id": 1, "name": "alt", "cookie": "c"}]
+        launched, resolved, problems, _ = self.run_join(accounts, {"place_id": "55", "link_code": "OLD1"})
+        self.assertEqual(resolved, [])
+        self.assertEqual(launched, [("c", "55", "", "OLD1")])
+        self.assertEqual(problems, [])
+
+    def test_private_link_is_never_saved(self):
+        saved = []
+        fake = types.SimpleNamespace(
+            settings={"place": "https://www.roblox.com/games/1/Public"},
+            place_var=types.SimpleNamespace(get=lambda: "https://www.roblox.com/share?code=SECRET123&type=Server"),
+            **{name: types.SimpleNamespace(get=lambda: True)
+               for name in ("multi_var", "same_server_var", "auto_tile_var", "anti_afk_var")})
+        with mock.patch.object(av, "save_settings", lambda s: saved.append(dict(s))):
+            av.App.save_settings(fake)
+        self.assertNotIn("SECRET123", repr(saved))
+        self.assertEqual(saved[-1]["place"], "https://www.roblox.com/games/1/Public")
+
+
 class TestSecretsNeverLeak(unittest.TestCase):
-    SECRET_NAMES = {"cookie", "ticket", "uri"}
+    SECRET_NAMES = {"cookie", "ticket", "uri", "link_code", "share_code", "private"}
 
     @classmethod
     def setUpClass(cls):

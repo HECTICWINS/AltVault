@@ -32,6 +32,7 @@ A secure, lightweight Roblox account manager for Windows. Download, unzip, doubl
 - **Log in with browser:** add accounts by logging in normally. You don't need developer tools or cookie copying.
 - **Saved accounts:** logins are encrypted with Windows DPAPI.
 - **Join:** launch one or many accounts into a game, optionally all into the same server or a specific Job ID.
+- **Private servers:** paste a private server link and every selected account joins that private server.
 - **Multi-Roblox:** run several clients at once.
 - **Auto-tile:** arrange any number of Roblox windows in an even grid.
 - **Live status:** see who's online or in game, with avatars.
@@ -66,7 +67,7 @@ Get-FileHash .\AltVault-*-win64.zip
 If you have the [GitHub CLI](https://cli.github.com), you can also confirm GitHub built the file from this repository:
 
 ```powershell
-gh attestation verify .\AltVault-2.1.1-win64.zip --repo HECTICWINS/AltVault
+gh attestation verify .\AltVault-2.2.0-win64.zip --repo HECTICWINS/AltVault
 ```
 
 The download includes its own copy of Python, so one or two lesser-known engines may flag it; that's a common false positive for Python apps.
@@ -112,6 +113,17 @@ Prefer not to use a browser window? Choose **Paste a cookie instead**. To get th
 
 > **A Roblox login cookie is equivalent to your password.** Only give it to software you trust and have read.
 > AltVault is a single readable file so that you can check exactly what it does with it.
+
+## Joining a private server
+
+Paste the private server link into the **Game** box, select the accounts and click **Join selected**. Both kinds of link work:
+
+- share links, such as `https://www.roblox.com/share?code=...&type=Server`, which is what Roblox's **Copy link** button gives you now;
+- older links, such as `https://www.roblox.com/games/123456/Game-Name?privateServerLinkCode=...`.
+
+Every selected account joins that private server, so the **Server / Job ID** box and **Same server** are ignored.
+Each account must be allowed in: for a friends-only private server, every alt needs to be friends with the owner.
+A private server link works like an invite, so AltVault never saves it to `settings.json` or the log.
 
 ## Anti-AFK
 

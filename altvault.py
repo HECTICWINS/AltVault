@@ -32,7 +32,7 @@ import zlib
 from tkinter import messagebox, simpledialog, ttk
 
 APP_TITLE = "AltVault"
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.2.0"
 APP_DIR = os.path.join(os.environ["LOCALAPPDATA"], "AltVault")
 DATA_FILE = os.path.join(APP_DIR, "accounts.dat")
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
@@ -970,13 +970,31 @@ def get_auth_ticket(cookie):
     return ticket
 
 
-def build_launch_uri(ticket, place_id, job_id=""):
+def resolve_share_link(cookie, code):
+    """Turns a roblox.com/share?code=...&type=Server link into (place_id, link_code)."""
+    status, _, body = _post("https://apis.roblox.com/sharelinks/v1/resolve-link", cookie,
+                            {"linkId": code, "linkType": "Server"})
+    if status != 200:
+        raise RobloxError(f"Roblox couldn't open that private server link (HTTP {status}).")
+    try:
+        invite = json.loads(body)["privateServerInviteData"]
+        state, place_id, link_code = invite.get("status"), invite.get("placeId"), invite.get("linkCode")
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise RobloxError("Roblox sent an unexpected reply about that private server link.") from None
+    if state != "Valid" or not place_id or not link_code:
+        raise RobloxError("That private server link has expired or been turned off. Ask the owner for a new one.")
+    return str(int(place_id)), str(link_code)
+
+
+def build_launch_uri(ticket, place_id, job_id="", link_code=""):
     tracker = str(random.randint(10**11, 10**12 - 1))
-    params = {"request": "RequestGameJob" if job_id else "RequestGame",
-              "browserTrackerId": tracker, "placeId": place_id,
+    request = "RequestPrivateGame" if link_code else "RequestGameJob" if job_id else "RequestGame"
+    params = {"request": request, "browserTrackerId": tracker, "placeId": place_id,
               "isPlayTogetherGame": "false", "joinAttemptId": str(uuid.uuid4()),
               "joinAttemptOrigin": "PlayButton"}
-    if job_id:
+    if link_code:
+        params["linkCode"] = link_code
+    elif job_id:
         params["gameId"] = job_id
     launcher = "https://www.roblox.com/Game/PlaceLauncher.ashx?" + urllib.parse.urlencode(params)
     return "+".join([
@@ -988,9 +1006,9 @@ def build_launch_uri(ticket, place_id, job_id=""):
     ])
 
 
-def launch(cookie, place_id, job_id=""):
+def launch(cookie, place_id, job_id="", link_code=""):
     try:
-        os.startfile(build_launch_uri(get_auth_ticket(cookie), place_id, job_id))
+        os.startfile(build_launch_uri(get_auth_ticket(cookie), place_id, job_id, link_code))
     except OSError as e:
         # The OSError text includes the launch link, which holds a login ticket, so it must not
         # reach the log or a dialog.
@@ -1197,6 +1215,28 @@ def parse_place_id(text):
     m = (re.search(r"roblox\.com/(?:[a-z]{2}/)?games/(\d+)", text) or re.search(r"placeId=(\d+)", text)
          or re.search(r"\((\d+)\)\s*$", text))
     return m.group(1) if m else None
+
+
+PRIVATE_CODE = r"([A-Za-z0-9_-]{4,200})"
+
+
+def parse_private_server(text):
+    """Recognises private server links. Returns None for anything else, or a dict with either
+    'link_code' (and 'place_id') for roblox.com/games/...?privateServerLinkCode=... links, or
+    'share_code' for roblox.com/share?code=...&type=Server links, which need resolving first."""
+    text = text.strip()
+    if not re.search(r"(^|[/.])roblox\.com/", text, re.I):
+        return None
+    m = re.search(r"[?&]privateServerLinkCode=" + PRIVATE_CODE, text)
+    if m:
+        place = re.search(r"roblox\.com/(?:[a-z]{2}/)?games/(\d+)", text, re.I)
+        return {"place_id": place.group(1) if place else None, "link_code": m.group(1)}
+    if re.search(r"roblox\.com/share\?", text, re.I):
+        code = re.search(r"[?&]code=" + PRIVATE_CODE, text)
+        kind = re.search(r"[?&]type=(\w+)", text)
+        if code and (not kind or kind.group(1).lower() == "server"):
+            return {"share_code": code.group(1)}
+    return None
 
 
 def parse_job_id(text):
@@ -1502,7 +1542,7 @@ class App:
         ttk.Entry(game, textvariable=self.job_var).grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=(2, 0))
         game.columnconfigure(0, weight=3)
         game.columnconfigure(1, weight=2)
-        ttk.Label(game, text="Paste a place ID or roblox.com/games link, or pick a recent game.",
+        ttk.Label(game, text="Paste a place ID, a game link or a private server link, or pick a recent game.",
                   style="Small.TLabel").grid(row=2, column=0, columnspan=2, sticky="w", pady=(3, 0))
         self.update_recents_box()
 
@@ -1575,9 +1615,12 @@ class App:
         save_accounts(self.accounts)
 
     def save_settings(self):
+        place = self.place_var.get().strip()
+        if parse_private_server(place):   # a private server link is an invite; never write it to disk
+            place = self.settings.get("place", "")
         self.settings.update(multi=self.multi_var.get(), same_server=self.same_server_var.get(),
                              auto_tile=self.auto_tile_var.get(), anti_afk=self.anti_afk_var.get(),
-                             place=self.place_var.get().strip())
+                             place=place)
         save_settings(self.settings)
 
     def status_of(self, acc):
@@ -2030,11 +2073,17 @@ class App:
             messagebox.showinfo("Join", "Select one or more accounts first (Ctrl+click for several).",
                                 parent=self.root)
             return
-        place_id = parse_place_id(self.place_var.get())
-        if not place_id:
-            messagebox.showerror("Join", "Enter a place ID or a roblox.com/games/... link.", parent=self.root)
+        private = parse_private_server(self.place_var.get())
+        if private and not private.get("share_code") and not private.get("place_id"):
+            messagebox.showerror("Join", "That private server link doesn't say which game it's for. Copy the "
+                                 "link again from the private server's menu on roblox.com.", parent=self.root)
             return
-        job_id = parse_job_id(self.job_var.get())
+        place_id = private.get("place_id") if private else parse_place_id(self.place_var.get())
+        if not private and not place_id:
+            messagebox.showerror("Join", "Enter a place ID, a roblox.com/games/... link or a private server link.",
+                                 parent=self.root)
+            return
+        job_id = "" if private else parse_job_id(self.job_var.get())
         if job_id is None:
             messagebox.showerror("Join", "The server / Job ID should look like "
                                  "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (or leave it empty).", parent=self.root)
@@ -2053,19 +2102,42 @@ class App:
         self.save_settings()
         self.joining = True
         self.join_btn.config(state="disabled", text="Joining...")
-        same_server = self.same_server_var.get() and len(sel) > 1
-        threading.Thread(target=self.join_worker, args=(sel, place_id, job_id, same_server),
+        # Everyone joining through a private server link ends up in that private server anyway.
+        same_server = self.same_server_var.get() and len(sel) > 1 and not private
+        if private and self.job_var.get().strip():
+            self.status.config(text="Joining a private server, so the Job ID box is ignored.")
+        threading.Thread(target=self.join_worker, args=(sel, place_id, job_id, same_server, private),
                          daemon=True).start()
 
-    def join_worker(self, accounts, place_id, job_id, same_server):
+    def resolve_private(self, accounts, private):
+        """(place_id, link_code) for a private server link, resolving share links with the first
+        account that's still logged in."""
+        if "link_code" in private:
+            return private["place_id"], private["link_code"]
+        self.set_status("Opening the private server link...")
+        for acc in accounts:
+            try:
+                return resolve_share_link(acc["cookie"], private["share_code"])
+            except CookieExpired:
+                self.expired.add(acc["id"])
+        raise RobloxError("Every selected account needs to log in again before it can open the link.")
+
+    def join_worker(self, accounts, place_id, job_id, same_server, private=None):
         problems = []
+        link_code = ""
         try:
+            if private:
+                try:
+                    place_id, link_code = self.resolve_private(accounts, private)
+                except RobloxError as e:
+                    problems.append(str(e))
+                    return
             for i, acc in enumerate(accounts):
                 last = i == len(accounts) - 1
                 self.set_status(f"Launching @{acc['name']} ({i + 1}/{len(accounts)})...")
                 before = {pid for _, pid, _ in roblox_windows()}
                 try:
-                    launch(acc["cookie"], place_id, job_id)
+                    launch(acc["cookie"], place_id, job_id, link_code)
                 except CookieExpired:
                     self.expired.add(acc["id"])
                     problems.append(f"@{acc['name']}: login expired — right-click > Log in again.")
@@ -2086,7 +2158,7 @@ class App:
                 if i == 0:
                     threading.Thread(target=self.remember_place, args=(acc["cookie"], place_id),
                                      daemon=True).start()
-                if same_server and not job_id and not last:
+                if same_server and not job_id and not link_code and not last:
                     self.set_status(f"Waiting for @{acc['name']} to reach a server...")
                     job_id = self.wait_for_server(acc, place_id) or ""
                     if not job_id:

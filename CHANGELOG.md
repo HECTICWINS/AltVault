@@ -2,6 +2,12 @@
 
 Every release on the [Releases](../../releases) page is built by GitHub from the tagged commit, comes with a build attestation, and is scanned by VirusTotal. See [Verify your download](README.md#verify-your-download).
 
+## 2.2.0
+
+- **Private servers:** paste a private server link into the Game box and every selected account joins that private server. Works with Roblox's share links (`roblox.com/share?code=...&type=Server`) and older `privateServerLinkCode` links. Before, pasting one joined a public server of that game instead.
+- Expired or turned-off private server links get a clear message instead of a silent public join.
+- Private server links are never saved to `settings.json` or written to the log, since they work like invites.
+
 ## 2.1.1
 
 - **Anti-AFK is far more reliable with several clients.** Each Roblox window is tracked on its own, so a window that misses a ping (for example mid-teleport) is retried by itself without delaying the rest. Any window that reaches 15 minutes is pinged straight away. Pings happen every 6–9 minutes.
