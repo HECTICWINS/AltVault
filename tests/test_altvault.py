@@ -1,0 +1,321 @@
+"""AltVault's automated checks. Run from the repo root on Windows:
+
+    py -3 -m unittest discover -s tests -v
+
+They never touch your real data: LOCALAPPDATA is pointed at a temporary folder before AltVault is
+imported, and nothing here talks to Roblox or any other server.
+"""
+import ast
+import http.server
+import importlib.util
+import os
+import random
+import subprocess
+import sys
+import tempfile
+import threading
+import types
+import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
+from unittest import mock
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SOURCE = os.path.join(ROOT, "altvault.py")
+TEMP_HOME = tempfile.mkdtemp(prefix="altvault-test-")
+os.environ["LOCALAPPDATA"] = TEMP_HOME
+
+_spec = importlib.util.spec_from_file_location("altvault", SOURCE)
+av = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(av)
+
+FAKE_COOKIE = "_|WARNING:-DO-NOT-SHARE-THIS.--|_" + "T3stC00kie" * 20
+FAKE_TICKET = "TICKET-" + "x" * 60
+
+
+class TestDataStaysInTempFolder(unittest.TestCase):
+    def test_app_dir_is_redirected(self):
+        self.assertTrue(av.APP_DIR.startswith(TEMP_HOME), "tests must never touch the real data folder")
+
+
+class TestCookieOnlyGoesToRoblox(unittest.TestCase):
+    def test_roblox_url_check(self):
+        good = ["https://www.roblox.com/", "https://auth.roblox.com/v1/x", "https://roblox.com", "https://WWW.ROBLOX.COM/a"]
+        bad = ["http://www.roblox.com/", "https://evilroblox.com/", "https://roblox.com.evil.com/",
+               "https://www.roblox.com@evil.com/", "https://evil.com/?u=https://www.roblox.com",
+               "ftp://www.roblox.com/", "https://roblox.co/", "javascript:alert(1)", ""]
+        for url in good:
+            self.assertTrue(av._is_roblox_url(url), url)
+        for url in bad:
+            self.assertFalse(av._is_roblox_url(url), url)
+
+    def test_cookie_refused_before_any_connection(self):
+        with mock.patch.object(av._opener, "open", side_effect=AssertionError("connected")) as opened:
+            for url in ("https://evil.com/", "http://www.roblox.com/", "https://evilroblox.com/"):
+                with self.assertRaises(av.RobloxError):
+                    av._request(url, FAKE_COOKIE)
+            opened.assert_not_called()
+
+    def test_redirect_away_from_roblox_drops_nothing_to_the_new_host(self):
+        """A real redirect between two local servers: the second must never see the cookie."""
+        seen = []
+
+        class Target(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(self.headers.get("Cookie"))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        target = http.server.HTTPServer(("127.0.0.1", 0), Target)
+        target_url = f"http://127.0.0.1:{target.server_port}/steal"
+
+        class Redirector(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", target_url)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        start = http.server.HTTPServer(("127.0.0.1", 0), Redirector)
+        for server in (target, start):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{start.server_port}/",
+                                         headers={"Cookie": ".ROBLOSECURITY=" + FAKE_COOKIE})
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                av._opener.open(req, timeout=5)
+            self.assertEqual(caught.exception.code, 302)
+            caught.exception.close()
+            self.assertEqual(seen, [], "the redirect target was contacted with the cookie")
+
+            # Without a cookie the same redirect is followed normally.
+            with av._opener.open(f"http://127.0.0.1:{start.server_port}/", timeout=5) as r:
+                self.assertEqual(r.status, 200)
+            self.assertEqual(seen, [None])
+        finally:
+            for server in (target, start):
+                server.shutdown()
+                server.server_close()
+
+    def test_browser_login_only_takes_roblox_cookies(self):
+        for domain in ("roblox.com", ".roblox.com", "www.roblox.com", ".WWW.Roblox.com"):
+            self.assertTrue(av.is_roblox_cookie_domain(domain), domain)
+        for domain in ("evilroblox.com", ".evilroblox.com", "roblox.com.evil.com", "", None, "com"):
+            self.assertFalse(av.is_roblox_cookie_domain(domain), domain)
+
+    def test_launch_link_only_points_at_roblox(self):
+        uri = av.build_launch_uri(FAKE_TICKET, "123", "0a1b2c3d-1111-2222-3333-444455556666")
+        launcher = urllib.parse.unquote(uri.split("placelauncherurl:")[1].split("+")[0])
+        self.assertTrue(av._is_roblox_url(launcher), launcher)
+
+
+class TestSecretsNeverLeak(unittest.TestCase):
+    SECRET_NAMES = {"cookie", "ticket", "uri"}
+
+    @classmethod
+    def setUpClass(cls):
+        with open(SOURCE, encoding="utf-8") as f:
+            cls.tree = ast.parse(f.read())
+
+    def _secret_refs(self, node):
+        found = []
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and sub.id in self.SECRET_NAMES:
+                found.append(sub.id)
+            elif isinstance(sub, ast.Attribute) and sub.attr in self.SECRET_NAMES:
+                found.append(sub.attr)
+            elif isinstance(sub, ast.Subscript) and isinstance(sub.slice, ast.Constant) \
+                    and sub.slice.value in self.SECRET_NAMES:
+                found.append(sub.slice.value)
+        return found
+
+    def test_no_log_call_mentions_a_secret(self):
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                    and isinstance(node.func.value, ast.Name) and node.func.value.id == "log":
+                refs = [r for a in node.args + [k.value for k in node.keywords] for r in self._secret_refs(a)]
+                self.assertEqual(refs, [], f"log call on line {node.lineno} uses {refs}")
+
+    def test_no_error_message_includes_a_secret(self):
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                    and node.func.id in ("RobloxError", "CookieExpired"):
+                refs = [r for a in node.args for r in self._secret_refs(a)]
+                self.assertEqual(refs, [], f"error on line {node.lineno} uses {refs}")
+
+    def test_no_print_calls(self):
+        prints = [n.lineno for n in ast.walk(self.tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "print"]
+        self.assertEqual(prints, [])
+
+    def test_failed_launch_hides_the_ticket(self):
+        err = OSError(2, f"cannot open roblox-player:1+gameinfo:{FAKE_TICKET}")
+        err.winerror = 2
+        with mock.patch.object(av, "get_auth_ticket", return_value=FAKE_TICKET), \
+                mock.patch.object(av.os, "startfile", side_effect=err, create=True):
+            with self.assertRaises(av.RobloxError) as caught:
+                av.launch(FAKE_COOKIE, "123")
+        self.assertNotIn(FAKE_TICKET, str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    def test_network_error_hides_the_request(self):
+        with mock.patch.object(av._opener, "open", side_effect=urllib.error.URLError("boom")):
+            with self.assertRaises(av.RobloxError) as caught:
+                av._request("https://users.roblox.com/v1/users/authenticated", FAKE_COOKIE)
+        self.assertNotIn(FAKE_COOKIE, str(caught.exception))
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    def test_cookie_format_check(self):
+        self.assertTrue(av.COOKIE_RE.fullmatch(FAKE_COOKIE))
+        for bad in (FAKE_COOKIE + "\n", FAKE_COOKIE[:30] + " " + FAKE_COOKIE[30:], "short", FAKE_COOKIE + "\r\nX: y"):
+            self.assertIsNone(av.COOKIE_RE.fullmatch(bad), repr(bad[-12:]))
+
+
+class TestStoredAccounts(unittest.TestCase):
+    def setUp(self):
+        self.accounts = [{"id": 1, "name": "test_user", "displayName": "Test", "cookie": FAKE_COOKIE, "note": ""}]
+        av.save_accounts(self.accounts)
+
+    def test_round_trip(self):
+        self.assertEqual(av.load_accounts(), self.accounts)
+
+    def test_file_is_encrypted(self):
+        with open(av.DATA_FILE, "rb") as f:
+            raw = f.read()
+        self.assertNotIn(FAKE_COOKIE.encode(), raw)
+        self.assertNotIn(b"test_user", raw)
+
+    def test_tampered_file_is_rejected(self):
+        with open(av.DATA_FILE, "rb") as f:
+            raw = bytearray(f.read())
+        raw[len(raw) // 2] ^= 0xFF
+        with self.assertRaises(OSError):
+            av.unprotect(bytes(raw))
+
+    def test_file_is_locked_to_this_user(self):
+        acl = subprocess.run(["icacls", av.DATA_FILE], capture_output=True, text=True).stdout
+        for group in ("Everyone", "BUILTIN\\Users", "Authenticated Users"):
+            self.assertNotIn(group, acl)
+        self.assertNotIn("(I)", acl, "inherited permissions should have been removed")
+
+
+class TestParsing(unittest.TestCase):
+    def test_place_ids(self):
+        cases = {"920587237": "920587237", "https://www.roblox.com/games/920587237/Adopt-Me": "920587237",
+                 "https://www.roblox.com/en/games/123/x": "123", "roblox.com/games/start?placeId=55": "55",
+                 "Tap Simulator  (72858262610964)": "72858262610964", "hello": None, "": None}
+        for text, want in cases.items():
+            self.assertEqual(av.parse_place_id(text), want, text)
+
+    def test_job_ids(self):
+        u = "0a1b2c3d-1111-2222-3333-444455556666"
+        self.assertEqual(av.parse_job_id(""), "")
+        self.assertEqual(av.parse_job_id(u), u)
+        self.assertEqual(av.parse_job_id("https://x/?gameInstanceId=" + u), u)
+        self.assertIsNone(av.parse_job_id("not a server"))
+
+
+class TestAntiAfkTiming(unittest.TestCase):
+    """Simulates 12 hours of Anti-AFK with four clients, a user who's often busy, a window that
+    misses a quarter of its pings, and a client that closes while another opens. Roblox kicks at
+    20 minutes; no window may come close."""
+
+    def simulate(self, seed, flaky=0.25, busy_user=0.6, hours=12):
+        rnd = random.Random(seed)
+        clock = [0.0]
+        windows = {101: 1, 102: 2, 103: 3, 104: 4}
+        last = {h: 0.0 for h in windows}
+        worst = {h: 0.0 for h in windows}
+
+        def fake_pass(hwnds, vk):
+            pinged, missed, reasons = [], [], {}
+            for h in hwnds:
+                if h == 103 and rnd.random() < flaky:
+                    missed.append(h)
+                    reasons[h] = "not responding"
+                else:
+                    pinged.append(h)
+                    worst[h] = max(worst[h], clock[0] - last[h])
+                    last[h] = clock[0]
+            clock[0] += 0.7 * len(hwnds)
+            return pinged, [], missed, reasons
+
+        timer = [None]
+        fake = types.SimpleNamespace(
+            root=types.SimpleNamespace(after=lambda ms, fn: timer.__setitem__(0, (clock[0] + ms / 1000, fn)) or 1,
+                                       after_cancel=lambda job: timer.__setitem__(0, None)),
+            anti_afk_var=types.SimpleNamespace(get=lambda: True), settings={}, running={}, joining=False,
+            afk_busy=False, afk_busy_since=0, afk_pass_id=0, afk_wait_started=None, afk_waiting_for=None,
+            afk_waiting_since=0, afk_waiting_logged=False, afk_last={}, afk_misses={}, afk_job=None,
+            status=types.SimpleNamespace(config=lambda **k: None), account=lambda i: None)
+        for name in ("schedule_afk", "afk_skip_ids", "afk_due", "_afk_due", "_afk_waiting",
+                     "afk_finished", "afk_next_delay", "afk_window_name"):
+            setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
+        fake.ui = lambda fn, *a: fn(*a)
+
+        user32 = types.SimpleNamespace(IsIconic=lambda h: False, GetWindowThreadProcessId=lambda h, p: None)
+        with mock.patch.object(av.time, "monotonic", lambda: clock[0]), \
+                mock.patch.object(av, "roblox_windows", lambda: [(h, p, "Roblox") for h, p in windows.items()]), \
+                mock.patch.object(av, "idle_seconds", lambda: 0.0 if rnd.random() < busy_user else 10.0), \
+                mock.patch.object(av, "_user32", user32), \
+                mock.patch.object(av, "anti_afk_pass", fake_pass), \
+                mock.patch.object(av.random, "uniform", rnd.uniform), \
+                mock.patch.object(av.threading, "Thread", lambda target, daemon: types.SimpleNamespace(start=target)), \
+                mock.patch.object(av.log, "info"):
+            fake.schedule_afk(3)
+            end, swapped = hours * 3600, False
+            while clock[0] < end:
+                due, fn = timer[0]
+                clock[0] = max(clock[0], due)
+                fn()
+                if not swapped and clock[0] > end / 2:
+                    windows.pop(104)
+                    windows[105] = 5
+                    last[105], worst[105], swapped = clock[0], 0.0, True
+        for h in windows:
+            worst[h] = max(worst[h], clock[0] - last[h])
+        return worst
+
+    def test_no_window_gets_near_the_idle_kick(self):
+        healthy = flaky = 0.0
+        for seed in range(30):
+            worst = self.simulate(seed)
+            flaky = max(flaky, worst[103])
+            healthy = max(healthy, max(v for h, v in worst.items() if h != 103))
+        self.assertLess(healthy / 60, 12, "a healthy window went too long without a ping")
+        self.assertLess(flaky / 60, 17, "a window that often misses went too long without a ping")
+
+    def test_calm_conditions_ping_on_schedule(self):
+        worst = self.simulate(1, flaky=0, busy_user=0)
+        self.assertLess(max(worst.values()) / 60, 9.5)
+
+
+class TestRepoHygiene(unittest.TestCase):
+    def test_only_standard_library(self):
+        with open(SOURCE, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        modules = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+        modules |= {n.module.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
+        third_party = sorted(m for m in modules if m not in sys.stdlib_module_names)
+        self.assertEqual(third_party, [])
+
+    def test_gitignore_keeps_personal_files_out(self):
+        with open(os.path.join(ROOT, ".gitignore"), encoding="utf-8") as f:
+            ignored = f.read()
+        for pattern in ("accounts.dat", "settings.json", "avatars/", "dist/"):
+            self.assertIn(pattern, ignored)
+
+    def test_version_is_in_the_changelog(self):
+        with open(os.path.join(ROOT, "CHANGELOG.md"), encoding="utf-8") as f:
+            self.assertIn(f"## {av.APP_VERSION}", f.read())
+
+
+if __name__ == "__main__":
+    unittest.main()

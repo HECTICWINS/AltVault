@@ -1,6 +1,13 @@
 # AltVault
 
+[![Tests](https://github.com/HECTICWINS/AltVault/actions/workflows/ci.yml/badge.svg)](https://github.com/HECTICWINS/AltVault/actions/workflows/ci.yml)
+[![Release build](https://github.com/HECTICWINS/AltVault/actions/workflows/release.yml/badge.svg)](https://github.com/HECTICWINS/AltVault/actions/workflows/release.yml)
+
 A secure, lightweight Roblox account manager for Windows. Download, unzip, double-click, and you're running.
+
+> **The only official download is the [Releases](https://github.com/HECTICWINS/AltVault/releases) page of this repository.**
+> Fake "AltVault" downloads on other sites, YouTube descriptions or Discord servers are a common way to steal Roblox accounts.
+> There's no paid version, no "pro" build and no installer. If someone offers you one, it isn't AltVault.
 
 ## Why AltVault
 
@@ -40,12 +47,26 @@ You don't need Python or anything else installed.
 
 ### Verify your download
 
-Every release is scanned automatically by [VirusTotal](https://www.virustotal.com), which checks it with about 70 antivirus engines.
-The release notes link to the full results for that exact file and list its SHA-256 hash.
-To confirm your download is the file that was scanned, run this in PowerShell and compare the hash:
+Every release zip is built by GitHub, not on anyone's PC, straight from the tagged source code.
+Before it's published, the [release workflow](.github/workflows/release.yml):
+
+1. runs the [automated tests](tests),
+2. checks that every program file carries a valid Python Software Foundation or Microsoft signature,
+3. checks that the zip contains nothing from the build machine and that its `altvault.py` is identical to the repo's,
+4. signs a **build attestation**: a certificate from GitHub saying exactly which commit and workflow produced the zip.
+
+Each published release is then scanned by [VirusTotal](https://www.virustotal.com) with about 70 antivirus engines, and the release notes link to the results for that exact file along with its SHA-256 hash.
+
+To check your download, run this in PowerShell from the folder you saved it to, and compare the hash with the one in the release notes:
 
 ```powershell
-Get-FileHash .\AltVault-2.1.1-win64.zip
+Get-FileHash .\AltVault-*-win64.zip
+```
+
+If you have the [GitHub CLI](https://cli.github.com), you can also confirm GitHub built the file from this repository:
+
+```powershell
+gh attestation verify .\AltVault-2.1.1-win64.zip --repo HECTICWINS/AltVault
 ```
 
 The download includes its own copy of Python, so one or two lesser-known engines may flag it; that's a common false positive for Python apps.
@@ -120,6 +141,12 @@ The key is only pressed once a Roblox window is confirmed to be in focus, so it 
 - **What DPAPI can't stop.** Any program running as *your* Windows user could decrypt the file, just as it could read your browser's cookies.
   Keep your PC free of malware.
 - **Expired cookies.** If a cookie leaks, logging that account out on roblox.com makes it invalid.
+- **Tested on every change.** The [tests](tests/test_altvault.py) check each claim above:
+  - cookies are refused for any non-Roblox or non-HTTPS address, including lookalikes such as `evilroblox.com`;
+  - a redirect away from Roblox is never followed with the cookie, tested against real local servers;
+  - no log line or error message can include a cookie or login ticket;
+  - the accounts file is encrypted, rejects tampering, and is locked to your Windows account.
+- **Found a problem?** Please report it privately; see [SECURITY.md](SECURITY.md).
 
 ## Files
 
@@ -132,14 +159,22 @@ The key is only pressed once a Roblox window is confirmed to be in focus, so it 
 
 ## Building the download
 
+Official releases are built by GitHub Actions; see [Verify your download](#verify-your-download).
+To make a release, add a section to [CHANGELOG.md](CHANGELOG.md), bump `APP_VERSION` in `altvault.py`, then push a tag such as `v2.1.2`.
+The release workflow builds, checks and attests the zip and attaches it to a draft release, which is published by hand.
+
+To build it yourself:
+
 ```
 py -3.13 build_release.py
+py -3.13 tests/check_release.py dist/AltVault-<version>-win64.zip
 ```
 
 This creates `dist/AltVault-<version>-win64.zip` from your python.org Python install.
 It copies the official, signed binaries unchanged, leaves out unused parts of Python, and adds `altvault.py`.
 A `AltVault._pth` file locks the bundled Python to its own folder, so `PYTHONPATH` and other installed packages can't inject code.
-Bump `APP_VERSION` in `altvault.py` before each release.
+
+To run the tests: `py -3 -m unittest discover -s tests -v`. They use a temporary folder and never touch your own accounts.
 
 ## Disclaimer
 

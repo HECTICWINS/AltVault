@@ -1114,6 +1114,13 @@ class DevTools:
             pass
 
 
+def is_roblox_cookie_domain(domain):
+    """True for roblox.com and its subdomains. A plain endswith("roblox.com") would also accept a
+    lookalike such as evilroblox.com."""
+    host = str(domain or "").lower().lstrip(".")
+    return host == "roblox.com" or host.endswith(".roblox.com")
+
+
 class BrowserLogin:
     """A throwaway browser window on the Roblox login page. wait() returns the cookie once the user
     has logged in; close() shuts the browser and deletes its profile. Safe to cancel from any thread."""
@@ -1148,7 +1155,7 @@ class BrowserLogin:
                     self._connect()
                 for c in self.devtools.call("Storage.getCookies").get("cookies", []):
                     if c.get("name") == ".ROBLOSECURITY" and c.get("value") \
-                            and str(c.get("domain", "")).lstrip(".").endswith("roblox.com"):
+                            and is_roblox_cookie_domain(c.get("domain")):
                         return c["value"]
             except (OSError, ValueError, KeyError):   # browser still starting, or reconnect needed
                 if self.devtools:

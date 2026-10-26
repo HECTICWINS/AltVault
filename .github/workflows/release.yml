@@ -1,0 +1,93 @@
+name: Release
+
+# Builds the download on GitHub's own machines from the tagged commit, so nobody's PC is involved:
+#   1. run the tests
+#   2. build the zip with build_release.py
+#   3. check every program file carries a valid Python Software Foundation or Microsoft signature
+#   4. check the zip holds nothing from the build machine and its app files match the repo
+#   5. sign a build attestation (verify with: gh attestation verify <zip> --repo HECTICWINS/AltVault)
+#   6. attach the zip to a draft release, which is published by hand after a look-over
+# Publishing then triggers the VirusTotal scan (virustotal.yml).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build, e.g. v2.1.1
+        required: true
+
+permissions:
+  contents: write       # create the draft release and upload the zip
+  id-token: write       # sign the build attestation
+  attestations: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.13"
+          architecture: x64
+
+      - name: Check the tag matches the app version
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path altvault.py -Pattern '^APP_VERSION = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$version" -ne $env:TAG) { throw "Tag $env:TAG doesn't match APP_VERSION $version" }
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Test
+        run: python -m unittest discover -s tests -v
+
+      - name: Build
+        run: python build_release.py
+
+      - name: Check every program file is signed
+        shell: pwsh
+        run: |
+          $bad = 0
+          Get-ChildItem dist/AltVault -Recurse -Include *.exe, *.dll, *.pyd | ForEach-Object {
+            $sig = Get-AuthenticodeSignature $_.FullName
+            $signer = $sig.SignerCertificate.Subject
+            if ($sig.Status -ne 'Valid' -or $signer -notmatch 'CN=(Python Software Foundation|Microsoft)') {
+              Write-Host "::error::$($_.Name): $($sig.Status) $signer"; $bad++
+            }
+          }
+          if ($bad) { throw "$bad unsigned or wrongly signed file(s)" }
+          "All program files are validly signed."
+
+      - name: Check the zip
+        run: python tests/check_release.py dist/AltVault-${{ env.VERSION }}-win64.zip
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: dist/AltVault-${{ env.VERSION }}-win64.zip
+
+      - name: Attach to a draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = "dist/AltVault-$env:VERSION-win64.zip"
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "SHA-256: $hash"
+          gh release view $env:TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG $zip --clobber --repo $env:GITHUB_REPOSITORY
+          } else {
+            # Notes: this version's section of CHANGELOG.md.
+            $log = Get-Content CHANGELOG.md -Raw
+            $notes = [regex]::Match($log, "(?ms)^## $([regex]::Escape($env:VERSION))\s*\r?\n(.*?)(?=^## |\z)").Groups[1].Value.Trim()
+            Set-Content notes.md "## What's new`n`n$notes`n`nInstall: download the zip below, unzip it anywhere and double-click **AltVault.exe**."
+            gh release create $env:TAG $zip --draft --verify-tag --title "AltVault $env:VERSION" --notes-file notes.md --repo $env:GITHUB_REPOSITORY
+          }

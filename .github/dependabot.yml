@@ -1,0 +1,8 @@
+# Keeps the pinned GitHub Actions up to date. AltVault itself has no dependencies to update:
+# it only uses Python's standard library.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
