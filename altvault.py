@@ -29,10 +29,10 @@ import urllib.request
 import uuid
 import webbrowser
 import zlib
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_TITLE = "AltVault"
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 APP_DIR = os.path.join(os.environ["LOCALAPPDATA"], "AltVault")
 DATA_FILE = os.path.join(APP_DIR, "accounts.dat")
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
@@ -48,6 +48,7 @@ SERVER_TIMEOUT = 45              # seconds to wait for the first account to reac
 PRESENCE_INTERVAL = 30_000       # ms between online/in-game status refreshes
 TICK_INTERVAL = 1_500            # ms between Roblox window checks
 MAX_RECENTS = 12
+GROUP_PREFIX = "group:"            # tree row ids of group headers
 # Anti-AFK: Roblox kicks after 20 idle minutes, and many games rejoin "idle" players into another
 # server shortly before that. Every window's own last ping is tracked, and a window that reaches
 # AFK_URGENT is pinged without waiting for the user to pause, so none can go past ~15 minutes.
@@ -172,11 +173,15 @@ class INPUT(ctypes.Structure):
     _fields_ = [("type", wt.DWORD), ("u", _U)]
 
 
-def _dpapi(func, data):
+def _dpapi(func, data, entropy=None):
     buf = ctypes.create_string_buffer(data, len(data))
     blob_in = DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    extra = None
+    if entropy:
+        ebuf = ctypes.create_string_buffer(entropy, len(entropy))
+        extra = ctypes.byref(DATA_BLOB(len(entropy), ctypes.cast(ebuf, ctypes.POINTER(ctypes.c_char))))
     blob_out = DATA_BLOB()
-    if not func(ctypes.byref(blob_in), None, None, None, None,
+    if not func(ctypes.byref(blob_in), None, extra, None, None,
                 CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(blob_out)):
         raise ctypes.WinError(ctypes.get_last_error())
     try:
@@ -818,13 +823,57 @@ def acquire_instance_lock():
     return handle
 
 
-# ---------------------------------------------------------------- per-account FPS caps
-# Roblox's own Maximum Frame Rate setting (FramerateCap in GlobalBasicSettings_<n>.xml) is read
-# once, when a client starts. Writing an account's cap just before launching it, then putting
-# the user's own value back, gives every account its own cap without touching running clients.
+# ---------------------------------------------------------------- per-account client settings
+# Roblox's own player settings (GlobalBasicSettings_<n>.xml) are read once, when a client starts.
+# Writing an account's values (FPS cap, lowest graphics, mute) just before launching it, then
+# putting the user's own values back, gives every account its own settings without touching
+# running clients. Nothing is injected into Roblox; these are the same settings its menu changes.
 FPS_PRESETS = (15, 20, 30, 45, 60)
 FPS_RANGE = (5, 240)
-_FPS_TAG = re.compile(rb'(<int name="FramerateCap">)(-?\d+)(</int>)')
+# Settings AltVault may change, by name, with their XML type in Roblox's file.
+CLIENT_SETTINGS = {"FramerateCap": b"int", "SavedQualityLevel": b"token",
+                   "GraphicsQualityLevel": b"int", "MasterVolume": b"float"}
+LOW_GRAPHICS = {"SavedQualityLevel": "1", "GraphicsQualityLevel": "1"}   # Roblox's lowest level
+MUTED = {"MasterVolume": "0"}
+
+
+def _setting_tag(name):
+    kind = CLIENT_SETTINGS[name]
+    return re.compile(rb"(<" + kind + rb' name="' + name.encode() + rb'">)(-?[0-9.]+)(</' + kind + rb">)")
+
+
+
+def read_client_settings(path):
+    """{name: value as text} for each of CLIENT_SETTINGS found in Roblox's file; {} if unreadable."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return {}
+    found = {}
+    for name in CLIENT_SETTINGS:
+        m = _setting_tag(name).search(data)
+        if m:
+            found[name] = m.group(2).decode()
+    return found
+
+
+def write_client_settings(path, values):
+    """Changes only the given settings' numbers; every other byte of Roblox's file stays as it was."""
+    with open(path, "rb") as f:
+        data = f.read()
+    new = data
+    for name, value in values.items():
+        if not re.fullmatch(r"-?[0-9]+(\.[0-9]+)?", str(value)):
+            raise ValueError(f"not a number: {value!r}")
+        new, found = _setting_tag(name).subn(lambda m: m.group(1) + str(value).encode() + m.group(3), new, count=1)
+        if not found:
+            raise OSError(f"Roblox's settings file has no {name} setting")
+    if new != data:
+        tmp = path + ".altvault.tmp"
+        with open(tmp, "wb") as f:
+            f.write(new)
+        os.replace(tmp, path)
 
 
 def roblox_settings_file():
@@ -840,26 +889,53 @@ def roblox_settings_file():
 
 
 def read_fps_cap(path):
-    try:
-        with open(path, "rb") as f:
-            m = _FPS_TAG.search(f.read())
-    except OSError:
-        return None
-    return int(m.group(2)) if m else None
+    value = read_client_settings(path).get("FramerateCap")
+    return int(value) if value is not None else None
 
 
 def write_fps_cap(path, value):
-    """Changes only the FramerateCap number; every other byte of Roblox's file stays as it was."""
+    write_client_settings(path, {"FramerateCap": int(value)})
+
+
+# ---------------------------------------------------------------- import from Roblox Account Manager
+# RAM (github.com/ic3w0lf22/Roblox-Account-Manager) saves AccountData.json either as plain JSON or
+# encrypted with Windows DPAPI plus this fixed entropy from its source code. Its optional password
+# encryption can't be read without the password, so that case is reported instead.
+RAM_ENTROPY = b"ROBLOX ACCOUNT MANAGER | :) | BROUGHT TO YOU BUY ic3w0lf"
+RAM_PASSWORD_HEADER = b"Roblox Account Manager created by ic3w0lf22 @ github.com ......."
+
+
+def read_ram_accounts(path):
+    """[{'cookie', 'name', 'group', 'note'}] from RAM's AccountData.json. Passwords RAM may have
+    saved are never read."""
     with open(path, "rb") as f:
         data = f.read()
-    new, found = _FPS_TAG.subn(lambda m: m.group(1) + str(int(value)).encode() + m.group(3), data, count=1)
-    if not found:
-        raise OSError("Roblox's settings file has no frame rate setting")
-    if new != data:
-        tmp = path + ".altvault.tmp"
-        with open(tmp, "wb") as f:
-            f.write(new)
-        os.replace(tmp, path)
+    if data.startswith(RAM_PASSWORD_HEADER):
+        raise RobloxError("This RAM file is protected with a password. In RAM, turn off password "
+                          "encryption, let it save, then import again.")
+    text = data.decode("utf-8-sig", "replace").lstrip()
+    if not text.startswith(("[", "{")):   # anything that isn't plain JSON is RAM's encrypted format
+        try:
+            text = _dpapi(_crypt32.CryptUnprotectData, data, RAM_ENTROPY).decode("utf-8-sig")
+        except OSError:
+            raise RobloxError("Couldn't decrypt this RAM file. It can only be read on the PC and Windows "
+                              "account that RAM saved it on.") from None
+    try:
+        items = json.loads(text)
+    except ValueError:
+        raise RobloxError("That file isn't a RAM AccountData.json.") from None
+    if not isinstance(items, list):
+        raise RobloxError("That file isn't a RAM AccountData.json.")
+    found = []
+    for item in items:
+        if not isinstance(item, dict) or not COOKIE_RE.fullmatch(str(item.get("SecurityToken") or "")):
+            continue
+        group = str(item.get("Group") or "").strip()
+        notes = [str(item.get(k) or "").strip() for k in ("Alias", "Description")]
+        found.append({"cookie": item["SecurityToken"], "name": str(item.get("Username") or ""),
+                      "group": None if group in ("", "Default") else group[:40],
+                      "note": " · ".join(n for n in notes if n)[:200]})
+    return found
 
 
 # ---------------------------------------------------------------- storage
@@ -1028,6 +1104,66 @@ def get_place_name(cookie, place_id):
     except (RobloxError, ValueError, KeyError):
         pass
     return None
+
+
+def get_servers(place_id, cursor="", fewest_first=True):
+    """One page of a game's public servers as ([{id, playing, maxPlayers, ping, fps}], next_cursor).
+    Full servers are left out. This list is public, so no cookie is sent."""
+    query = urllib.parse.urlencode({"sortOrder": "Asc" if fewest_first else "Desc", "limit": 100,
+                                    "excludeFullGames": "true", **({"cursor": cursor} if cursor else {})})
+    status, _, body = _request(f"https://games.roblox.com/v1/games/{int(place_id)}/servers/Public?{query}")
+    if status == 429:
+        raise RobloxError("Roblox is rate-limiting server lists. Wait a few seconds and try again.")
+    if status != 200:
+        raise RobloxError(f"Couldn't load servers (HTTP {status}).")
+    try:
+        page = json.loads(body)
+        servers = [{"id": s["id"], "playing": int(s.get("playing") or 0), "maxPlayers": int(s["maxPlayers"]),
+                    "ping": s.get("ping"), "fps": s.get("fps")}
+                   for s in page.get("data") or [] if re.fullmatch(UUID_RE, str(s.get("id", "")))]
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise RobloxError("Roblox sent an unexpected server list.") from None
+    return servers, page.get("nextPageCursor") or ""
+
+
+def find_user(username):
+    """{'id', 'name'} for a Roblox username, or None if there's no such (unbanned) user. Public, so
+    no cookie is sent."""
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,20}", username):
+        return None
+    status, _, body = _request("https://users.roblox.com/v1/usernames/users", None, "POST",
+                               {"Content-Type": "application/json"},
+                               json.dumps({"usernames": [username], "excludeBannedUsers": True}).encode())
+    if status != 200:
+        raise RobloxError(f"Couldn't look up that username (HTTP {status}).")
+    try:
+        users = json.loads(body)["data"]
+        return {"id": int(users[0]["id"]), "name": str(users[0]["name"])} if users else None
+    except (ValueError, KeyError, TypeError, IndexError):
+        raise RobloxError("Roblox sent an unexpected reply about that username.") from None
+
+
+def server_of_player(cookie, username):
+    """(place_id, job_id, player_name) for the server a player is in, as seen by the account whose
+    cookie is given. Raises RobloxError with a plain explanation when it can't be seen."""
+    user = find_user(username.strip().lstrip("@"))
+    if not user:
+        raise RobloxError(f"There's no Roblox user called {username.strip()!r}.")
+    p = get_presence(cookie, user["id"])
+    if p.get("userPresenceType") != 2:
+        raise RobloxError(f"@{user['name']} isn't in a game right now.")
+    place, job = p.get("rootPlaceId") or p.get("placeId"), p.get("gameId")
+    if not place or not job or not re.fullmatch(UUID_RE, str(job)):
+        raise RobloxError(f"@{user['name']} is in a game, but their privacy settings hide which server. "
+                          "Usually you need to be friends with them.")
+    return str(int(place)), str(job), user["name"]
+
+
+def pick_smallest_server(servers, needed):
+    """The least busy server that still has room for `needed` more players, or None."""
+    fits = [s for s in servers if s["maxPlayers"] - s["playing"] >= needed]
+    return min(fits, key=lambda s: (s["playing"], s["ping"] if isinstance(s["ping"], (int, float)) else 9999),
+               default=None)
 
 
 def get_headshots(user_ids, size):
@@ -1437,12 +1573,27 @@ class AddAccountDialog(tk.Toplevel):
         ttk.Label(self.paste, text="A cookie works like a password. Only ever paste it into AltVault.",
                   style="Small.TLabel").pack(anchor="w", pady=(4, 0))
 
+        if not for_account:
+            ttk.Button(frm, text="Import from Roblox Account Manager...", command=self.import_ram).pack(
+                anchor="w", pady=(6, 0))
         ttk.Button(frm, text="Close", command=self.destroy).pack(side="bottom", anchor="e", pady=(14, 0))
         self.cookie_entry.bind("<Return>", lambda _e: self.submit())
         self.bind("<Escape>", lambda _e: self.destroy())
         dark_title_bar(self)
         self.grab_set()
         self.login_btn.focus_set()
+
+    def import_ram(self):
+        path = filedialog.askopenfilename(parent=self, title="RAM's AccountData.json",
+                                          filetypes=[("RAM accounts", "AccountData.json"), ("JSON", "*.json")])
+        if not path:
+            return
+        self.status.config(text="Reading and checking accounts...", style="Muted.TLabel")
+
+        def report(text):
+            if self.winfo_exists():
+                self.status.config(text=text, style="Muted.TLabel")
+        threading.Thread(target=import_ram_into, args=(self.app, path, report), daemon=True).start()
 
     def toggle_paste(self):
         if self.paste.winfo_ismapped():
@@ -1551,6 +1702,153 @@ class AddAccountDialog(tk.Toplevel):
         self.destroy()
 
 
+def import_ram_into(app, path, report):
+    """Reads a RAM file, checks every login with Roblox, then saves the working ones in one go.
+    report(text) is called on the Tk thread with the outcome."""
+    try:
+        entries = read_ram_accounts(path)
+    except (RobloxError, OSError) as e:
+        message = str(e)
+        app.ui(report, message)
+        return
+    good, expired = [], []
+    for i, entry in enumerate(entries, 1):
+        app.set_status(f"Checking imported account {i}/{len(entries)}...")
+        try:
+            good.append((get_user(entry["cookie"]), entry))
+        except RobloxError as e:
+            if not isinstance(e, CookieExpired):
+                log.warning("Import check failed: %s", e)
+            expired.append(entry["name"] or "an account")
+
+    def save():
+        app.add_many(good)
+        if not entries:
+            report("No accounts were found in that file.")
+            return
+        text = f"Imported {len(good)} account{'s' if len(good) != 1 else ''}."
+        if expired:
+            text += (f" Skipped {len(expired)} whose login has expired: " + ", ".join(expired[:8]) +
+                     ("..." if len(expired) > 8 else "") + ". Add those again with Log in with browser.")
+        report(text)
+    app.ui(save)
+
+
+class ServerBrowser(tk.Toplevel):
+    """A game's public servers with player counts, ping and FPS. Pick one to join with the selected
+    accounts, or let AltVault pick the least busy one that has room for all of them."""
+
+    def __init__(self, app, place_id):
+        super().__init__(app.root, bg=C["bg"])
+        self.app, self.place_id = app, place_id
+        self.servers, self.cursor, self.loading = [], "", False
+        self.title("Servers")
+        self.transient(app.root)
+        self.geometry(f"{int(560 * app.scale)}x{int(460 * app.scale)}")
+        frm = ttk.Frame(self, padding=14)
+        frm.pack(fill="both", expand=True)
+        top = ttk.Frame(frm)
+        top.pack(fill="x")
+        self.heading = ttk.Label(top, text="Loading servers...", style="Title.TLabel")
+        self.heading.pack(side="left")
+        self.order = tk.StringVar(value="Fewest players")
+        order = ttk.Combobox(top, textvariable=self.order, state="readonly", width=16,
+                             values=("Fewest players", "Most players"))
+        order.pack(side="right")
+        order.bind("<<ComboboxSelected>>", lambda _e: self.reload())
+
+        btns = ttk.Frame(frm)
+        btns.pack(side="bottom", fill="x", pady=(10, 0))
+        self.join_btn = ttk.Button(btns, text="Join this server", style="Accent.TButton", command=self.join_selected)
+        self.join_btn.pack(side="right")
+        ttk.Button(btns, text="Join least busy", command=self.join_smallest).pack(side="right", padx=(0, 6))
+        ttk.Button(btns, text="Copy Job ID", command=self.copy_id).pack(side="left")
+        self.more_btn = ttk.Button(btns, text="Load more", command=self.load)
+        self.more_btn.pack(side="left", padx=(6, 0))
+        self.status = ttk.Label(frm, text="Joins with the accounts selected in AltVault.", style="Small.TLabel")
+        self.status.pack(side="bottom", anchor="w", pady=(8, 0))
+
+        cols = ("players", "ping", "fps", "id")
+        self.tree = ttk.Treeview(frm, columns=cols, show="headings", selectmode="browse")
+        for col, title, width in zip(cols, ("Players", "Ping", "FPS", "Server / Job ID"), (80, 70, 60, 300)):
+            self.tree.heading(col, text=title, anchor="w")
+            self.tree.column(col, width=int(width * app.scale), anchor="w", stretch=col == "id")
+        self.tree.configure(style="Servers.Treeview")
+        ttk.Style(self).configure("Servers.Treeview", rowheight=int(26 * app.scale))
+        self.tree.pack(fill="both", expand=True, pady=(10, 0))
+        self.tree.bind("<Double-1>", lambda _e: self.join_selected())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        dark_title_bar(self)
+        self.after(50, lambda: self.winfo_exists() and dark_title_bar(self))   # again once it's on screen
+        self.load()
+
+    def reload(self):
+        self.servers, self.cursor = [], ""
+        self.tree.delete(*self.tree.get_children())
+        self.load()
+
+    def load(self):
+        if self.loading:
+            return
+        self.loading = True
+        self.more_btn.config(state="disabled")
+        fewest, cursor = self.order.get() == "Fewest players", self.cursor
+
+        def work():
+            try:
+                servers, nxt = get_servers(self.place_id, cursor, fewest)
+                self.app.ui(self.loaded, servers, nxt, None)
+            except RobloxError as e:
+                self.app.ui(self.loaded, [], cursor, str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def loaded(self, servers, cursor, error):
+        if not self.winfo_exists():
+            return
+        self.loading, self.cursor = False, cursor
+        for s in servers:
+            if self.tree.exists(s["id"]):   # pages can overlap while servers fill and empty
+                continue
+            self.servers.append(s)
+            ping = f"{s['ping']} ms" if isinstance(s["ping"], (int, float)) else "-"
+            fps = f"{s['fps']:.0f}" if isinstance(s["fps"], (int, float)) else "-"
+            self.tree.insert("", "end", iid=s["id"], values=(f"{s['playing']}/{s['maxPlayers']}", ping, fps, s["id"]))
+        self.heading.config(text=f"{len(self.servers)} servers" if self.servers else "No open servers")
+        self.more_btn.config(state="normal" if cursor else "disabled")
+        if error:
+            self.status.config(text=error)
+
+    def chosen(self):
+        sel = self.tree.selection()
+        return sel[0] if sel else None
+
+    def copy_id(self):
+        if self.chosen():
+            self.app.copy(self.chosen())
+            self.status.config(text="Job ID copied.")
+
+    def join(self, job_id):
+        self.app.job_var.set(job_id)
+        self.app.place_var.set(str(self.place_id))
+        self.destroy()
+        self.app.join_selected()
+
+    def join_selected(self):
+        if not self.chosen():
+            self.status.config(text="Pick a server first, or use Join least busy.")
+            return
+        self.join(self.chosen())
+
+    def join_smallest(self):
+        needed = max(1, len(self.app.selected_accounts()))
+        server = pick_smallest_server(self.servers, needed)
+        if not server:
+            self.status.config(text=f"None of the loaded servers has room for {needed} more players. Try Load more.")
+            return
+        self.join(server["id"])
+
+
 class App:
     def __init__(self, root, accounts):
         self.root = root
@@ -1626,6 +1924,10 @@ class App:
         self.place_box.grid(row=1, column=0, sticky="ew", pady=(2, 0))
         self.job_var = tk.StringVar()
         ttk.Entry(game, textvariable=self.job_var).grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=(2, 0))
+        self.star_btn = ttk.Button(game, text="☆", width=3, command=self.toggle_favorite)
+        self.star_btn.grid(row=1, column=2, padx=(6, 0), pady=(2, 0))
+        ttk.Button(game, text="Servers...", command=self.open_servers).grid(row=1, column=3, padx=(6, 0), pady=(2, 0))
+        self.place_var.trace_add("write", lambda *_: self.update_star())
         game.columnconfigure(0, weight=3)
         game.columnconfigure(1, weight=2)
         ttk.Label(game, text="Paste a place ID, a game link or a private server link, or pick a recent game.",
@@ -1671,16 +1973,20 @@ class App:
         self.tree.tag_configure("offline", foreground=C["muted"])
         self.tree.tag_configure("expired", foreground=C["red"])
         self.tree.tag_configure("ingame", foreground=C["green"])
+        self.tree.tag_configure("group", foreground=C["muted"], font=("Segoe UI Semibold", 10))
         scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
         self.empty_hint = ttk.Label(table, text="No accounts yet — click “Add account” to start.",
                                     style="Muted.TLabel", background=C["panel"])
-        self.tree.bind("<Double-1>", lambda _e: self.join_selected())
+        # Double-clicking a group header only opens or closes it; it never launches the whole group.
+        self.tree.bind("<Double-1>", self.on_double_click)
         self.tree.bind("<Return>", lambda _e: self.join_selected())
         self.tree.bind("<Delete>", lambda _e: self.remove_selected())
-        self.tree.bind("<Control-a>", lambda _e: self.tree.selection_set(self.tree.get_children()))
+        self.tree.bind("<Control-a>", lambda _e: self.tree.selection_set(self.account_rows()))
+        self.tree.bind("<<TreeviewOpen>>", lambda _e: self.group_toggled(True))
+        self.tree.bind("<<TreeviewClose>>", lambda _e: self.group_toggled(False))
         self.tree.bind("<Button-3>", self.show_menu)
 
     # ------------------------------------------------------------ helpers
@@ -1694,7 +2000,10 @@ class App:
         return next((a for a in self.accounts if a["id"] == account_id), None)
 
     def selected_accounts(self):
-        ids = set(self.tree.selection())
+        """Selected accounts; selecting a group header selects everyone in it."""
+        ids = set()
+        for iid in self.tree.selection():
+            ids |= set(self.tree.get_children(iid)) if iid.startswith(GROUP_PREFIX) else {iid}
         return [a for a in self.accounts if str(a["id"]) in ids]
 
     def save(self):
@@ -1716,13 +2025,15 @@ class App:
         running = acc["id"] in self.running.values()
         p = self.presence.get(acc["id"])
         kind = p.get("userPresenceType") if p else None
+        cap = self.fps_cap_of(acc)
+        extras = ([f"{cap} FPS"] if cap else []) + \
+            (["low graphics"] if acc["id"] in self.flagged("low_graphics") else []) + \
+            (["muted"] if acc["id"] in self.flagged("muted") else [])
+        fps = "".join(f" · {e}" for e in extras)
         if kind == 2:
             where = p.get("lastLocation") or "a game"
-            cap = self.fps_cap_of(acc) if running else None
             return (f"● In game · {where}" + ("" if running else " (another device)")
-                    + (f" · {cap} FPS" if cap else "")), "ingame"
-        cap = self.fps_cap_of(acc)
-        fps = f" · {cap} FPS" if cap else ""
+                    + (fps if running else "")), "ingame"
         if running:
             return "● Roblox open" + (" · no anti-AFK" if self.afk_skipped(acc) else "") + fps, "ingame"
         if kind == 3:
@@ -1733,18 +2044,36 @@ class App:
             return "Offline" + fps, "offline"
         return fps.lstrip(" ·"), ""
 
+    def group_of(self, acc):
+        group = acc.get("group")
+        return group.strip() if isinstance(group, str) and group.strip() else None
+
+    def groups(self):
+        return sorted({g for g in map(self.group_of, self.accounts) if g}, key=str.lower)
+
     def refresh(self):
         selection = self.tree.selection()
         self.tree.delete(*self.tree.get_children())
         query = self.search_var.get().strip().lower()
+        collapsed = set(self.settings.get("collapsed_groups") or [])
+        parents = {}
+        for group in self.groups():
+            members = [a for a in self.accounts if self.group_of(a) == group]
+            parents[group] = self.tree.insert(
+                "", "end", iid=GROUP_PREFIX + group, open=group not in collapsed, tags=("group",),
+                values=(f"{group}", f"{len(members)} account{'s' if len(members) != 1 else ''}", "", ""))
         for acc in self.accounts:
-            haystack = f"{acc['name']} {acc['displayName']} {acc.get('note', '')}".lower()
+            haystack = f"{acc['name']} {acc['displayName']} {acc.get('note', '')} {self.group_of(acc) or ''}".lower()
             if query and query not in haystack:
                 continue
             text, tag = self.status_of(acc)
-            self.tree.insert("", "end", iid=str(acc["id"]), image=self.avatars.get(acc["id"], self.blank_avatar),
+            self.tree.insert(parents.get(self.group_of(acc), ""), "end", iid=str(acc["id"]),
+                             image=self.avatars.get(acc["id"], self.blank_avatar),
                              values=(acc["displayName"], "@" + acc["name"], text, acc.get("note", "")),
                              tags=(tag,) if tag else ())
+        for group, iid in parents.items():   # hide groups the search filtered empty
+            if query and not self.tree.get_children(iid):
+                self.tree.delete(iid)
         self.tree.selection_set([i for i in selection if self.tree.exists(i)])
         if self.accounts:
             self.empty_hint.place_forget()
@@ -1753,13 +2082,115 @@ class App:
         n_running = len(set(self.running.values()))
         self.summary.config(text=f"{len(self.accounts)} accounts" + (f" · {n_running} open" if n_running else ""))
 
+    def on_double_click(self, event):
+        if not self.tree.identify_row(event.y).startswith(GROUP_PREFIX):
+            self.join_selected()
+
+    def account_rows(self):
+        """Every account row in the list, inside groups too."""
+        rows = []
+        for iid in self.tree.get_children():
+            rows += list(self.tree.get_children(iid)) if iid.startswith(GROUP_PREFIX) else [iid]
+        return rows
+
+    def group_toggled(self, opened):
+        iid = self.tree.focus()
+        if not iid.startswith(GROUP_PREFIX):
+            return
+        collapsed = set(self.settings.get("collapsed_groups") or [])
+        (collapsed.discard if opened else collapsed.add)(iid[len(GROUP_PREFIX):])
+        self.settings["collapsed_groups"] = sorted(collapsed)
+        save_settings(self.settings)
+
+    def set_group(self, accounts, group):
+        for acc in accounts:
+            if group:
+                acc["group"] = group
+            else:
+                acc.pop("group", None)
+        self.save()
+        self.refresh()
+        who = f"@{accounts[0]['name']}" if len(accounts) == 1 else f"{len(accounts)} accounts"
+        self.status.config(text=f"Moved {who} to {group}." if group else f"Took {who} out of their group.")
+
+    def ask_new_group(self, accounts):
+        name = simpledialog.askstring("New group", "Group name (for example Mains or Alts):", parent=self.root)
+        name = (name or "").strip()[:40]
+        if name:
+            self.set_group(accounts, name)
+
+    def rename_group(self, old):
+        name = simpledialog.askstring("Rename group", "New name:", initialvalue=old, parent=self.root)
+        name = (name or "").strip()[:40]
+        if name and name != old:
+            self.set_group([a for a in self.accounts if self.group_of(a) == old], name)
+
+    def group_menu(self, parent, accounts):
+        menu = themed_menu(parent)
+        current = {self.group_of(a) for a in accounts}
+        for group in self.groups():
+            menu.add_command(label=("✓ " if current == {group} else "    ") + group,
+                             command=lambda g=group: self.set_group(accounts, g))
+        if self.groups():
+            menu.add_separator()
+        menu.add_command(label="New group...", command=lambda: self.ask_new_group(accounts))
+        if current != {None}:
+            menu.add_command(label="No group", command=lambda: self.set_group(accounts, None))
+        return menu
+
     def recents(self):
         items = self.settings.get("recents")
         return [r for r in items if isinstance(r, dict) and "id" in r and "name" in r] \
             if isinstance(items, list) else []
 
+    def favorites(self):
+        items = self.settings.get("favorites")
+        return [f for f in items if isinstance(f, dict) and "id" in f and "name" in f] \
+            if isinstance(items, list) else []
+
     def update_recents_box(self):
-        self.place_box["values"] = [f"{r['name']}  ({r['id']})" for r in self.recents()]
+        """Favourites first (starred), then recent games that aren't favourites."""
+        favs = self.favorites()
+        fav_ids = {f["id"] for f in favs}
+        self.place_box["values"] = [f"★ {f['name']}  ({f['id']})" for f in favs] + \
+            [f"{r['name']}  ({r['id']})" for r in self.recents() if r["id"] not in fav_ids]
+        self.update_star()
+
+    def update_star(self):
+        if hasattr(self, "star_btn"):
+            place_id = None if parse_private_server(self.place_var.get()) else parse_place_id(self.place_var.get())
+            starred = place_id in {f["id"] for f in self.favorites()}
+            self.star_btn.config(text="★" if starred else "☆")
+
+    def toggle_favorite(self):
+        text = self.place_var.get()
+        place_id = None if parse_private_server(text) else parse_place_id(text)
+        if not place_id:
+            self.status.config(text="Enter a game first, then click ☆ to add it to favourites.")
+            return
+        favs = self.favorites()
+        if place_id in {f["id"] for f in favs}:
+            self.settings["favorites"] = [f for f in favs if f["id"] != place_id]
+            save_settings(self.settings)
+            self.update_recents_box()
+            self.status.config(text="Removed from favourites.")
+            return
+        known = {r["id"]: r["name"] for r in self.recents()}
+        m = re.match(r"\s*(?:★\s*)?(.+?)\s+\(\d+\)\s*$", text)
+        name = known.get(place_id) or (m.group(1) if m else None)
+
+        def save(name):
+            self.settings["favorites"] = self.favorites() + [{"id": place_id, "name": name or f"Place {place_id}"}]
+            save_settings(self.settings)
+            self.update_recents_box()
+            self.status.config(text=f"Added {name or 'this game'} to favourites.")
+
+        if name:
+            save(name)
+            return
+        cookie = next((a["cookie"] for a in self.accounts if a["id"] not in self.expired), None)
+        threading.Thread(target=lambda: self.ui(save, get_place_name(cookie, place_id) if cookie else None),
+                         daemon=True).start()
 
     def add_recent(self, place_id, name):
         recents = [r for r in self.recents() if r["id"] != place_id]
@@ -1846,6 +2277,27 @@ class App:
         self.root.after(TICK_INTERVAL, self.tick)
 
     # ------------------------------------------------------------ account actions
+    def add_many(self, items):
+        """Saves several checked accounts at once: [(user, {'cookie', 'group', 'note'})]."""
+        by_id = {a["id"]: a for a in self.accounts}
+        for user, entry in items:
+            acc = by_id.get(user["id"])
+            if acc is None:
+                acc = {"id": user["id"], "note": ""}
+                self.accounts.append(acc)
+                by_id[user["id"]] = acc
+            acc.update(name=user["name"], displayName=user["displayName"], cookie=entry["cookie"])
+            if entry.get("note") and not acc.get("note"):
+                acc["note"] = entry["note"]
+            if entry.get("group") and not self.group_of(acc):
+                acc["group"] = entry["group"]
+            self.expired.discard(user["id"])
+        if items:
+            self.save()
+            self.refresh()
+            threading.Thread(target=self.fetch_missing_avatars, daemon=True).start()
+            self.refresh_presence(reschedule=False)
+
     def add_or_update(self, user, cookie, note):
         for acc in self.accounts:
             if acc["id"] == user["id"]:
@@ -1903,8 +2355,20 @@ class App:
             self.tree.selection_set(row)
         sel = self.selected_accounts()
         menu = themed_menu(self.root)
+        if row.startswith(GROUP_PREFIX):
+            group = row[len(GROUP_PREFIX):]
+            menu.add_command(label=f"Join game ({len(sel)} accounts)", command=self.join_selected)
+            menu.add_command(label="Join a player's server...", command=lambda: self.ask_join_player(sel))
+            menu.add_cascade(label=f"FPS cap ({len(sel)} accounts)", menu=self.fps_menu(menu, sel))
+            self.add_performance_items(menu, sel)
+            menu.add_separator()
+            menu.add_command(label="Rename group...", command=lambda: self.rename_group(group))
+            menu.add_command(label="Ungroup (keeps the accounts)", command=lambda: self.set_group(sel, None))
+            menu.tk_popup(event.x_root, event.y_root)
+            return
         menu.add_command(label="Join game" if len(sel) == 1 else f"Join game ({len(sel)} accounts)",
                          command=self.join_selected)
+        menu.add_command(label="Join a player's server...", command=lambda: self.ask_join_player(sel))
         if len(sel) == 1:
             acc = sel[0]
             wins = self.windows_of(acc)
@@ -1924,12 +2388,16 @@ class App:
                              else "Turn anti-AFK off for this account",
                              command=lambda: self.toggle_afk_skip(acc))
             menu.add_cascade(label="FPS cap", menu=self.fps_menu(menu, sel))
+            self.add_performance_items(menu, sel)
+            menu.add_cascade(label="Group", menu=self.group_menu(menu, sel))
             menu.add_command(label="Edit note", command=lambda: self.edit_note(acc))
             menu.add_command(label="Log in again", command=lambda: AddAccountDialog(self, acc))
             menu.add_command(label="Move up", command=lambda: self.move(acc, -1))
             menu.add_command(label="Move down", command=lambda: self.move(acc, 1))
         else:
             menu.add_cascade(label=f"FPS cap ({len(sel)} accounts)", menu=self.fps_menu(menu, sel))
+            self.add_performance_items(menu, sel)
+            menu.add_cascade(label=f"Group ({len(sel)} accounts)", menu=self.group_menu(menu, sel))
         menu.add_separator()
         menu.add_command(label="Remove", command=self.remove_selected)
         menu.tk_popup(event.x_root, event.y_root)
@@ -1981,29 +2449,138 @@ class App:
                          command=lambda: self.ask_fps_cap(accounts))
         return menu
 
-    def apply_fps_cap(self, path, acc):
-        """Writes the cap this account should start with (its own cap, or the user's own Roblox
-        setting). The user's own value is learned the first time, and again whenever the file holds
-        a value AltVault didn't write. A capped client can save its cap back when it closes, so a
-        value matching one of AltVault's caps is never mistaken for the user's own."""
-        current = read_fps_cap(path)
-        own = self.settings.get("fps_own")
-        if current is not None and (own is None or (current != self.settings.get("fps_written")
-                                                     and current not in self.fps_caps().values())):
-            self.settings["fps_own"] = own = current
-        target = self.fps_cap_of(acc) or own
-        if target is not None and target != current:
-            write_fps_cap(path, target)
-            self.settings["fps_written"] = target
+    # ------------------------------------------------------------ lowest graphics / mute
+    def add_performance_items(self, menu, accounts):
+        for key, label in (("low_graphics", "Lowest graphics"), ("muted", "Mute")):
+            on = all(a["id"] in self.flagged(key) for a in accounts)
+            menu.add_command(label=("✓ " if on else "") + label,
+                             command=lambda k=key, t=label.lower(), o=on: self.set_flag(k, accounts, not o, t))
+
+    def flagged(self, key):
+        ids = self.settings.get(key)
+        return {i for i in ids if isinstance(i, int)} if isinstance(ids, list) else set()
+
+    def set_flag(self, key, accounts, on, label):
+        ids = self.flagged(key)
+        for acc in accounts:
+            (ids.add if on else ids.discard)(acc["id"])
+        self.settings[key] = sorted(ids)
+        save_settings(self.settings)
+        self.refresh()
+        who = f"@{accounts[0]['name']}" if len(accounts) == 1 else f"{len(accounts)} accounts"
+        self.status.config(text=f"{who}: {label} {'on' if on else 'off'}, from their next join.")
+
+    def client_overrides(self, acc):
+        """The Roblox settings this account should start with, beyond the user's own."""
+        values = {}
+        cap = self.fps_cap_of(acc)
+        if cap:
+            values["FramerateCap"] = str(cap)
+        if acc["id"] in self.flagged("low_graphics"):
+            values.update(LOW_GRAPHICS)
+        if acc["id"] in self.flagged("muted"):
+            values.update(MUTED)
+        return values
+
+    def client_values_in_use(self):
+        """Every value AltVault writes for some account, by setting name."""
+        used = {"FramerateCap": {str(c) for c in self.fps_caps().values()}}
+        if self.flagged("low_graphics"):
+            for name, value in LOW_GRAPHICS.items():
+                used.setdefault(name, set()).add(value)
+        if self.flagged("muted"):
+            for name, value in MUTED.items():
+                used.setdefault(name, set()).add(value)
+        return used
+
+    def client_state(self):
+        """(own, written): the user's own values and the last values AltVault wrote. Settings saved
+        by version 2.3, which only knew the FPS cap, are carried over."""
+        own = self.settings.get("client_own")
+        written = self.settings.get("client_written")
+        if not isinstance(own, dict):
+            own = {} if self.settings.get("fps_own") is None else {"FramerateCap": str(self.settings["fps_own"])}
+        if not isinstance(written, dict):
+            written = {} if self.settings.get("fps_written") is None else {"FramerateCap": str(self.settings["fps_written"])}
+        self.settings["client_own"], self.settings["client_written"] = own, written
+        return own, written
+
+    def apply_client_settings(self, path, acc):
+        """Writes the settings this account should start with: its own overrides, otherwise the user's
+        own values. The user's own value of each setting is learned the first time, and again whenever
+        the file holds a value AltVault didn't write. A client can save its settings back when it
+        closes, so a value matching one AltVault uses for some account is never taken as the user's."""
+        current = read_client_settings(path)
+        own, written = self.client_state()
+        used = self.client_values_in_use()
+        for name, value in current.items():
+            if name not in own or (value != written.get(name) and value not in used.get(name, ())):
+                own[name] = value
+        targets = {name: own[name] for name in current if name in own}
+        targets.update({k: v for k, v in self.client_overrides(acc).items() if k in current})
+        changes = {name: value for name, value in targets.items() if current.get(name) != value}
+        if changes:
+            write_client_settings(path, changes)
+            written.update(changes)
         self.ui(save_settings, self.settings)
 
-    def restore_fps_cap(self, path):
-        """Puts the user's own Roblox frame-rate setting back once a capped client has started."""
-        own = self.settings.get("fps_own")
-        if own is not None and read_fps_cap(path) not in (None, own):
-            write_fps_cap(path, own)
-            self.settings["fps_written"] = own
+    def restore_client_settings(self, path):
+        """Puts the user's own Roblox settings back once a client has started with its own."""
+        own, written = self.client_state()
+        current = read_client_settings(path)
+        changes = {name: own[name] for name in current if name in own and current[name] != own[name]}
+        if changes:
+            write_client_settings(path, changes)
+            written.update(changes)
             self.ui(save_settings, self.settings)
+
+    def needs_client_settings(self):
+        own, _ = self.client_state()
+        return bool(self.fps_caps() or self.flagged("low_graphics") or self.flagged("muted") or own)
+
+    def ask_join_player(self, accounts):
+        if not accounts:
+            return
+        name = simpledialog.askstring("Join a player", "Their Roblox username:", parent=self.root)
+        name = (name or "").strip()
+        if not name:
+            return
+        viewer = next((a for a in accounts if a["id"] not in self.expired), None)
+        if not viewer:
+            messagebox.showerror("Join a player", "The selected accounts need to log in again first.", parent=self.root)
+            return
+        self.status.config(text=f"Finding {name}...")
+
+        def work():
+            try:
+                place, job, found = server_of_player(viewer["cookie"], name)
+            except RobloxError as e:
+                message = str(e)   # e itself is cleared when the except block ends
+                self.ui(lambda: (self.status.config(text=""),
+                                 messagebox.showerror("Join a player", message, parent=self.root)))
+                return
+
+            def go():
+                self.place_var.set(place)
+                self.job_var.set(job)
+                self.status.config(text=f"Joining @{found}'s server...")
+                self.join_selected()
+            self.ui(go)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def open_servers(self):
+        text = self.place_var.get()
+        if parse_private_server(text):
+            messagebox.showinfo("Servers", "A private server link already points at one server, so there's "
+                                "no list to browse. Just click Join selected.", parent=self.root)
+            return
+        place_id = parse_place_id(text)
+        if not place_id:
+            messagebox.showinfo("Servers", "Enter a game first (a place ID or roblox.com/games link).",
+                                parent=self.root)
+            return
+        ServerBrowser(self, place_id)
 
     def use_server_of(self, presence):
         self.place_var.set(str(presence.get("rootPlaceId") or presence.get("placeId")))
@@ -2313,10 +2890,10 @@ class App:
         problems = []
         link_code = ""
         fps_file = None
-        if self.fps_caps() or self.settings.get("fps_own") is not None:
+        if self.needs_client_settings():
             fps_file = roblox_settings_file()
             if fps_file is None:
-                problems.append("Couldn't find Roblox's settings file, so FPS caps weren't applied. "
+                problems.append("Couldn't find Roblox's settings file, so FPS caps, graphics and mute weren't applied. "
                                 "Start Roblox once normally, then try again.")
         try:
             if private:
@@ -2331,10 +2908,10 @@ class App:
                 before = {pid for _, pid, _ in roblox_windows()}
                 if fps_file:
                     try:
-                        self.apply_fps_cap(fps_file, acc)
-                    except OSError as e:
-                        log.warning("Couldn't set the FPS cap: %s", e)
-                        problems.append(f"Couldn't set FPS caps ({e}), so accounts start with your normal frame rate.")
+                        self.apply_client_settings(fps_file, acc)
+                    except (OSError, ValueError) as e:
+                        log.warning("Couldn't apply per-account Roblox settings: %s", e)
+                        problems.append(f"Couldn't apply per-account settings ({e}), so accounts start with your normal Roblox settings.")
                         fps_file = None
                 try:
                     launch(acc["cookie"], place_id, job_id, link_code)
@@ -2354,9 +2931,9 @@ class App:
                 time.sleep(3)
                 if fps_file:   # the client has read its cap by now
                     try:
-                        self.restore_fps_cap(fps_file)
-                    except OSError as e:
-                        log.warning("Couldn't restore the FPS setting: %s", e)
+                        self.restore_client_settings(fps_file)
+                    except (OSError, ValueError) as e:
+                        log.warning("Couldn't restore your own Roblox settings: %s", e)
                 if before - {p for _, p, _ in roblox_windows()}:
                     problems.append("An earlier Roblox window closed when this one opened, so "
                                     "Multi-Roblox isn't working with this Roblox version.")
@@ -2377,9 +2954,9 @@ class App:
         finally:
             if fps_file:   # never leave an alt's cap as the user's own Roblox setting
                 try:
-                    self.restore_fps_cap(fps_file)
-                except OSError as e:
-                    log.warning("Couldn't restore the FPS setting: %s", e)
+                    self.restore_client_settings(fps_file)
+                except (OSError, ValueError) as e:
+                    log.warning("Couldn't restore your own Roblox settings: %s", e)
             self.ui(self.join_finished, problems)
 
     def wait_for_new_window(self, before):

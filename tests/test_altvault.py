@@ -207,7 +207,7 @@ class TestPrivateServers(unittest.TestCase):
                                      set_status=lambda text: None, ui=lambda fn, *a: fn(*a),
                                      join_finished=finished.append, remember_place=lambda c, p: None)
         for name in ("join_worker", "resolve_private", "wait_for_new_window", "fps_caps", "fps_cap_of",
-                     "apply_fps_cap", "restore_fps_cap"):
+                     "flagged", "client_overrides", "client_values_in_use", "client_state", "needs_client_settings", "apply_client_settings", "restore_client_settings"):
             setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
         fake.wait_for_server = lambda *a: self.fail("same-server logic ran for a private server")
         with mock.patch.object(av, "resolve_share_link", fake_resolve), \
@@ -299,7 +299,7 @@ class TestFpsCaps(unittest.TestCase):
 
     def make_app(self, caps, **settings):
         fake = types.SimpleNamespace(settings={"fps_caps": caps, **settings}, ui=lambda fn, *a: fn(*a))
-        for name in ("fps_caps", "fps_cap_of", "apply_fps_cap", "restore_fps_cap"):
+        for name in ("fps_caps", "fps_cap_of", "flagged", "client_overrides", "client_values_in_use", "client_state", "needs_client_settings", "apply_client_settings", "restore_client_settings"):
             setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
         return fake
 
@@ -308,35 +308,77 @@ class TestFpsCaps(unittest.TestCase):
         seen = []
         with mock.patch.object(av, "save_settings", lambda s: None):
             for acc_id in (1, 2, 3):
-                app.apply_fps_cap(self.path, {"id": acc_id})
+                app.apply_client_settings(self.path, {"id": acc_id})
                 seen.append(av.read_fps_cap(self.path))     # what this client would start with
-                app.restore_fps_cap(self.path)
+                app.restore_client_settings(self.path)
                 self.assertEqual(av.read_fps_cap(self.path), 60, "your own setting must come back")
         self.assertEqual(seen, [20, 60, 45])
-        self.assertEqual(app.settings["fps_own"], 60)
+        self.assertEqual(app.settings["client_own"]["FramerateCap"], "60")
 
     def test_a_closing_alt_cant_overwrite_your_own_setting(self):
         av.write_fps_cap(self.path, 20)          # an alt saved its cap when it closed
         app = self.make_app({"1": 20}, fps_own=60, fps_written=60)
         with mock.patch.object(av, "save_settings", lambda s: None):
-            app.apply_fps_cap(self.path, {"id": 2})
-        self.assertEqual(app.settings["fps_own"], 60)
+            app.apply_client_settings(self.path, {"id": 2})
+        self.assertEqual(app.settings["client_own"]["FramerateCap"], "60")
         self.assertEqual(av.read_fps_cap(self.path), 60)
 
     def test_your_in_game_change_is_respected(self):
         av.write_fps_cap(self.path, 144)         # you picked 144 in Roblox's menu
         app = self.make_app({"1": 20}, fps_own=60, fps_written=60)
         with mock.patch.object(av, "save_settings", lambda s: None):
-            app.apply_fps_cap(self.path, {"id": 1})
+            app.apply_client_settings(self.path, {"id": 1})
             self.assertEqual(av.read_fps_cap(self.path), 20)
-            app.restore_fps_cap(self.path)
-        self.assertEqual(app.settings["fps_own"], 144)
+            app.restore_client_settings(self.path)
+        self.assertEqual(app.settings["client_own"]["FramerateCap"], "144")
         self.assertEqual(av.read_fps_cap(self.path), 144)
 
     def test_invalid_caps_are_ignored(self):
         app = self.make_app({"1": 20, "2": 0, "3": 9999, "4": "30", "5": None, "6": 240, "7": 5})
         self.assertEqual(app.fps_caps(), {"1": 20, "6": 240, "7": 5})
         self.assertEqual(self.make_app("garbage").fps_caps(), {})
+
+    def use_full_sample(self):
+        with open(self.path, "wb") as f:
+            f.write(ROBLOX_SETTINGS_SAMPLE.replace(
+                b'\t\t\t<int name="GraphicsQualityLevel">3</int>\r\n',
+                b'\t\t\t<int name="GraphicsQualityLevel">3</int>\r\n\t\t\t<token name="SavedQualityLevel">6</token>\r\n'))
+        return self.contents()
+
+    def test_lowest_graphics_and_mute_per_account(self):
+        original = self.use_full_sample()
+        app = self.make_app({"2": 15}, low_graphics=[1, 2], muted=[2, 3])
+        seen = {}
+        with mock.patch.object(av, "save_settings", lambda s: None):
+            for acc_id in (1, 2, 3, 4):
+                app.apply_client_settings(self.path, {"id": acc_id})
+                seen[acc_id] = av.read_client_settings(self.path)
+                app.restore_client_settings(self.path)
+                self.assertEqual(self.contents(), original, "every setting must go back exactly")
+        own = {"FramerateCap": "60", "GraphicsQualityLevel": "3", "SavedQualityLevel": "6", "MasterVolume": "0.5"}
+        self.assertEqual(seen[1], {**own, "SavedQualityLevel": "1", "GraphicsQualityLevel": "1"})
+        self.assertEqual(seen[2], {"FramerateCap": "15", "SavedQualityLevel": "1", "GraphicsQualityLevel": "1",
+                                   "MasterVolume": "0"})
+        self.assertEqual(seen[3], {**own, "MasterVolume": "0"})
+        self.assertEqual(seen[4], own)
+
+    def test_a_closing_low_graphics_alt_cant_change_your_graphics(self):
+        self.use_full_sample()
+        app = self.make_app({}, low_graphics=[1], muted=[1])
+        with mock.patch.object(av, "save_settings", lambda s: None):
+            app.apply_client_settings(self.path, {"id": 2})     # learns your own values
+            av.write_client_settings(self.path, {"SavedQualityLevel": "1", "GraphicsQualityLevel": "1",
+                                                 "MasterVolume": "0"})   # the alt saved its own on close
+            app.apply_client_settings(self.path, {"id": 2})
+        self.assertEqual(av.read_client_settings(self.path)["SavedQualityLevel"], "6")
+        self.assertEqual(av.read_client_settings(self.path)["MasterVolume"], "0.5")
+
+    def test_only_numbers_are_written(self):
+        original = self.use_full_sample()
+        for bad in ("1<script>", "", "1e9", "-", "0x10"):
+            with self.assertRaises(ValueError):
+                av.write_client_settings(self.path, {"MasterVolume": bad})
+        self.assertEqual(self.contents(), original)
 
     def test_join_applies_caps_in_order(self):
         events = []
@@ -347,7 +389,7 @@ class TestFpsCaps(unittest.TestCase):
                                      set_status=lambda text: None, join_finished=lambda p: events.append(("done", p)),
                                      remember_place=lambda c, p: None, wait_for_server=lambda *a: None)
         for name in ("join_worker", "wait_for_new_window", "fps_caps", "fps_cap_of",
-                     "apply_fps_cap", "restore_fps_cap"):
+                     "flagged", "client_overrides", "client_values_in_use", "client_state", "needs_client_settings", "apply_client_settings", "restore_client_settings"):
             setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
 
         def fake_launch(cookie, *a):
@@ -621,6 +663,226 @@ class TestAntiAfkBlocked(unittest.TestCase):
         with mock.patch.object(av.log, "warning") as warned:
             app.afk_alert([1], None, None)
         warned.assert_called_once()
+
+
+def fake_request(responses, calls):
+    """A stand-in for av._request: returns (status, headers, body) from `responses` in order and
+    records each call's (url, cookie)."""
+    def request(url, cookie=None, method="GET", headers=None, data=None):
+        calls.append((url, cookie))
+        status, body = responses.pop(0)
+        return status, {}, body if isinstance(body, bytes) else av.json.dumps(body).encode()
+    return request
+
+
+SERVER_A = "11111111-1111-1111-1111-111111111111"
+SERVER_B = "22222222-2222-2222-2222-222222222222"
+
+
+class TestServers(unittest.TestCase):
+    def test_server_list_is_parsed_and_never_sends_a_cookie(self):
+        calls = []
+        page = {"nextPageCursor": "NEXT", "data": [
+            {"id": SERVER_A, "playing": 3, "maxPlayers": 10, "ping": 40, "fps": 59.9},
+            {"id": "not-a-uuid", "playing": 1, "maxPlayers": 10},
+            {"id": SERVER_B, "maxPlayers": 8, "ping": None, "fps": None}]}
+        with mock.patch.object(av, "_request", fake_request([(200, page)], calls)):
+            servers, cursor = av.get_servers("920587237", "CUR", fewest_first=False)
+        self.assertEqual([s["id"] for s in servers], [SERVER_A, SERVER_B])
+        self.assertEqual(servers[1]["playing"], 0)
+        self.assertEqual(cursor, "NEXT")
+        url, cookie = calls[0]
+        self.assertIsNone(cookie)
+        self.assertTrue(av._is_roblox_url(url))
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+        self.assertEqual((query["sortOrder"], query["cursor"], query["excludeFullGames"]), (["Desc"], ["CUR"], ["true"]))
+
+    def test_server_list_errors(self):
+        for status, body in ((429, b"{}"), (500, b""), (200, b"nope"), (200, {"data": [{"id": SERVER_A}]})):
+            with mock.patch.object(av, "_request", fake_request([(status, body)], [])):
+                with self.assertRaises(av.RobloxError):
+                    av.get_servers("1")
+        with self.assertRaises(ValueError):
+            av.get_servers("1/../../evil")     # place IDs must be numbers
+
+    def test_least_busy_server_with_room(self):
+        servers = [{"id": "a", "playing": 9, "maxPlayers": 10, "ping": 20},
+                   {"id": "b", "playing": 2, "maxPlayers": 10, "ping": 300},
+                   {"id": "c", "playing": 2, "maxPlayers": 10, "ping": 50},
+                   {"id": "d", "playing": 0, "maxPlayers": 2, "ping": None}]
+        self.assertEqual(av.pick_smallest_server(servers, 1)["id"], "d")
+        self.assertEqual(av.pick_smallest_server(servers, 4)["id"], "c")   # same players: lower ping wins
+        self.assertIsNone(av.pick_smallest_server(servers, 11))
+
+
+class TestJoinPlayer(unittest.TestCase):
+    def test_bad_usernames_never_reach_roblox(self):
+        with mock.patch.object(av, "_request", side_effect=AssertionError("request made")):
+            for name in ("", "ab", "a" * 21, "bad name", "x/../y", "émoji"):
+                self.assertIsNone(av.find_user(name))
+
+    def test_username_lookup(self):
+        calls = []
+        with mock.patch.object(av, "_request", fake_request([(200, {"data": [{"id": 7, "name": "Builder"}]}),
+                                                             (200, {"data": []})], calls)):
+            self.assertEqual(av.find_user("builder"), {"id": 7, "name": "Builder"})
+            self.assertIsNone(av.find_user("nobody_here"))
+        self.assertTrue(all(cookie is None for _, cookie in calls), "a username lookup never sends a cookie")
+
+    def server_of(self, presence, user={"id": 7, "name": "Builder"}):
+        with mock.patch.object(av, "find_user", lambda name: user), \
+                mock.patch.object(av, "get_presence", lambda cookie, uid: presence):
+            return av.server_of_player(FAKE_COOKIE, "@Builder")
+
+    def test_finds_their_server(self):
+        self.assertEqual(self.server_of({"userPresenceType": 2, "rootPlaceId": 920587237, "placeId": 1,
+                                         "gameId": SERVER_A}), ("920587237", SERVER_A, "Builder"))
+
+    def test_clear_reasons_when_it_cant(self):
+        cases = [({"userPresenceType": 1}, "isn't in a game"),
+                 ({"userPresenceType": 2, "placeId": 5, "gameId": None}, "privacy"),
+                 ({"userPresenceType": 2, "placeId": 5, "gameId": "garbage"}, "privacy")]
+        for presence, words in cases:
+            with self.assertRaises(av.RobloxError) as caught:
+                self.server_of(presence)
+            self.assertIn(words, str(caught.exception))
+        with self.assertRaises(av.RobloxError) as caught:
+            self.server_of({}, user=None)
+        self.assertIn("no Roblox user", str(caught.exception))
+
+
+class TestRamImport(unittest.TestCase):
+    ITEMS = [{"SecurityToken": FAKE_COOKIE, "Username": "alt1", "Group": "Farm", "Alias": "main farm",
+              "Description": "", "Password": "hunter2-never-read", "UserID": 1},
+             {"SecurityToken": FAKE_COOKIE + "B", "Username": "alt2", "Group": "Default", "Alias": "", "Description": "x"},
+             {"SecurityToken": "too short", "Username": "broken"}, "not a dict"]
+
+    def write(self, data):
+        path = os.path.join(tempfile.mkdtemp(dir=TEMP_HOME), "AccountData.json")
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def check(self, found):
+        self.assertEqual([f["name"] for f in found], ["alt1", "alt2"])
+        self.assertEqual(found[0], {"cookie": FAKE_COOKIE, "name": "alt1", "group": "Farm", "note": "main farm"})
+        self.assertIsNone(found[1]["group"], "RAM's Default group means no group")
+        self.assertNotIn("hunter2", repr(found), "saved passwords must never be read")
+
+    def test_plain_file(self):
+        self.check(av.read_ram_accounts(self.write(av.json.dumps(self.ITEMS).encode())))
+
+    def test_encrypted_file(self):
+        blob = av._dpapi(av._crypt32.CryptProtectData, av.json.dumps(self.ITEMS).encode(), av.RAM_ENTROPY)
+        self.check(av.read_ram_accounts(self.write(blob)))
+
+    def test_password_file_and_garbage_are_explained(self):
+        for data, words in ((av.RAM_PASSWORD_HEADER + b"\x00" * 40, "password"),
+                            (b"\x01\x02garbage", "decrypt"), (b'{"not": "a list"}', "isn't a RAM")):
+            with self.assertRaises(av.RobloxError) as caught:
+                av.read_ram_accounts(self.write(data))
+            self.assertIn(words, str(caught.exception))
+
+    def test_import_checks_logins_then_saves_once(self):
+        path = self.write(av.json.dumps(self.ITEMS).encode())
+        saved, reports = [], []
+
+        def fake_user(cookie):
+            if cookie.endswith("B"):
+                raise av.CookieExpired()
+            return {"id": 1, "name": "alt1", "displayName": "Alt One"}
+        app = types.SimpleNamespace(ui=lambda fn, *a: fn(*a), set_status=lambda t: None,
+                                    add_many=saved.append)
+        with mock.patch.object(av, "get_user", fake_user):
+            av.import_ram_into(app, path, reports.append)
+        self.assertEqual(len(saved), 1)
+        self.assertEqual([u["name"] for u, _ in saved[0]], ["alt1"])
+        self.assertIn("Imported 1 account.", reports[0])
+        self.assertIn("alt2", reports[0])
+
+
+class TestWindow(unittest.TestCase):
+    """The real AltVault window, kept hidden, with test accounts in the temporary data folder."""
+
+    @classmethod
+    def setUpClass(cls):
+        import tkinter
+        try:
+            cls.root = tkinter.Tk()
+        except tkinter.TclError as e:
+            raise unittest.SkipTest(f"no display: {e}")
+        cls.root.withdraw()
+        accounts = [{"id": i, "name": f"alt{i}", "displayName": f"Alt {i}", "cookie": FAKE_COOKIE, "note": ""}
+                    for i in range(1, 6)]
+        accounts[0]["group"] = accounts[1]["group"] = "Farm"
+        accounts[2]["group"] = "Mains"
+        with mock.patch.object(av.threading, "Thread", lambda **k: types.SimpleNamespace(start=lambda: None)):
+            cls.app = av.App(cls.root, accounts)
+        cls.root.withdraw()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.root.destroy()
+
+    def test_groups_in_the_list(self):
+        tree = self.app.tree
+        self.assertEqual(list(tree.get_children()), ["group:Farm", "group:Mains", "4", "5"])
+        self.assertEqual(list(tree.get_children("group:Farm")), ["1", "2"])
+        tree.selection_set("group:Farm")
+        self.assertEqual([a["name"] for a in self.app.selected_accounts()], ["alt1", "alt2"])
+        self.assertEqual(sorted(self.app.account_rows()), ["1", "2", "3", "4", "5"])
+
+    def test_double_clicking_a_group_never_joins(self):
+        event = types.SimpleNamespace(y=5)
+        with mock.patch.object(self.app, "join_selected") as join:
+            with mock.patch.object(self.app.tree, "identify_row", lambda y: "group:Farm"):
+                self.app.on_double_click(event)
+            join.assert_not_called()
+            with mock.patch.object(self.app.tree, "identify_row", lambda y: "4"):
+                self.app.on_double_click(event)
+            join.assert_called_once()
+
+    def test_moving_between_groups(self):
+        with mock.patch.object(av, "save_accounts", lambda a: None):
+            self.app.set_group([self.app.account(4)], "Farm")
+            self.assertEqual(list(self.app.tree.get_children("group:Farm")), ["1", "2", "4"])
+            self.app.set_group([self.app.account(4)], None)
+        self.assertIn("4", self.app.tree.get_children())
+
+    def test_favourites_star(self):
+        with mock.patch.object(av, "save_settings", lambda s: None):
+            self.app.place_var.set("Tap Simulator  (72858262610964)")
+            self.app.toggle_favorite()
+            self.assertEqual(self.app.star_btn.cget("text"), "★")
+            self.assertEqual(self.app.place_box["values"][0], "★ Tap Simulator  (72858262610964)")
+            self.app.place_var.set("★ Tap Simulator  (72858262610964)")    # picking it from the list
+            self.assertEqual(av.parse_place_id(self.app.place_var.get()), "72858262610964")
+            self.app.toggle_favorite()
+            self.assertEqual(self.app.star_btn.cget("text"), "☆")
+
+    def test_server_browser_joins_the_chosen_server(self):
+        servers = [{"id": SERVER_A, "playing": 5, "maxPlayers": 10, "ping": 30, "fps": 60.0},
+                   {"id": SERVER_B, "playing": 1, "maxPlayers": 10, "ping": 80, "fps": 59.5}]
+        self.app.tree.selection_set(["4", "5"])
+        with mock.patch.object(av, "get_servers", lambda *a: (servers, "")), \
+                mock.patch.object(av.threading, "Thread", lambda target, daemon=None: types.SimpleNamespace(start=target)), \
+                mock.patch.object(self.app, "join_selected") as join:
+            self.app.ui = lambda fn, *a: fn(*a)
+            browser = av.ServerBrowser(self.app, "72858262610964")
+            self.assertEqual(browser.heading.cget("text"), "2 servers")
+            browser.join_smallest()
+            del self.app.ui
+        self.assertEqual(self.app.job_var.get(), SERVER_B)
+        self.assertEqual(self.app.place_var.get(), "72858262610964")
+        join.assert_called_once()
+        self.app.job_var.set("")
+
+    def test_status_shows_per_account_settings(self):
+        self.app.settings.update(fps_caps={"5": 15}, low_graphics=[5], muted=[5])
+        text, _ = self.app.status_of(self.app.account(5))
+        self.assertIn("15 FPS · low graphics · muted", text)
+        for key in ("fps_caps", "low_graphics", "muted"):
+            self.app.settings.pop(key)
 
 
 class TestRepoHygiene(unittest.TestCase):

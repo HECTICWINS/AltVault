@@ -2,6 +2,15 @@
 
 Every release on the [Releases](../../releases) page is built by GitHub from the tagged commit, comes with a build attestation, and is scanned by VirusTotal. See [Verify your download](README.md#verify-your-download).
 
+## 2.5.0
+
+- **Server browser:** click **Servers...** to see a game's open servers with player counts, ping and FPS. Join one, or click **Join least busy** to pick the emptiest server with room for all selected accounts. The list loads without sending any login.
+- **Join a player's server:** right-click > **Join a player's server...** and type a username.
+- **Groups:** sort accounts into folders, collapse them, and join, cap or mute a whole group from its header. Double-clicking a header never launches the group.
+- **Favourite games:** the ☆ button pins a game to the top of the game list.
+- **Lowest graphics and mute per account**, alongside FPS caps. Like FPS caps, they use Roblox's own settings for that account's launch, and your own settings are put back exactly.
+- **Import from Roblox Account Manager:** reads RAM's `AccountData.json` (plain or encrypted on the same PC), checks each login, and keeps groups and aliases. Saved passwords are never read.
+
 ## 2.4.0
 
 - **Anti-AFK tells you when it's blocked.** If it can't reach the Roblox windows for about 2 minutes, a tray alert names the accounts, what's in front (the lock screen, a UAC prompt, an administrator app such as an installer) and roughly how long until they'd be idle-kicked. A second alert says when it's working again.

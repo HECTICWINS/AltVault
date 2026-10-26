@@ -33,7 +33,12 @@ A secure, lightweight Roblox account manager for Windows. Download, unzip, doubl
 - **Saved accounts:** logins are encrypted with Windows DPAPI.
 - **Join:** launch one or many accounts into a game, optionally all into the same server or a specific Job ID.
 - **Private servers:** paste a private server link and every selected account joins that private server.
-- **FPS caps per account:** give each alt its own frame-rate limit, such as 20 or 30, to save power while your main stays smooth.
+- **FPS caps, lowest graphics and mute per account:** run alts at 15 FPS, minimum graphics and no sound to save power, while your main stays smooth.
+- **Server browser:** see a game's servers with player counts, ping and FPS, and join one, or let AltVault pick the least busy server with room for all your accounts.
+- **Join a player:** join the server a friend is in by typing their username.
+- **Groups:** sort accounts into folders such as Mains and Alts, and join, cap or mute a whole group at once.
+- **Favourite games:** star games so they stay at the top of the game list.
+- **Import from Roblox Account Manager:** bring your accounts, groups and notes over from RAM in one step.
 - **Multi-Roblox:** run several clients at once.
 - **Auto-tile:** arrange any number of Roblox windows in an even grid.
 - **Live status:** see who's online or in game, with avatars.
@@ -68,7 +73,7 @@ Get-FileHash .\AltVault-*-win64.zip
 If you have the [GitHub CLI](https://cli.github.com), you can also confirm GitHub built the file from this repository:
 
 ```powershell
-gh attestation verify .\AltVault-2.4.0-win64.zip --repo HECTICWINS/AltVault
+gh attestation verify .\AltVault-2.5.0-win64.zip --repo HECTICWINS/AltVault
 ```
 
 The download includes its own copy of Python, so one or two lesser-known engines may flag it; that's a common false positive for Python apps.
@@ -126,15 +131,43 @@ Every selected account joins that private server, so the **Server / Job ID** box
 Each account must be allowed in: for a friends-only private server, every alt needs to be friends with the owner.
 A private server link works like an invite, so AltVault never saves it to `settings.json` or the log.
 
-## FPS caps
+## Servers and joining a player
 
-Right-click an account (or several) > **FPS cap**, then pick 15, 20, 30, 45 or 60 FPS, or **Custom...** for any number from 5 to 240.
-Alts you're only AFK grinding on rarely need more than 15–30 FPS, and capping them saves a lot of CPU, GPU and power.
+Click **Servers...** next to the Game box to see that game's open servers, with player counts, ping and FPS.
+Pick one and click **Join this server**, or click **Join least busy** to send your selected accounts to the emptiest server that has room for all of them.
+The server list is public, so AltVault loads it without sending any login.
 
-The cap applies from that account's **next join**; windows that are already open aren't touched.
-It uses Roblox's own Maximum Frame Rate setting: just before launching an account, AltVault writes that account's cap into Roblox's `GlobalBasicSettings_13.xml`, and once the client has started it puts your own setting back.
-Only that one number is changed, and nothing is injected into Roblox.
-To check a cap, press **Shift+F5** in that Roblox window to show its frame rate.
+To join a friend, right-click your accounts > **Join a player's server...** and type their username.
+This only works when Roblox lets your account see which server they're in; usually that means being friends with them.
+
+## Groups and favourites
+
+Right-click an account > **Group** > **New group...** to sort accounts into folders such as Mains and Alts.
+Right-click a group's header to join, cap or mute everyone in it at once, or to rename it.
+Double-clicking a header only opens or closes it, so it never launches a whole group by accident.
+
+Click **☆** next to the Game box to add the current game to your favourites. Favourites stay at the top of the game list with a ★.
+
+## FPS caps, lowest graphics and mute
+
+Right-click an account (or several, or a group) and choose:
+
+- **FPS cap**: 15, 20, 30, 45 or 60 FPS, or **Custom...** for any number from 5 to 240;
+- **Lowest graphics**: Roblox's lowest graphics quality;
+- **Mute**: no sound.
+
+Alts you're only AFK grinding on rarely need more than 15–30 FPS or any graphics, and these settings save a lot of CPU, GPU and power.
+
+Each setting applies from that account's **next join**; windows that are already open aren't touched.
+They use Roblox's own settings: just before launching an account, AltVault writes that account's values into Roblox's `GlobalBasicSettings_13.xml`, and once the client has started it puts your own settings back exactly.
+Only those numbers are changed, and nothing is injected into Roblox.
+To check an FPS cap, press **Shift+F5** in that Roblox window to show its frame rate.
+
+## Importing from Roblox Account Manager
+
+Click **Add account** > **Import from Roblox Account Manager...** and choose RAM's `AccountData.json`, which is in the folder RAM runs from.
+AltVault checks every login with Roblox and adds the ones that still work, along with their RAM groups and aliases. Saved passwords are never read.
+It works with RAM's normal encrypted file on the same PC and Windows account. If you set a password in RAM, turn that off in RAM first.
 
 ## Anti-AFK
 
