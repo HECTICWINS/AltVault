@@ -1515,7 +1515,24 @@ def apply_theme(root, scale):
     s.configure("Small.TLabel", foreground=C["muted"], font=("Segoe UI", 9))
     s.configure("Title.TLabel", font=("Segoe UI Semibold", 16))
     s.configure("Error.TLabel", foreground=C["red"])
+    s.configure("Hint.TLabel", background=C["field"], foreground=C["muted"])
     s.configure("Success.TLabel", foreground=C["green"])
+
+
+def add_placeholder(entry, var, text):
+    """Grey hint text shown inside an empty box. It's a label laid over the box, so the box's real
+    value stays empty; clicking the hint just focuses the box."""
+    hint = ttk.Label(entry, text=text, style="Hint.TLabel", cursor="xterm")
+    hint.bind("<Button-1>", lambda _e: entry.focus_set())
+
+    def update(*_):
+        if var.get():
+            hint.place_forget()
+        else:
+            hint.place(x=7, rely=0.5, anchor="w")
+    var.trace_add("write", update)
+    update()
+    return hint
 
 
 def themed_menu(root):
@@ -1981,20 +1998,19 @@ class App:
         self.place_var = tk.StringVar(value=self.settings.get("place", ""))
         self.place_box = ttk.Combobox(game, textvariable=self.place_var)
         self.place_box.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        add_placeholder(self.place_box, self.place_var, "Paste a game or private server link, or pick one")
         self.star_btn = ttk.Button(game, text="☆", width=3, command=self.toggle_favorite)
         self.star_btn.grid(row=1, column=1, padx=(6, 0), pady=(2, 0))
         ttk.Button(game, text="Servers...", command=self.open_servers).grid(row=1, column=2, padx=(6, 0), pady=(2, 0))
         self.place_var.trace_add("write", lambda *_: self.update_star())
         game.columnconfigure(0, weight=1)
-        ttk.Label(game, text="A place ID, a game or private server link, or a recent or ★ game.",
-                  style="Small.TLabel").grid(row=2, column=0, columnspan=3, sticky="w", pady=(3, 0))
         server = ttk.Frame(game)
-        server.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        server.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         ttk.Label(server, text="Server", style="Muted.TLabel").pack(side="left")
         self.job_var = tk.StringVar()
-        ttk.Entry(server, textvariable=self.job_var, width=40).pack(side="left", padx=(8, 0))
-        ttk.Label(server, text="optional: leave empty for any server, or paste a Job ID", style="Small.TLabel").pack(
-            side="left", padx=(8, 0))
+        job = ttk.Entry(server, textvariable=self.job_var, width=40)
+        job.pack(side="left", padx=(8, 0))
+        add_placeholder(job, self.job_var, "Any server (or paste a Job ID)")
         self.update_recents_box()
 
         # The Anti-AFK switch and the status line; set-once options live in Settings.
@@ -2014,8 +2030,10 @@ class App:
         ttk.Button(btns, text="+ Add account", command=lambda: AddAccountDialog(self)).pack(side="left")
         self.join_btn = ttk.Button(btns, text="Join", style="Accent.TButton", command=self.join_selected)
         self.join_btn.pack(side="right")
-        ttk.Button(btns, text="Close all", command=self.close_all).pack(side="right", padx=(0, 6))
-        ttk.Button(btns, text="Tile", command=self.tile).pack(side="right", padx=(0, 6))
+        self.close_btn = ttk.Button(btns, text="Close all", command=self.close_all, state="disabled")
+        self.close_btn.pack(side="right", padx=(0, 6))
+        self.tile_btn = ttk.Button(btns, text="Tile", command=self.tile, state="disabled")
+        self.tile_btn.pack(side="right", padx=(0, 6))
 
         table = ttk.Frame(outer)
         table.pack(fill="both", expand=True, pady=(12, 0))
@@ -2051,7 +2069,15 @@ class App:
         if self.joining:
             return
         n = len(self.selected_accounts())
-        self.join_btn.config(text="Join" if n == 0 else f"Join {n} account{'s' if n != 1 else ''}")
+        self.join_btn.config(text="Join" if n == 0 else f"Join {n} account{'s' if n != 1 else ''}",
+                             state="normal" if n else "disabled")
+
+    def update_window_buttons(self, count):
+        """Tile and Close all only do something while Roblox windows are open."""
+        state = "normal" if count else "disabled"
+        for btn in (self.tile_btn, self.close_btn):
+            if str(btn.cget("state")) != state:
+                btn.config(state=state)
 
     # ------------------------------------------------------------ helpers
     def ui(self, fn, *args):
@@ -2139,6 +2165,9 @@ class App:
             if query and not self.tree.get_children(iid):
                 self.tree.delete(iid)
         self.tree.selection_set([i for i in selection if self.tree.exists(i)])
+        shown = ("display", "user", "status") + (("note",) if any(a.get("note") for a in self.accounts) else ())
+        if tuple(self.tree["displaycolumns"]) != shown:
+            self.tree["displaycolumns"] = shown
         if self.accounts:
             self.empty_hint.place_forget()
         else:
@@ -2322,6 +2351,7 @@ class App:
         """Keeps track of which Roblox window belongs to which account and labels each window."""
         try:
             windows = roblox_windows()
+            self.update_window_buttons(len(windows))
             alive = {pid for _, pid, _ in windows}
             by_name = {a["name"].lower(): a["id"] for a in self.accounts}
             before = dict(self.running)
