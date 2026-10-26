@@ -209,6 +209,7 @@ class TestPrivateServers(unittest.TestCase):
         for name in ("join_worker", "resolve_private", "wait_for_new_window", "fps_caps", "fps_cap_of",
                      "flagged", "client_overrides", "client_values_in_use", "client_state", "needs_client_settings", "apply_client_settings", "restore_client_settings"):
             setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
+        fake.who = lambda acc: "@" + acc["name"]
         fake.wait_for_server = lambda *a: self.fail("same-server logic ran for a private server")
         with mock.patch.object(av, "resolve_share_link", fake_resolve), \
                 mock.patch.object(av, "launch", fake_launch), \
@@ -245,7 +246,8 @@ class TestPrivateServers(unittest.TestCase):
             settings={"place": "https://www.roblox.com/games/1/Public"},
             place_var=types.SimpleNamespace(get=lambda: "https://www.roblox.com/share?code=SECRET123&type=Server"),
             **{name: types.SimpleNamespace(get=lambda: True)
-               for name in ("multi_var", "same_server_var", "auto_tile_var", "anti_afk_var")})
+               for name in ("multi_var", "same_server_var", "auto_tile_var", "anti_afk_var", "stream_var",
+                            "hide_taskbar_var")})
         with mock.patch.object(av, "save_settings", lambda s: saved.append(dict(s))):
             av.App.save_settings(fake)
         self.assertNotIn("SECRET123", repr(saved))
@@ -301,6 +303,7 @@ class TestFpsCaps(unittest.TestCase):
         fake = types.SimpleNamespace(settings={"fps_caps": caps, **settings}, ui=lambda fn, *a: fn(*a))
         for name in ("fps_caps", "fps_cap_of", "flagged", "client_overrides", "client_values_in_use", "client_state", "needs_client_settings", "apply_client_settings", "restore_client_settings"):
             setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
+        fake.who = lambda acc: "@" + acc["name"]
         return fake
 
     def test_each_account_starts_with_its_own_cap(self):
@@ -391,6 +394,7 @@ class TestFpsCaps(unittest.TestCase):
         for name in ("join_worker", "wait_for_new_window", "fps_caps", "fps_cap_of",
                      "flagged", "client_overrides", "client_values_in_use", "client_state", "needs_client_settings", "apply_client_settings", "restore_client_settings"):
             setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
+        fake.who = lambda acc: "@" + acc["name"]
 
         def fake_launch(cookie, *a):
             events.append((cookie, av.read_fps_cap(self.path)))
@@ -943,12 +947,170 @@ class TestWindow(unittest.TestCase):
     def test_settings_window(self):
         saved = []
         with mock.patch.object(av, "save_settings", lambda s: saved.append(dict(s))):
-            dialog = av.SettingsDialog(self.app)
-            dialog.key_var.set("f13")
-            dialog.set_key()
-            dialog.destroy()
+            page = self.app.pages["settings"]
+            page.key_var.set("f13")
+            page.set_key()
         self.assertEqual(saved[-1]["afk_key"], "f13")
         self.app.settings.pop("afk_key")
+
+    def test_sidebar_switches_pages(self):
+        for key in ("live", "settings", "accounts"):
+            self.app.show_page(key)
+            self.assertEqual(self.app.page, key)
+            shown = [k for k, page in self.app.pages.items() if page.winfo_manager()]
+            self.assertEqual(shown, [key])
+
+    def test_stream_mode_hides_names(self):
+        with mock.patch.object(av, "save_settings", lambda s: None), mock.patch.object(self.app, "tick_now"):
+            self.app.stream_var.set(True)
+            self.app.toggle_stream()
+            values = self.app.tree.item("4", "values")
+            self.assertEqual(values[0], "Account 4")
+            self.assertNotIn("user", self.app.tree["displaycolumns"])
+            self.assertEqual(self.app.window_title(self.app.account(4)), "Roblox - Account 4")
+            self.assertNotIn("alt", self.app.status.cget("text"))
+            self.app.stream_var.set(False)
+            self.app.toggle_stream()
+        self.assertEqual(self.app.tree.item("4", "values")[1], "@alt4")
+        self.assertEqual(self.app.window_title(self.app.account(4)), "Roblox - alt4")
+
+    def test_live_tiles_follow_the_windows(self):
+        page = self.app.pages["live"]
+        registered, released = [], []
+        windows = [(101, 1, "Roblox"), (102, 2, "Roblox - alt2")]
+        self.app.running[2] = 2
+        self.app.presence[2] = {"userPresenceType": 2}
+        with mock.patch.object(av, "roblox_windows", lambda: list(windows)), \
+                mock.patch.object(av, "responsive", lambda h: h != 101), \
+                mock.patch.object(av, "register_thumbnail", lambda d, s: registered.append(s) or s), \
+                mock.patch.object(av, "unregister_thumbnail", released.append), \
+                mock.patch.object(av, "place_thumbnail", lambda t, r: True), \
+                mock.patch.object(av, "client_size", lambda h: (800, 600)), \
+                mock.patch.object(av._user32, "IsIconic", lambda h: False):
+            self.app.show_page("live")
+            self.assertEqual(set(page.tiles), {101, 102})
+            self.assertEqual(page.tiles[101].color, "red")
+            self.assertEqual(page.tiles[102].color, "green")
+            self.assertEqual(page.tiles[102].label.cget("text"), "@alt2")
+            page.thumbs.update({101: 101, 102: 102})   # as place_thumbs would once the tiles are drawn
+            windows.pop(0)
+            page.sync(av.roblox_windows())
+            self.assertEqual(set(page.tiles), {102})
+            self.assertEqual(released, [101])
+            self.app.show_page("accounts")
+            self.assertEqual(released, [101, 102], "thumbnails must go when the page is left")
+            self.assertIsNone(page.sample_job)
+        self.app.running.clear()
+        self.app.presence.clear()
+
+    def test_import_carries_settings_without_undoing_local_ones(self):
+        self.app.settings["fps_caps"] = {"4": 30}
+        entries = av.export_entries({"accounts": [
+            {"cookie": FAKE_COOKIE, "fps_cap": 15, "muted": True, "group": "Imported"},
+            {"cookie": FAKE_COOKIE, "fps_cap": 20, "afk_skip": True}]})
+        users = [{"id": 4, "name": "alt4", "displayName": "Alt 4"}, {"id": 99, "name": "new", "displayName": "New"}]
+        with mock.patch.object(av, "save_accounts", lambda a: None), mock.patch.object(av, "save_settings", lambda s: None), \
+                mock.patch.object(av.threading, "Thread", lambda **k: types.SimpleNamespace(start=lambda: None)), \
+                mock.patch.object(self.app, "refresh_presence"):
+            self.app.add_many(list(zip(users, entries)))
+        self.assertEqual(self.app.fps_caps(), {"4": 30, "99": 20})
+        self.assertIn(4, self.app.flagged("muted"))
+        self.assertIn(99, self.app.afk_skip_ids())
+        self.assertEqual(self.app.group_of(self.app.account(4)), "Imported")
+        self.app.accounts.remove(self.app.account(99))
+        self.app.account(4).pop("group")
+        for key in ("fps_caps", "muted", "low_graphics", "afk_skip"):
+            self.app.settings.pop(key, None)
+        self.app.refresh()
+
+    def test_export_payload_has_everything_import_reads(self):
+        payload = self.app.export_payload()
+        self.assertEqual(len(av.export_entries(payload)), len(self.app.accounts))
+        self.assertEqual(payload["accounts"][0]["group"], "Farm")
+
+
+class TestTransferFile(unittest.TestCase):
+    PAYLOAD = {"accounts": [{"id": 1, "name": "alt1", "cookie": FAKE_COOKIE}], "favorites": []}
+
+    def test_aes_gcm_matches_the_nist_vector(self):
+        key = bytes.fromhex("feffe9928665731c6d6a8f9467308308" * 2)
+        iv = bytes.fromhex("cafebabefacedbaddecaf888")
+        aad = bytes.fromhex("feedfacedeadbeeffeedfacedeadbeefabaddad2")
+        pt = bytes.fromhex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72"
+                           "1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39")
+        ct, tag = av.aes_gcm(True, key, iv, pt, aad)
+        self.assertEqual(tag.hex(), "76fc6ece0f4e1768cddf8853bb2d551b")
+        self.assertEqual(av.aes_gcm(False, key, iv, ct, aad, tag), pt)
+        with self.assertRaises(ValueError):
+            av.aes_gcm(False, key, iv, ct, aad, bytes(16))
+
+    def test_round_trip(self):
+        data = av.seal_export(self.PAYLOAD, "correct horse")
+        self.assertTrue(data.startswith(av.EXPORT_MAGIC))
+        self.assertNotIn(FAKE_COOKIE.encode(), data)
+        self.assertEqual(av.open_export(data, "correct horse"), self.PAYLOAD)
+
+    def test_wrong_password_or_any_changed_byte_is_refused(self):
+        data = av.seal_export(self.PAYLOAD, "correct horse")
+        with self.assertRaisesRegex(av.RobloxError, "Wrong password"):
+            av.open_export(data, "wrong horse")
+        head = len(av.EXPORT_MAGIC) + 1
+        for i in (head, head + 20, len(data) - 30, len(data) - 1):   # salt, nonce, body, tag
+            bad = bytearray(data)
+            bad[i] ^= 1
+            with self.assertRaises(av.RobloxError):
+                av.open_export(bytes(bad), "correct horse")
+
+    def test_other_files_get_plain_errors(self):
+        for data, message in ((b"not an export at all, just some text " * 3, "isn't an AltVault export"),
+                              (av.EXPORT_MAGIC + b"\x09" + bytes(60), "newer AltVault")):
+            with self.assertRaisesRegex(av.RobloxError, message):
+                av.open_export(data, "pw")
+
+    def test_entries_drop_anything_malformed(self):
+        entries = av.export_entries({"accounts": [
+            {"cookie": FAKE_COOKIE, "name": "alt1", "group": " Farm ", "note": "n", "fps_cap": 15,
+             "low_graphics": True, "muted": "yes", "afk_skip": False},
+            {"cookie": "short"}, "junk", {"cookie": FAKE_COOKIE + "x", "fps_cap": 9999, "group": 5}]})
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0], {"cookie": FAKE_COOKIE, "name": "alt1", "group": "Farm", "note": "n",
+                                      "fps_cap": 15, "low_graphics": True, "muted": False, "afk_skip": False})
+        self.assertIsNone(entries[1]["fps_cap"])
+        self.assertIsNone(entries[1]["group"])
+
+
+class TestLiveHelpers(unittest.TestCase):
+    def test_grid_fills_the_area_without_scrolling(self):
+        for n in range(1, 13):
+            cols, rows, w, h = av.live_grid(n, 700, 480, 30, 10, 16 / 10)
+            self.assertGreaterEqual(cols * rows, n)
+            self.assertLessEqual(cols * w + (cols - 1) * 10, 700)
+            self.assertLessEqual(rows * h + (rows - 1) * 10, 480)
+        self.assertEqual(av.live_grid(4, 1000, 640, 30, 10, 16 / 10)[:2], (2, 2))
+        self.assertEqual(av.live_grid(3, 1400, 300, 30, 10, 16 / 10)[:2], (3, 1))
+
+    def test_fit_keeps_the_shape_and_centres(self):
+        self.assertEqual(av.fit_rect(800, 600, 10, 20, 400, 400), (10, 70, 410, 370))
+        self.assertEqual(av.fit_rect(0, 0, 5, 5, 10, 10), (5, 5, 15, 15))
+
+    def test_numbers_and_hatch_rate(self):
+        self.assertEqual([av.short_number(n) for n in (0, 999, 9999, 12345, 2_500_000, 3e9)],
+                         ["0", "999", "9,999", "12.3K", "2.5M", "3B"])
+        self.assertEqual(av.hatch_totals(30, 4), (120, 7200, 172800))
+        self.assertEqual(av.hatch_totals(30, 0), (0, 0, 0))
+        self.assertEqual([av.per_minute(v, u) for v, u in ((30, "min"), (1800, "hour"), (2, "sec"))], [30, 30, 30])
+
+    def test_window_never_bigger_than_the_screen(self):
+        with mock.patch.object(av, "work_area", lambda: (1366, 728)):
+            self.assertEqual(av.fit_to_screen("1200x740"), "1200x688+83+0")
+            self.assertEqual(av.fit_to_screen("1000x500+10+20"), "1000x500+10+20")
+            self.assertEqual(av.min_size(1.5), (1350, 728))
+
+    def test_cpu_meter(self):
+        meter = av.CpuMeter()
+        self.assertIsNone(meter.percent({1: 10.0}, now=100))
+        with mock.patch.object(av.os, "cpu_count", lambda: 4):
+            self.assertAlmostEqual(meter.percent({1: 12.0, 2: 5.0}, now=102), 25.0)   # 1 of 4 cores
 
 
 class TestRepoHygiene(unittest.TestCase):

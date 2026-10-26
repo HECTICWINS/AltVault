@@ -29,10 +29,10 @@ import urllib.request
 import uuid
 import webbrowser
 import zlib
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
 APP_TITLE = "AltVault"
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.7.0"
 APP_DIR = os.path.join(os.environ["LOCALAPPDATA"], "AltVault")
 DATA_FILE = os.path.join(APP_DIR, "accounts.dat")
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
@@ -518,8 +518,222 @@ def tile_windows(hwnds):
                              SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING)
 
 
+# Hide from taskbar: a tool window gets no taskbar button (and no Alt+Tab entry). The taskbar only
+# looks at the style when a window is shown, so the window is hidden and shown again around the
+# change, without activating it. Changing the style waits on Roblox, so frozen windows are skipped.
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_APPWINDOW = 0x00040000
+SW_HIDE, SW_SHOWNA = 0, 8
+_user32.SetWindowLongW.argtypes = [wt.HWND, ctypes.c_int, wt.LONG]
+_user32.ShowWindowAsync.argtypes = [wt.HWND, ctypes.c_int]
+
+
+def on_taskbar(hwnd):
+    return not _user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW
+
+
+def set_on_taskbar(hwnd, shown):
+    """Puts a window on the taskbar or takes it off. Returns False if it was frozen and left alone."""
+    if not responsive(hwnd):
+        return False
+    style = _user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    new = style & ~WS_EX_TOOLWINDOW if shown else (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+    if new != style:
+        _user32.ShowWindowAsync(hwnd, SW_HIDE)
+        _user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ctypes.c_long(new & 0xFFFFFFFF).value)
+        _user32.ShowWindowAsync(hwnd, SW_SHOWNA)
+    return True
+
+
+# ---------------------------------------------------------------- live view
+# The Live page shows Roblox windows through DWM thumbnails: Windows' compositor draws a scaled,
+# live copy of each window straight into AltVault's window, the same way taskbar previews work.
+# Nothing is captured or copied, Roblox isn't touched, and it costs nothing once the page is left.
+
+class DWM_THUMBNAIL_PROPERTIES(ctypes.Structure):
+    _fields_ = [("dwFlags", wt.DWORD), ("rcDestination", wt.RECT), ("rcSource", wt.RECT),
+                ("opacity", wt.BYTE), ("fVisible", wt.BOOL), ("fSourceClientAreaOnly", wt.BOOL)]
+
+
+DWM_TNP_RECTDESTINATION, DWM_TNP_OPACITY, DWM_TNP_VISIBLE, DWM_TNP_SOURCECLIENTAREAONLY = 0x1, 0x4, 0x8, 0x10
+_dwmapi.DwmRegisterThumbnail.argtypes = [wt.HWND, wt.HWND, ctypes.POINTER(ctypes.c_void_p)]
+_dwmapi.DwmRegisterThumbnail.restype = ctypes.c_long
+_dwmapi.DwmUnregisterThumbnail.argtypes = [ctypes.c_void_p]
+_dwmapi.DwmUpdateThumbnailProperties.argtypes = [ctypes.c_void_p, ctypes.POINTER(DWM_THUMBNAIL_PROPERTIES)]
+_dwmapi.DwmUpdateThumbnailProperties.restype = ctypes.c_long
+_user32.ClientToScreen.argtypes = [wt.HWND, ctypes.POINTER(wt.POINT)]
+_user32.GetClientRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+
+
+def register_thumbnail(dest, src):
+    """A handle for a live copy of window `src` drawn inside top-level window `dest`, or None."""
+    thumb = ctypes.c_void_p()
+    if _dwmapi.DwmRegisterThumbnail(dest, src, ctypes.byref(thumb)) != 0 or not thumb.value:
+        return None
+    return thumb.value
+
+
+def place_thumbnail(thumb, rect):
+    """Shows the thumbnail in rect (left, top, right, bottom, in dest's client pixels)."""
+    props = DWM_THUMBNAIL_PROPERTIES(
+        DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE | DWM_TNP_SOURCECLIENTAREAONLY,
+        wt.RECT(*rect), wt.RECT(), 255, True, True)
+    return _dwmapi.DwmUpdateThumbnailProperties(thumb, ctypes.byref(props)) == 0
+
+
+def unregister_thumbnail(thumb):
+    _dwmapi.DwmUnregisterThumbnail(thumb)
+
+
+def client_size(hwnd):
+    r = wt.RECT()
+    return (r.right, r.bottom) if _user32.GetClientRect(hwnd, ctypes.byref(r)) else (0, 0)
+
+
+def client_origin(hwnd):
+    pt = wt.POINT(0, 0)
+    _user32.ClientToScreen(hwnd, ctypes.byref(pt))
+    return pt.x, pt.y
+
+
+def fit_rect(src_w, src_h, x, y, w, h):
+    """The biggest rect with the source's shape, centred in (x, y, w, h): (left, top, right, bottom)."""
+    if src_w <= 0 or src_h <= 0 or w <= 0 or h <= 0:
+        return x, y, x + max(w, 0), y + max(h, 0)
+    scale = min(w / src_w, h / src_h)
+    fw, fh = round(src_w * scale), round(src_h * scale)
+    left, top = x + (w - fw) // 2, y + (h - fh) // 2
+    return left, top, left + fw, top + fh
+
+
+def live_grid(n, width, height, header, gap, aspect):
+    """(cols, rows, tile_w, tile_h) for n tiles as big as fits in width x height, no scrolling.
+    A tile is a `header`-high title row over a body with the windows' shape (aspect = w / h)."""
+    best = None
+    for cols in range(1, n + 1):
+        rows = math.ceil(n / cols)
+        cell_w = (width - gap * (cols - 1)) / cols
+        cell_h = (height - gap * (rows - 1)) / rows
+        body_w = min(cell_w, (cell_h - header) * aspect)
+        if best is None or body_w > best[0]:
+            best = (body_w, cols, rows)
+    body_w, cols, rows = best
+    body_w = max(int(body_w), 1)
+    return cols, rows, body_w, int(body_w / aspect) + header
+
+
+class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+    _fields_ = [("cb", wt.DWORD), ("PageFaultCount", wt.DWORD)] + \
+               [(name, ctypes.c_size_t) for name in (
+                   "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+                   "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage")]
+
+
+class MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [("dwLength", wt.DWORD), ("dwMemoryLoad", wt.DWORD)] + \
+               [(name, ctypes.c_ulonglong) for name in (
+                   "ullTotalPhys", "ullAvailPhys", "ullTotalPageFile", "ullAvailPageFile",
+                   "ullTotalVirtual", "ullAvailVirtual", "ullAvailExtendedVirtual")]
+
+
+PROCESS_VM_READ = 0x0010
+_kernel32.GetProcessTimes.argtypes = [wt.HANDLE] + [ctypes.POINTER(wt.FILETIME)] * 4
+_kernel32.K32GetProcessMemoryInfo.argtypes = [wt.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), wt.DWORD]
+_kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(MEMORYSTATUSEX)]
+
+
+def process_usage(pid):
+    """(CPU seconds used so far, bytes of RAM in use) for a process. Either is None if Windows
+    won't say (Roblox may refuse the memory query); None overall if the process can't be opened."""
+    handle = (_kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, False, pid)
+              or _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid))
+    if not handle:
+        return None
+    try:
+        times = [wt.FILETIME() for _ in range(4)]
+        cpu = None
+        if _kernel32.GetProcessTimes(handle, *map(ctypes.byref, times)):
+            kernel, user = ((t.dwHighDateTime << 32 | t.dwLowDateTime) for t in times[2:])
+            cpu = (kernel + user) / 1e7
+        mem = PROCESS_MEMORY_COUNTERS(cb=ctypes.sizeof(PROCESS_MEMORY_COUNTERS))
+        ok = _kernel32.K32GetProcessMemoryInfo(handle, ctypes.byref(mem), ctypes.sizeof(mem))
+        return cpu, mem.WorkingSetSize if ok else None
+    finally:
+        _kernel32.CloseHandle(handle)
+
+
+def memory_status():
+    """(free, total) physical RAM in bytes."""
+    status = MEMORYSTATUSEX(dwLength=ctypes.sizeof(MEMORYSTATUSEX))
+    _kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+    return status.ullAvailPhys, status.ullTotalPhys
+
+
+class CpuMeter:
+    """Turns CPU seconds per process into a share of the whole PC, like Task Manager shows."""
+
+    def __init__(self):
+        self.last = {}   # pid -> (monotonic time, cpu seconds)
+
+    def percent(self, samples, now=None):
+        """samples: {pid: cpu seconds}. Returns the total % since the last call, or None at first."""
+        now = time.monotonic() if now is None else now
+        total, known = 0.0, False
+        for pid, cpu in samples.items():
+            if pid in self.last:
+                then, before = self.last[pid]
+                if now > then:
+                    total += max(cpu - before, 0) / (now - then)
+                    known = True
+        self.last = {pid: (now, cpu) for pid, cpu in samples.items()}
+        return 100 * total / (os.cpu_count() or 1) if known else None
+
+
+def short_number(n):
+    """1234 -> '1,234', 98765 -> '98.8K', 2500000 -> '2.5M'."""
+    for above, size, suffix in ((1e12, 1e12, "T"), (1e9, 1e9, "B"), (1e6, 1e6, "M"), (1e4, 1e3, "K")):
+        if abs(n) >= above:
+            return f"{n / size:.1f}".rstrip("0").rstrip(".") + suffix
+    return f"{n:,.0f}" if n == int(n) else f"{n:,.1f}"
+
+
+def per_minute(value, unit):
+    """One alt's hatch speed typed as eggs/min, eggs/hour or seconds per egg, as eggs per minute."""
+    return {"min": value, "hour": value / 60, "sec": 60 / value}[unit]
+
+
+def hatch_totals(per_minute, alts):
+    """Eggs per (minute, hour, day) for `alts` alts that each hatch `per_minute`."""
+    rate = max(per_minute, 0) * max(alts, 0)
+    return rate, rate * 60, rate * 1440
+
+
 SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 76, 77, 78, 79
-DEFAULT_GEOMETRY = "820x560"
+DEFAULT_GEOMETRY = "1200x740"
+
+
+LAYOUT_VERSION = 2   # 2.7: sidebar pages and the Live grid
+
+
+def work_area():
+    area = wt.RECT()
+    _user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(area), 0)
+    return area.right - area.left, area.bottom - area.top
+
+
+def min_size(scale):
+    w, h = work_area()
+    return min(int(900 * scale), w), min(int(580 * scale), h)
+
+
+def fit_to_screen(geometry):
+    """Shrinks a 'WxH[+X+Y]' geometry to the main screen's work area, centring a size-only one."""
+    m = re.fullmatch(r"(\d+)x(\d+)(.*)", geometry)
+    if not m:
+        return geometry
+    aw, ah = work_area()
+    w, h = min(int(m.group(1)), aw), min(int(m.group(2)), ah - 40)
+    return f"{w}x{h}{m.group(3) or f'+{(aw - w) // 2}+{max((ah - h) // 2 - 20, 0)}'}"
 
 
 def safe_geometry(saved):
@@ -1001,6 +1215,102 @@ def save_settings(settings):
         json.dump(settings, f)
 
 
+# ---------------------------------------------------------------- transfer file
+# accounts.dat only opens for this Windows user on this PC, which is what keeps it safe. To move
+# accounts elsewhere they're exported to a .altvault file locked with a password instead: scrypt
+# turns the password into a key (slow on purpose, to make guessing expensive), and AES-256-GCM
+# from Windows' own crypto library (CNG) encrypts the accounts and detects any tampering. The
+# header (magic, version, salt, nonce) is authenticated too, so it can't be swapped either.
+EXPORT_MAGIC = b"ALTVAULT"
+EXPORT_VERSION = 1
+EXPORT_EXT = ".altvault"
+SCRYPT = {"n": 2 ** 15, "r": 8, "p": 1, "maxmem": 64 * 1024 * 1024, "dklen": 32}
+MIN_PASSWORD = 8
+STATUS_AUTH_TAG_MISMATCH = 0xC000A002
+
+
+class BCRYPT_AUTH_INFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.ULONG), ("dwInfoVersion", wt.ULONG), ("pbNonce", ctypes.c_void_p),
+                ("cbNonce", wt.ULONG), ("pbAuthData", ctypes.c_void_p), ("cbAuthData", wt.ULONG),
+                ("pbTag", ctypes.c_void_p), ("cbTag", wt.ULONG), ("pbMacContext", ctypes.c_void_p),
+                ("cbMacContext", wt.ULONG), ("cbAAD", wt.ULONG), ("cbData", ctypes.c_ulonglong),
+                ("dwFlags", wt.ULONG)]
+
+
+_bcrypt = ctypes.WinDLL("bcrypt")
+_bcrypt.BCryptOpenAlgorithmProvider.argtypes = [ctypes.POINTER(ctypes.c_void_p), wt.LPCWSTR, wt.LPCWSTR, wt.ULONG]
+_bcrypt.BCryptSetProperty.argtypes = [ctypes.c_void_p, wt.LPCWSTR, ctypes.c_void_p, wt.ULONG, wt.ULONG]
+_bcrypt.BCryptGenerateSymmetricKey.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+                                               wt.ULONG, ctypes.c_char_p, wt.ULONG, wt.ULONG]
+for _fn in (_bcrypt.BCryptEncrypt, _bcrypt.BCryptDecrypt):
+    _fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, wt.ULONG, ctypes.c_void_p, ctypes.c_void_p, wt.ULONG,
+                    ctypes.c_char_p, wt.ULONG, ctypes.POINTER(wt.ULONG), wt.ULONG]
+for _fn in (_bcrypt.BCryptOpenAlgorithmProvider, _bcrypt.BCryptSetProperty, _bcrypt.BCryptGenerateSymmetricKey,
+            _bcrypt.BCryptEncrypt, _bcrypt.BCryptDecrypt):
+    _fn.restype = ctypes.c_long
+_bcrypt.BCryptDestroyKey.argtypes = [ctypes.c_void_p]
+_bcrypt.BCryptCloseAlgorithmProvider.argtypes = [ctypes.c_void_p, wt.ULONG]
+
+
+def aes_gcm(encrypt, key, nonce, data, aad, tag=None):
+    """AES-GCM with a 16-byte tag. Encrypting returns (ciphertext, tag); decrypting returns the
+    plaintext, or raises ValueError if the key is wrong or anything was changed."""
+    def check(status):
+        if status:
+            raise OSError(f"Windows crypto error 0x{status & 0xFFFFFFFF:08X}")
+    alg, hkey = ctypes.c_void_p(), ctypes.c_void_p()
+    check(_bcrypt.BCryptOpenAlgorithmProvider(ctypes.byref(alg), "AES", None, 0))
+    try:
+        mode = ctypes.create_unicode_buffer("ChainingModeGCM")
+        check(_bcrypt.BCryptSetProperty(alg, "ChainingMode", mode, ctypes.sizeof(mode), 0))
+        check(_bcrypt.BCryptGenerateSymmetricKey(alg, ctypes.byref(hkey), None, 0, key, len(key), 0))
+        nonce_buf, aad_buf = ctypes.create_string_buffer(nonce, len(nonce)), ctypes.create_string_buffer(aad, len(aad))
+        tag_buf = ctypes.create_string_buffer(tag or bytes(16), 16)
+        info = BCRYPT_AUTH_INFO(ctypes.sizeof(BCRYPT_AUTH_INFO), 1, ctypes.cast(nonce_buf, ctypes.c_void_p), len(nonce),
+                                ctypes.cast(aad_buf, ctypes.c_void_p), len(aad), ctypes.cast(tag_buf, ctypes.c_void_p), 16)
+        out, done = ctypes.create_string_buffer(max(len(data), 1)), wt.ULONG()
+        fn = _bcrypt.BCryptEncrypt if encrypt else _bcrypt.BCryptDecrypt
+        status = fn(hkey, data, len(data), ctypes.byref(info), None, 0, out, len(data), ctypes.byref(done), 0)
+        if not encrypt and status & 0xFFFFFFFF == STATUS_AUTH_TAG_MISMATCH:
+            raise ValueError("wrong password or damaged file")
+        check(status)
+        return (out.raw[:done.value], tag_buf.raw) if encrypt else out.raw[:done.value]
+    finally:
+        if hkey:
+            _bcrypt.BCryptDestroyKey(hkey)
+        _bcrypt.BCryptCloseAlgorithmProvider(alg, 0)
+
+
+def _export_key(password, salt):
+    return hashlib.scrypt(password.encode("utf-8"), salt=salt, **SCRYPT)
+
+
+def seal_export(payload, password):
+    """The bytes of a .altvault file holding `payload` (JSON-able), locked with `password`."""
+    salt, nonce = os.urandom(16), os.urandom(12)
+    header = EXPORT_MAGIC + bytes([EXPORT_VERSION]) + salt + nonce
+    body, tag = aes_gcm(True, _export_key(password, salt), nonce, json.dumps(payload).encode("utf-8"), header)
+    return header + body + tag
+
+
+def open_export(data, password):
+    """The payload of a .altvault file. Raises RobloxError with a plain message if it can't be read."""
+    head = len(EXPORT_MAGIC)
+    if len(data) < head + 1 + 16 + 12 + 16 or not data.startswith(EXPORT_MAGIC):
+        raise RobloxError("That isn't an AltVault export file.")
+    if data[head] != EXPORT_VERSION:
+        raise RobloxError("This export was made by a newer AltVault. Update AltVault, then import it again.")
+    salt, nonce = data[head + 1:head + 17], data[head + 17:head + 29]
+    header, body, tag = data[:head + 29], data[head + 29:-16], data[-16:]
+    try:
+        payload = json.loads(aes_gcm(False, _export_key(password, salt), nonce, body, header, tag))
+    except ValueError:
+        raise RobloxError("Wrong password, or the file was damaged.") from None
+    if not isinstance(payload, dict) or not isinstance(payload.get("accounts"), list):
+        raise RobloxError("That export file has no accounts in it.")
+    return payload
+
+
 # ---------------------------------------------------------------- Roblox web API
 
 class RobloxError(Exception):
@@ -1473,8 +1783,9 @@ def parse_job_id(text):
 
 C = {"bg": "#1e1f22", "panel": "#2b2d31", "field": "#383a40", "sel": "#404249",
      "fg": "#e3e5e8", "muted": "#949ba4", "accent": "#5865f2", "accent_hover": "#4752c4",
-     "green": "#23a55a", "red": "#f23f43", "yellow": "#f0b232"}
+     "green": "#23a55a", "red": "#f23f43", "yellow": "#f0b232", "accent_text": "#8c95ff"}
 FONT = ("Segoe UI", 10)
+NAV_HOVER = "#35373c"
 
 
 def apply_theme(root, scale):
@@ -1514,6 +1825,7 @@ def apply_theme(root, scale):
     s.configure("Muted.TLabel", foreground=C["muted"])
     s.configure("Small.TLabel", foreground=C["muted"], font=("Segoe UI", 9))
     s.configure("Title.TLabel", font=("Segoe UI Semibold", 16))
+    s.configure("Section.TLabel", foreground=C["muted"], font=("Segoe UI Semibold", 10))
     s.configure("Error.TLabel", foreground=C["red"])
     s.configure("Hint.TLabel", background=C["field"], foreground=C["muted"])
     s.configure("Success.TLabel", foreground=C["green"])
@@ -1556,12 +1868,12 @@ class AddAccountDialog(tk.Toplevel):
         self.app = app
         self.login = None   # the BrowserLogin in progress, if any
         wrap = int(500 * app.scale)
-        self.title(f"Update login: {for_account['name']}" if for_account else "Add account")
+        self.title(f"Update login: {app.who(for_account)}" if for_account else "Add account")
         self.resizable(False, False)
         self.transient(app.root)
         frm = ttk.Frame(self, padding=18)
         frm.pack(fill="both", expand=True)
-        ttk.Label(frm, text=f"Log in again as @{for_account['name']}" if for_account
+        ttk.Label(frm, text=f"Log in again as {app.who(for_account)}" if for_account
                   else "Add a Roblox account", style="Title.TLabel").pack(anchor="w")
         ttk.Label(frm, text="A private browser window opens on roblox.com. Log in as usual (2-step verification "
                   "works too). AltVault saves the account and closes the window. Your normal browser and its "
@@ -1661,7 +1973,8 @@ class AddAccountDialog(tk.Toplevel):
         self.app.add_or_update(user, cookie, note)
         self.note_var.set("")
         self.login_btn.config(text="Log in another account")
-        self.status.config(text=f"Saved @{user['name']}. Log in another account, or Close.", style="Success.TLabel")
+        self.status.config(text=f"Saved {self.app.who(self.app.account(user['id']))}. Log in another account, "
+                           "or Close.", style="Success.TLabel")
 
     def _login_failed(self, msg):
         self.login = None
@@ -1728,6 +2041,32 @@ def import_ram_into(app, path, report):
         message = str(e)
         app.ui(report, message)
         return
+    check_and_add(app, entries, report)
+
+
+MAX_EXPORT_BYTES = 20 * 1024 * 1024
+
+
+def export_entries(payload):
+    """The accounts of an opened .altvault file, in the form add_many takes. Anything malformed is
+    dropped, since the file may have been made by hand."""
+    found = []
+    for item in payload.get("accounts") or []:
+        if not isinstance(item, dict) or not COOKIE_RE.fullmatch(str(item.get("cookie") or "")):
+            continue
+        group = item.get("group")
+        cap = item.get("fps_cap")
+        found.append({"cookie": item["cookie"], "name": str(item.get("name") or ""),
+                      "group": group.strip()[:40] or None if isinstance(group, str) else None,
+                      "note": str(item.get("note") or "")[:200],
+                      "fps_cap": cap if isinstance(cap, int) and FPS_RANGE[0] <= cap <= FPS_RANGE[1] else None,
+                      **{k: item.get(k) is True for k in ("low_graphics", "muted", "afk_skip")}})
+    return found
+
+
+def check_and_add(app, entries, report, favorites=None):
+    """Checks every login with Roblox (on this worker thread), then saves the working ones in one go
+    and calls report(text) on the Tk thread."""
     good, expired = [], []
     for i, entry in enumerate(entries, 1):
         app.set_status(f"Checking imported account {i}/{len(entries)}...")
@@ -1740,6 +2079,8 @@ def import_ram_into(app, path, report):
 
     def save():
         app.add_many(good)
+        if favorites:
+            app.merge_favorites(favorites)
         if not entries:
             report("No accounts were found in that file.")
             return
@@ -1751,63 +2092,534 @@ def import_ram_into(app, path, report):
     app.ui(save)
 
 
-class SettingsDialog(tk.Toplevel):
-    """Options you set once. Everyday controls (Join, Anti-AFK) stay in the main window."""
+class SettingsPage(ttk.Frame):
+    """Options you set once, in two columns. Everyday controls (Join, Anti-AFK) stay elsewhere."""
 
-    def __init__(self, app):
-        super().__init__(app.root, bg=C["bg"])
+    def __init__(self, app, parent):
+        super().__init__(parent)
         self.app = app
-        self.title("Settings")
-        self.resizable(False, False)
-        self.transient(app.root)
-        frm = ttk.Frame(self, padding=18)
-        frm.pack(fill="both", expand=True)
-        wrap = int(420 * app.scale)
-        ttk.Label(frm, text="Settings", style="Title.TLabel").pack(anchor="w")
+        wrap = int(300 * app.scale)
+        ttk.Label(self, text="Settings", style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        left, right = ttk.Frame(self), ttk.Frame(self)
+        left.grid(row=1, column=0, sticky="nwe", padx=(0, int(24 * app.scale)))
+        right.grid(row=1, column=1, sticky="nwe")
+        self.columnconfigure((0, 1), weight=1, uniform="col")
+        self.wrapped = []   # labels that rewrap when the page is resized
 
-        def option(var, title, detail, command):
-            ttk.Checkbutton(frm, text=title, variable=var, command=command).pack(anchor="w", pady=(12, 0))
-            ttk.Label(frm, text=detail, style="Small.TLabel", wraplength=wrap, justify="left").pack(
-                anchor="w", padx=(24, 0))
+        def section(frm, title, first=False):
+            ttk.Label(frm, text=title, style="Section.TLabel").pack(anchor="w", pady=(10 if first else 18, 0))
 
-        ttk.Label(frm, text="Joining", style="Muted.TLabel").pack(anchor="w", pady=(14, 0))
-        option(app.multi_var, "Multi-Roblox", "Run several Roblox windows at once. Turn off only if you "
+        def detail(frm, text, indent=24):
+            label = ttk.Label(frm, text=text, style="Small.TLabel", wraplength=wrap, justify="left")
+            label.pack(anchor="w", fill="x", padx=(indent, 0))
+            self.wrapped.append((label, indent))
+
+        def option(frm, var, title, text, command):
+            ttk.Checkbutton(frm, text=title, variable=var, command=command).pack(anchor="w", pady=(8, 0))
+            detail(frm, text)
+
+        section(left, "Joining", first=True)
+        option(left, app.multi_var, "Multi-Roblox", "Run several Roblox windows at once. Turn off only if you "
                "want each launch to replace the previous window.", app.toggle_multi)
-        option(app.same_server_var, "Put accounts in the same server",
+        option(left, app.same_server_var, "Put accounts in the same server",
                "When joining several accounts with no server chosen, they all follow the first one.",
                app.save_settings)
-        option(app.auto_tile_var, "Arrange windows after joining",
+        option(left, app.auto_tile_var, "Arrange windows after joining",
                "Splits the screen evenly between every Roblox window, like the Tile button.", app.save_settings)
 
-        ttk.Label(frm, text="Anti-AFK", style="Muted.TLabel").pack(anchor="w", pady=(16, 0))
-        row = ttk.Frame(frm)
-        row.pack(anchor="w", pady=(8, 0))
+        section(left, "Anti-AFK")
+        row = ttk.Frame(left)
+        row.pack(anchor="w", pady=(8, 2))
         ttk.Label(row, text="Key it presses").pack(side="left")
         self.key_var = tk.StringVar(value=str(app.settings.get("afk_key", "space")).lower())
         keys = ttk.Combobox(row, textvariable=self.key_var, state="readonly", width=8,
                             values=["space", "f13"] + list("abcdefghijklmnopqrstuvwxyz"))
         keys.pack(side="left", padx=(8, 0))
         keys.bind("<<ComboboxSelected>>", lambda _e: self.set_key())
-        ttk.Label(frm, text="Space makes your character jump. F13 is a key no game uses, for games where "
-                  "jumping gets in the way.", style="Small.TLabel", wraplength=wrap, justify="left").pack(anchor="w")
+        detail(left, "Space makes your character jump. F13 is a key no game uses, for games where "
+               "jumping gets in the way.", indent=0)
 
-        ttk.Label(frm, text="About", style="Muted.TLabel").pack(anchor="w", pady=(16, 0))
-        ttk.Label(frm, text=f"AltVault {APP_VERSION}").pack(anchor="w", pady=(6, 0))
-        links = ttk.Frame(frm)
+        section(right, "Privacy", first=True)
+        option(right, app.stream_var, "Stream mode", "Hides usernames and avatars in AltVault and in Roblox "
+               "window titles, so you can share your screen.", app.toggle_stream)
+        option(right, app.hide_taskbar_var, "Hide Roblox from the taskbar", "Keeps the taskbar and Alt+Tab "
+               "clear. Open a window from the Live page instead.", app.toggle_taskbar)
+
+        section(right, "Your accounts")
+        detail(right, "Updates keep your accounts by themselves. To move them to another PC or Windows "
+               "user, export them to a file locked with a password.", indent=0)
+        row = ttk.Frame(right)
+        row.pack(anchor="w", pady=(8, 0))
+        ttk.Button(row, text="Export...", command=app.export_accounts).pack(side="left")
+        ttk.Button(row, text="Import...", command=app.import_accounts).pack(side="left", padx=(6, 0))
+
+        section(right, "About")
+        ttk.Label(right, text=f"AltVault {APP_VERSION}").pack(anchor="w", pady=(6, 0))
+        links = ttk.Frame(right)
         links.pack(anchor="w", pady=(6, 0))
         ttk.Button(links, text="Open on GitHub",
                    command=lambda: webbrowser.open("https://github.com/HECTICWINS/AltVault")).pack(side="left")
         ttk.Button(links, text="Open log folder", command=lambda: os.startfile(APP_DIR)).pack(side="left", padx=(6, 0))
+        left.bind("<Configure>", self.rewrap)
 
-        ttk.Button(frm, text="Close", command=self.destroy).pack(anchor="e", pady=(18, 0))
-        self.bind("<Escape>", lambda _e: self.destroy())
-        dark_title_bar(self)
-        self.after(50, lambda: self.winfo_exists() and dark_title_bar(self))
+    def rewrap(self, event):
+        for label, indent in self.wrapped:
+            label.config(wraplength=max(event.width - indent - 4, 120))
 
     def set_key(self):
         self.app.settings["afk_key"] = self.key_var.get()
         save_settings(self.app.settings)
         self.app.status.config(text=f"Anti-AFK will press {self.key_var.get().upper()}.")
+
+
+class PasswordDialog(tk.Toplevel):
+    """Asks for an export file's password and waits. `confirm` adds a second box, for choosing a new
+    one. `check(password)` may raise RobloxError, shown in the dialog so the user can try again; its
+    return value is .result. .password is None if cancelled."""
+
+    def __init__(self, app, title, text, confirm=False, check=None):
+        super().__init__(app.root, bg=C["bg"])
+        self.password, self.result, self.confirm, self.check = None, None, confirm, check
+        self.title(title)
+        self.resizable(False, False)
+        self.transient(app.root)
+        frm = ttk.Frame(self, padding=18)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text=title, style="Title.TLabel").pack(anchor="w")
+        ttk.Label(frm, text=text, wraplength=int(380 * app.scale), justify="left").pack(anchor="w", pady=(8, 0))
+        self.vars = [tk.StringVar() for _ in range(2 if confirm else 1)]
+        entries = []
+        for var, label in zip(self.vars, ("Password", "Type it again")):
+            ttk.Label(frm, text=label, style="Muted.TLabel").pack(anchor="w", pady=(10, 2))
+            entries.append(ttk.Entry(frm, textvariable=var, show="•"))
+            entries[-1].pack(fill="x")
+            entries[-1].bind("<Return>", lambda _e: self.ok())
+        self.error = ttk.Label(frm, text="", style="Error.TLabel")
+        self.error.pack(anchor="w", pady=(8, 0))
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(8, 0))
+        ttk.Button(btns, text="OK", style="Accent.TButton", command=self.ok).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right", padx=(0, 6))
+        self.bind("<Escape>", lambda _e: self.destroy())
+        dark_title_bar(self)
+        self.grab_set()
+        entries[0].focus_set()
+        self.wait_window()
+
+    def ok(self):
+        password = self.vars[0].get()
+        if self.confirm and len(password) < MIN_PASSWORD:
+            self.error.config(text=f"Use at least {MIN_PASSWORD} characters.")
+        elif self.confirm and password != self.vars[1].get():
+            self.error.config(text="The two passwords don't match.")
+        elif password:
+            if self.check:
+                self.error.config(text="Checking...")
+                self.update_idletasks()
+                try:
+                    self.result = self.check(password)
+                except RobloxError as e:
+                    self.error.config(text=str(e))
+                    return
+            self.password = password
+            self.destroy()
+
+
+class LivePage(ttk.Frame):
+    """Every Roblox window as a live tile (see 'live view' above), with a stats panel on the right.
+    Thumbnails exist only while this page is on screen. Stats are sampled every few seconds, and
+    only then; nothing here runs while AltVault is minimised, in the tray, or on another page."""
+
+    SAMPLE_MS = 3000
+    GAP = 8
+    UNITS = (("min", "eggs/min"), ("hour", "eggs/hour"), ("sec", "sec/egg"))
+
+    def __init__(self, app, parent):
+        super().__init__(parent)
+        self.app = app
+        self.tiles = {}        # hwnd -> LiveTile
+        self.thumbs = {}       # hwnd -> DWM thumbnail handle
+        self.placed = {}       # hwnd -> the rect its thumbnail was last given
+        self.shown = False
+        self.sample_job = None
+        self.cpu = CpuMeter()
+        self.ram_used = None   # share of the PC's RAM in use, for the bar
+        s = app.scale
+        # The stats panel runs the page's full height, beside the title, toolbar and tiles.
+        self.panel = tk.Frame(self, bg=C["panel"], width=int(240 * s))
+        self.panel.pack(side="right", fill="y", padx=(int(14 * s), 0))
+        self.panel.pack_propagate(False)
+        left = ttk.Frame(self)
+        left.pack(side="left", fill="both", expand=True)
+        ttk.Label(left, text="Live", style="Title.TLabel").pack(anchor="w")
+        self.summary = ttk.Label(left, text="", style="Small.TLabel")
+        self.summary.pack(anchor="w")
+
+        # Quick switches for what matters while watching: privacy and the taskbar, then window actions.
+        bar = ttk.Frame(left)
+        bar.pack(fill="x", pady=(10, 0))
+        self.stream_btn = ttk.Button(bar, command=self.flip_stream)
+        self.stream_btn.pack(side="left")
+        ttk.Checkbutton(bar, text="Hide from taskbar", variable=app.hide_taskbar_var,
+                        command=app.toggle_taskbar).pack(side="left", padx=(14, 0))
+        ttk.Button(bar, text="Close all", command=app.close_all).pack(side="right")
+        ttk.Button(bar, text="Arrange windows", command=app.tile).pack(side="right", padx=(0, 6))
+        self.update_toolbar()
+
+        self.area = tk.Frame(left, bg=C["bg"])
+        self.area.pack(fill="both", expand=True, pady=(12, 0))
+        self.area.bind("<Configure>", lambda _e: self.layout())
+        self.empty = ttk.Label(self.area, text="No Roblox windows open.\nJoin from Accounts and they show up here.",
+                               style="Muted.TLabel", justify="center")
+        self.build_panel()
+
+    def flip_stream(self):
+        self.app.stream_var.set(not self.app.stream_var.get())
+        self.app.toggle_stream()
+
+    def update_toolbar(self):
+        on = self.app.stream_var.get()
+        self.stream_btn.config(text=f"Stream mode: {'on' if on else 'off'}", style="Accent.TButton" if on else "TButton")
+
+    # ------------------------------------------------------------ stats panel
+    def build_panel(self):
+        s = self.app.scale
+        pad = int(16 * s)
+        P = C["panel"]
+        small = ("Segoe UI", 8)
+        self.values = {}
+
+        def label(parent, text="", fg=C["fg"], font=FONT, **kw):
+            return tk.Label(parent, text=text, bg=P, fg=fg, font=font, **kw)
+
+        def section(title):
+            label(self.panel, title, font=("Segoe UI Semibold", 9)).pack(anchor="w", padx=pad,
+                                                                         pady=(int(14 * s), int(2 * s)))
+
+        def stat(key, text, dot=None):
+            row = tk.Frame(self.panel, bg=P)
+            row.pack(fill="x", padx=pad, pady=(int(2 * s), 0))
+            if dot:
+                label(row, "●", fg=dot, font=small).pack(side="left", padx=(0, int(6 * s)))
+            label(row, text, fg=C["muted"] if not dot else C["fg"]).pack(side="left")
+            self.values[key] = label(row, "—", font=("Segoe UI Semibold", 10))
+            self.values[key].pack(side="right")
+
+        # Headline: how many windows are in a game, and a one-line verdict.
+        top = tk.Frame(self.panel, bg=P)
+        top.pack(fill="x", padx=pad, pady=(pad, 0))
+        self.big = label(top, "0", font=("Segoe UI Semibold", 24))
+        self.big.pack(side="left")
+        self.big_of = label(top, " / 0", fg=C["muted"], font=("Segoe UI Semibold", 14))
+        self.big_of.pack(side="left", anchor="s", pady=(0, int(5 * s)))
+        label(self.panel, "windows in a game", fg=C["muted"], font=small).pack(anchor="w", padx=pad)
+        pill = tk.Frame(self.panel, bg=C["field"])
+        pill.pack(anchor="w", padx=pad, pady=(int(8 * s), 0))
+        self.pill_dot = tk.Label(pill, text="●", bg=C["field"], fg=C["muted"], font=small)
+        self.pill_dot.pack(side="left", padx=(int(8 * s), int(4 * s)), pady=int(3 * s))
+        self.pill_text = tk.Label(pill, text="", bg=C["field"], fg=C["fg"], font=small)
+        self.pill_text.pack(side="left", padx=(0, int(10 * s)))
+
+        section("Windows")
+        stat("ingame", "In a game", C["green"])
+        stat("loading", "Loading", C["yellow"])
+        stat("hung", "Not responding", C["red"])
+
+        section("This PC")
+        stat("cpu", "Roblox CPU")
+        stat("ram", "Roblox RAM")
+        stat("free", "Free RAM")
+        self.ram_bar = tk.Canvas(self.panel, height=max(int(5 * s), 3), bg=C["field"], highlightthickness=0, bd=0)
+        self.ram_bar.pack(fill="x", padx=pad, pady=(int(5 * s), 0))
+        self.ram_bar.bind("<Configure>", lambda _e: self.draw_ram_bar())
+
+        section("Egg hatch")
+        saved = self.app.settings.get("hatch")
+        saved = saved if isinstance(saved, dict) else {}
+        value, unit = saved.get("value"), saved.get("unit")
+        self.unit = unit if unit in dict(self.UNITS) else "min"
+        self.eggs_var = tk.StringVar(value=f"{value:g}" if isinstance(value, (int, float)) and value > 0 else "")
+        ttk.Entry(self.panel, textvariable=self.eggs_var).pack(fill="x", padx=pad, pady=(int(2 * s), 0))
+        self.eggs_var.trace_add("write", lambda *_: self.eggs_changed())
+        seg = tk.Frame(self.panel, bg=C["field"])
+        seg.pack(fill="x", padx=pad, pady=(int(6 * s), int(2 * s)))
+        self.unit_btns = {}
+        for key, text in self.UNITS:
+            btn = tk.Label(seg, text=text, bg=C["field"], fg=C["muted"], font=small, cursor="hand2", pady=int(3 * s))
+            btn.pack(side="left", fill="x", expand=True, padx=1, pady=1)
+            btn.bind("<Button-1>", lambda _e, k=key: self.set_unit(k))
+            self.unit_btns[key] = btn
+        stat("per_min", "Per minute")
+        stat("per_hour", "Per hour")
+        stat("per_day", "Per day")
+        self.values["per_hour"].config(fg=C["accent_text"])
+        self.hatch_hint = label(self.panel, "", fg=C["muted"], font=small, justify="left", wraplength=int(205 * s))
+        self.hatch_hint.pack(anchor="w", padx=pad, pady=(int(3 * s), 0))
+        self.paint_units()
+
+        section("Anti-AFK")
+        stat("afk_last", "Last ping")
+        stat("afk_next", "Next ping")
+
+    def set_unit(self, unit):
+        self.unit = unit
+        self.paint_units()
+        self.eggs_changed()
+
+    def paint_units(self):
+        for key, btn in self.unit_btns.items():
+            on = key == self.unit
+            btn.config(bg=C["sel"] if on else C["field"], fg=C["fg"] if on else C["muted"])
+
+    def eggs_value(self):
+        try:
+            value = float(self.eggs_var.get().replace(",", "."))
+        except ValueError:
+            return None
+        return value if 0 < value < 1e9 and math.isfinite(value) else None
+
+    def eggs_rate(self):
+        """Eggs per minute for one alt, whichever unit it was typed in."""
+        value = self.eggs_value()
+        return None if value is None else per_minute(value, self.unit)
+
+    def eggs_changed(self):
+        value = self.eggs_value()
+        if value is None:
+            self.app.settings.pop("hatch", None)
+        else:
+            self.app.settings["hatch"] = {"value": value, "unit": self.unit}
+        save_settings(self.app.settings)
+        self.update_hatch()
+
+    def update_hatch(self):
+        rate, alts = self.eggs_rate(), self.count("green")
+        if rate is None:
+            for key in ("per_min", "per_hour", "per_day"):
+                self.values[key].config(text="—")
+            self.hatch_hint.config(text="Type one alt's hatch speed, in the unit picked below the box.")
+            return
+        for key, total in zip(("per_min", "per_hour", "per_day"), hatch_totals(rate, alts)):
+            self.values[key].config(text=short_number(total))
+        self.hatch_hint.config(text=f"{alts} alt{'s' if alts != 1 else ''} in a game · "
+                                    f"{short_number(rate * 60)} per hour each")
+
+    def count(self, color):
+        return sum(1 for t in self.tiles.values() if t.color == color)
+
+    def update_headline(self):
+        n, ingame, loading, hung = len(self.tiles), self.count("green"), self.count("yellow"), self.count("red")
+        self.big.config(text=str(ingame))
+        self.big_of.config(text=f" / {n}")
+        if not n:
+            dot, text = C["muted"], "No Roblox windows"
+        elif hung:
+            dot, text = C["red"], f"{hung} not responding"
+        elif loading:
+            dot, text = C["yellow"], f"{loading} still loading"
+        else:
+            dot, text = C["green"], "Every window is in a game"
+        self.pill_dot.config(fg=dot)
+        self.pill_text.config(text=text)
+        for key, value in (("ingame", ingame), ("loading", loading), ("hung", hung)):
+            self.values[key].config(text=str(value))
+        self.summary.config(text=f"{n} window{'s' if n != 1 else ''} · {ingame} in a game · click a tile to "
+                                 "bring it to the front" if n else "Roblox windows show up here while they're open")
+
+    def draw_ram_bar(self):
+        bar = self.ram_bar
+        bar.delete("all")
+        if self.ram_used is None:
+            return
+        free = 1 - self.ram_used
+        color = C["green"] if free > 0.25 else C["yellow"] if free > 0.1 else C["red"]
+        bar.create_rectangle(0, 0, int(bar.winfo_width() * self.ram_used), bar.winfo_height(), fill=color, width=0)
+
+    def sample(self):
+        """Roblox's CPU and RAM, the PC's free RAM and Anti-AFK's timing. Reschedules itself only
+        while the page is seen."""
+        self.sample_job = None
+        if not self.shown or self.app.root.state() in ("iconic", "withdrawn"):
+            return   # app.on_restore starts it again
+        pids = {t.pid for t in self.tiles.values()}
+        usage = {pid: process_usage(pid) for pid in pids}
+        cpu = self.cpu.percent({pid: u[0] for pid, u in usage.items() if u and u[0] is not None})
+        rams = [u[1] if u else None for u in usage.values()]
+        self.values["cpu"].config(text="…" if cpu is None and pids else f"{cpu or 0:.0f}%")
+        self.values["ram"].config(text="—" if None in rams else f"{sum(rams) / 2 ** 30:.1f} GB")
+        free, total = memory_status()
+        self.values["free"].config(text=f"{free / 2 ** 30:.1f} of {total / 2 ** 30:.0f} GB")
+        self.ram_used = 1 - free / total if total else None
+        self.draw_ram_bar()
+        app = self.app
+        last, nxt = app.afk_last_ping_at, app.afk_next_at
+        self.values["afk_last"].config(text=time.strftime("%H:%M", time.localtime(last)) if last else "—")
+        self.values["afk_next"].config(text=time.strftime("~%H:%M", time.localtime(nxt))
+                                       if app.anti_afk_var.get() and nxt else "off" if not app.anti_afk_var.get() else "—")
+        self.sample_job = self.after(1000 if cpu is None and pids else self.SAMPLE_MS, self.sample)
+
+    # ------------------------------------------------------------ tiles
+    def on_show(self):
+        self.shown = True
+        self.sync(roblox_windows())
+        self.resume()
+
+    def on_hide(self):
+        self.shown = False
+        self.release()
+        if self.sample_job:
+            self.after_cancel(self.sample_job)
+            self.sample_job = None
+
+    def resume(self):
+        """(Re)starts sampling, e.g. when AltVault comes back from the tray."""
+        if self.shown and not self.sample_job:
+            self.cpu.last.clear()
+            self.sample()
+
+    def release(self):
+        for thumb in self.thumbs.values():
+            unregister_thumbnail(thumb)
+        self.thumbs.clear()
+        self.placed.clear()
+
+    def sync(self, windows):
+        """Adds and removes tiles to match the open Roblox windows, and updates each one's header."""
+        if not self.shown:
+            return
+        alive = {hwnd: pid for hwnd, pid, _ in windows}
+        changed = set(alive) != set(self.tiles)
+        for hwnd in set(self.tiles) - set(alive):
+            if hwnd in self.thumbs:
+                unregister_thumbnail(self.thumbs.pop(hwnd))
+            self.placed.pop(hwnd, None)
+            self.tiles.pop(hwnd).destroy()
+        order = {a["id"]: i for i, a in enumerate(self.app.accounts)}
+        for hwnd, pid, title in sorted(windows, key=lambda w: order.get(self.app.running.get(w[1]), len(order))):
+            tile = self.tiles.get(hwnd)
+            if tile is None:
+                tile = self.tiles[hwnd] = LiveTile(self, hwnd, pid)
+            tile.update_state(*self.app.live_state(hwnd, pid, title))
+        if changed:
+            self.layout()
+        else:
+            self.place_thumbs()
+        self.update_headline()
+        self.update_toolbar()
+        self.update_hatch()
+
+    def layout(self):
+        if not self.shown:
+            return
+        if not self.tiles:
+            self.empty.place(relx=0.5, rely=0.45, anchor="center")
+            return
+        self.empty.place_forget()
+        width, height = self.area.winfo_width(), self.area.winfo_height()
+        if width < 50 or height < 50:
+            return
+        s = self.app.scale
+        sizes = [client_size(h) for h in self.tiles]
+        shapes = [w / h for w, h in sizes if w > 0 and h > 0]
+        aspect = min(max(sum(shapes) / len(shapes), 0.6), 2.5) if shapes else 16 / 10
+        gap = int(self.GAP * s)
+        cols, rows, tile_w, tile_h = live_grid(len(self.tiles), width, height, LiveTile.header_px(s), gap, aspect)
+        tiles = list(self.tiles.values())
+        for i, tile in enumerate(tiles):
+            row, col = divmod(i, cols)
+            in_row = min(cols, len(tiles) - row * cols)   # a short last row is centred
+            x0 = (width - in_row * tile_w - (in_row - 1) * gap) // 2
+            y0 = (height - rows * tile_h - (rows - 1) * gap) // 2
+            tile.place(x=x0 + col * (tile_w + gap), y=max(y0, 0) + row * (tile_h + gap), width=tile_w, height=tile_h)
+        self.after_idle(self.place_thumbs)
+
+    def place_thumbs(self):
+        """Puts each window's thumbnail over its tile's body, keeping the window's shape. Minimised
+        and frozen windows get a note instead (DWM has no fresh picture of them)."""
+        if not self.shown or not self.winfo_ismapped():
+            return
+        self.update_idletasks()
+        dest = _user32.GetParent(self.app.root.winfo_id())
+        ox, oy = client_origin(dest)
+        for hwnd, tile in self.tiles.items():
+            note = "Minimised: click to restore" if _user32.IsIconic(hwnd) else None
+            if note or not tile.winfo_ismapped():
+                if hwnd in self.thumbs:
+                    unregister_thumbnail(self.thumbs.pop(hwnd))
+                    self.placed.pop(hwnd, None)
+                tile.set_note(note)
+                continue
+            if hwnd not in self.thumbs:
+                thumb = register_thumbnail(dest, hwnd)
+                if not thumb:
+                    tile.set_note("No preview")
+                    continue
+                self.thumbs[hwnd] = thumb
+            tile.set_note(None)
+            b = tile.body
+            rect = fit_rect(*client_size(hwnd), b.winfo_rootx() - ox, b.winfo_rooty() - oy,
+                            b.winfo_width(), b.winfo_height())
+            if self.placed.get(hwnd) != rect:
+                place_thumbnail(self.thumbs[hwnd], rect)
+                self.placed[hwnd] = rect
+
+    def show_window(self, hwnd):
+        focus_window(hwnd)
+
+    def close_window(self, hwnd):
+        tile = self.tiles.get(hwnd)
+        if tile and messagebox.askyesno("Close Roblox", f"Close {tile.label.cget('text')}'s Roblox window?",
+                                        parent=self.app.root):
+            kill_process(tile.pid)
+
+
+class LiveTile(tk.Frame):
+    """One Roblox window on the Live page: a header (status, name, show, close) over the body that
+    its thumbnail is drawn on. Clicking anywhere on the tile brings that window to the front."""
+
+    COLORS = {"green": C["green"], "yellow": C["yellow"], "red": C["red"]}
+
+    @staticmethod
+    def header_px(scale):
+        return int(28 * scale)
+
+    def __init__(self, page, hwnd, pid):
+        super().__init__(page.area, bg=C["panel"], cursor="hand2")
+        self.hwnd, self.pid, self.color = hwnd, pid, None
+        s = page.app.scale
+        head = tk.Frame(self, bg=C["panel"], height=self.header_px(s))
+        head.pack(fill="x")
+        head.pack_propagate(False)
+        icons = page.app.icon_font
+        for glyph, action in (("", page.close_window), ("", page.show_window)):
+            btn = tk.Label(head, text=glyph, font=(icons, 9), bg=C["panel"], fg=C["muted"], padx=int(6 * s))
+            btn.pack(side="right", fill="y")
+            btn.bind("<Enter>", lambda _e, b=btn: b.config(fg=C["fg"], bg=C["sel"]))
+            btn.bind("<Leave>", lambda _e, b=btn: b.config(fg=C["muted"], bg=C["panel"]))
+            btn.bind("<Button-1>", lambda _e, a=action: a(hwnd) or "break")
+        self.dot = tk.Label(head, text="●", font=("Segoe UI", 9), bg=C["panel"], fg=C["muted"])
+        self.dot.pack(side="left", padx=(int(8 * s), 0))
+        self.label = tk.Label(head, text="", font=("Segoe UI Semibold", 9), bg=C["panel"], fg=C["fg"], anchor="w")
+        self.label.pack(side="left", fill="x", expand=True, padx=(int(4 * s), 0))
+        self.body = tk.Frame(self, bg="#111214")
+        self.body.pack(fill="both", expand=True, padx=int(3 * s), pady=(0, int(3 * s)))
+        self.note = tk.Label(self.body, text="", bg="#111214", fg=C["muted"], font=FONT)
+        for widget in (self, head, self.dot, self.label, self.body, self.note):
+            widget.bind("<Button-1>", lambda _e: page.show_window(hwnd))
+
+    def update_state(self, color, name):
+        if color != self.color:
+            self.color = color
+            self.dot.config(fg=self.COLORS[color])
+        if self.label.cget("text") != name:
+            self.label.config(text=name)
+
+    def set_note(self, text):
+        if text:
+            self.note.config(text=text)
+            self.note.place(relx=0.5, rely=0.5, anchor="center")
+        else:
+            self.note.place_forget()
 
 
 class ServerBrowser(tk.Toplevel):
@@ -1951,12 +2763,19 @@ class App:
         self.afk_waiting_since = 0.0
         self.afk_waiting_logged = False
         self.afk_on = False           # mirrors the Anti-AFK box for the tray thread, which can't read Tk
+        self.afk_next_at = None       # wall-clock time of the next ping, and of the last one that landed,
+        self.afk_last_ping_at = None  # for the Live page
         self.tray = None              # set by main(); without it, closing the window quits
+        self.taskbar_busy = False     # a worker is moving Roblox windows on or off the taskbar
+        self.tick_job = None
 
         apply_theme(root, self.scale)
         root.title(APP_TITLE)
-        root.geometry(safe_geometry(self.settings.get("geometry")))
-        root.minsize(int(640 * self.scale), int(440 * self.scale))
+        saved = self.settings.get("geometry")
+        if self.settings.get("layout") != LAYOUT_VERSION:   # windows sized for the old layout start fresh
+            saved, self.settings["layout"] = None, LAYOUT_VERSION
+        root.geometry(fit_to_screen(safe_geometry(saved)))
+        root.minsize(*min_size(self.scale))
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.build()
         dark_title_bar(root)
@@ -1968,27 +2787,114 @@ class App:
         if self.anti_afk_var.get():
             self.toggle_anti_afk(quiet=True)
         threading.Thread(target=self.fetch_missing_avatars, daemon=True).start()
-        self.root.after(500, self.tick)
+        self.tick_job = self.root.after(500, self.tick)
         self.root.after(1000, self.refresh_presence)
         # Nobody sees presence while AltVault is minimised, so it pauses then and catches up on restore.
         self.presence_stale = False
         root.bind("<Map>", self.on_restore)
 
     # ------------------------------------------------------------ layout
-    def build(self):
-        outer = ttk.Frame(self.root, padding=(16, 14, 16, 12))
-        outer.pack(fill="both", expand=True)
+    NAV = (("accounts", "", "Accounts"), ("live", "", "Live"), ("settings", "", "Settings"))
 
-        # Top bar: name and counts, search, settings.
+    def build(self):
+        s = self.scale
+        families = set(tkfont.families(self.root))
+        self.icon_font = next((f for f in ("Segoe Fluent Icons", "Segoe MDL2 Assets") if f in families),
+                              "Segoe UI Symbol")
+        # Options used by more than one page.
+        self.multi_var = tk.BooleanVar(value=self.settings.get("multi", True))
+        self.same_server_var = tk.BooleanVar(value=self.settings.get("same_server", True))
+        self.auto_tile_var = tk.BooleanVar(value=self.settings.get("auto_tile", True))
+        self.anti_afk_var = tk.BooleanVar(value=self.settings.get("anti_afk", False))
+        self.stream_var = tk.BooleanVar(value=self.settings.get("stream_mode", False))
+        self.hide_taskbar_var = tk.BooleanVar(value=self.settings.get("hide_taskbar", False))
+
+        # Sidebar: the app icon, then one item per page; Settings sits at the bottom.
+        rail = tk.Frame(self.root, bg=C["panel"], width=int(72 * s))
+        rail.pack(side="left", fill="y")
+        rail.pack_propagate(False)
+        logo_px = int(30 * s)
+        self.logo = tk.PhotoImage(data=base64.b64encode(_png(logo_px, _render_icon(logo_px))))
+        tk.Label(rail, image=self.logo, bg=C["panel"]).pack(pady=(int(14 * s), int(10 * s)))
+        self.nav = {key: self.nav_item(rail, key, glyph, label) for key, glyph, label in self.NAV}
+
+        main = ttk.Frame(self.root, padding=(16, 14, 16, 12))
+        main.pack(side="left", fill="both", expand=True)
+        # The Anti-AFK switch and the status line, the same on every page.
+        footer = ttk.Frame(main)
+        footer.pack(side="bottom", fill="x", pady=(10, 0))
+        ttk.Checkbutton(footer, text="Anti-AFK", variable=self.anti_afk_var,
+                        command=self.toggle_anti_afk).pack(side="left")
+        self.status = ttk.Label(footer, text="", style="Muted.TLabel")
+        self.status.pack(side="right")
+
+        host = ttk.Frame(main)
+        host.pack(fill="both", expand=True)
+        self.pages = {"accounts": self.build_accounts(host), "live": LivePage(self, host),
+                      "settings": SettingsPage(self, host)}
+        self.page = None
+        self.show_page("accounts")
+        for i, (key, _, _) in enumerate(self.NAV, 1):
+            self.root.bind(f"<Control-Key-{i}>", lambda _e, k=key: self.show_page(k))
+
+    def nav_item(self, rail, key, glyph, label):
+        """A sidebar entry: icon over a short label, with an accent bar while its page is open.
+        Returns the function that repaints it."""
+        s = self.scale
+        bottom = key == "settings"
+        item = tk.Frame(rail, bg=C["panel"], cursor="hand2")
+        item.pack(side="bottom" if bottom else "top", fill="x", padx=int(6 * s),
+                  pady=(int(2 * s), int(12 * s) if bottom else int(2 * s)))
+        bar = tk.Frame(item, bg=C["accent"], width=max(int(3 * s), 2))
+        icon = tk.Label(item, text=glyph, font=(self.icon_font, 15), bg=C["panel"], fg=C["muted"])
+        icon.pack(pady=(int(8 * s), 0))
+        text = tk.Label(item, text=label, font=("Segoe UI", 8), bg=C["panel"], fg=C["muted"])
+        text.pack(pady=(int(1 * s), int(8 * s)))
+        parts = (item, icon, text)
+
+        def paint(hover=False):
+            on = self.page == key
+            bg = C["sel"] if on else NAV_HOVER if hover else C["panel"]
+            for w in parts:
+                w.config(bg=bg)
+            for w in (icon, text):
+                w.config(fg=C["fg"] if on or hover else C["muted"])
+            if on:
+                bar.place(x=0, rely=0.22, relheight=0.56)
+            else:
+                bar.place_forget()
+
+        def leave(_e):   # moving onto the icon or label inside the item isn't leaving it
+            paint(self.root.winfo_containing(*self.root.winfo_pointerxy()) in parts)
+        for w in parts:
+            w.bind("<Button-1>", lambda _e: self.show_page(key))
+            w.bind("<Enter>", lambda _e: paint(True))
+            w.bind("<Leave>", leave)
+        return paint
+
+    def show_page(self, key):
+        if key == self.page:
+            return
+        old = self.pages.get(self.page)
+        if old is not None:
+            getattr(old, "on_hide", lambda: None)()
+            old.pack_forget()
+        self.page = key
+        self.pages[key].pack(fill="both", expand=True)
+        for paint in self.nav.values():
+            paint()
+        getattr(self.pages[key], "on_show", lambda: None)()
+
+    def build_accounts(self, host):
+        outer = ttk.Frame(host)
         header = ttk.Frame(outer)
         header.pack(fill="x")
-        ttk.Label(header, text=APP_TITLE, style="Title.TLabel").pack(side="left")
+        ttk.Label(header, text="Accounts", style="Title.TLabel").pack(side="left")
         self.summary = ttk.Label(header, text="", style="Muted.TLabel")
         self.summary.pack(side="left", padx=(12, 0), pady=(6, 0))
-        ttk.Button(header, text="⚙", width=3, command=lambda: SettingsDialog(self)).pack(side="right")
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *_: self.refresh())
-        ttk.Entry(header, textvariable=self.search_var, width=22).pack(side="right", padx=(0, 8))
+        ttk.Entry(header, textvariable=self.search_var, width=22).pack(side="right")
         ttk.Label(header, text="Search", style="Muted.TLabel").pack(side="right", padx=(0, 6))
 
         # Where to join: the game first; a specific server is optional and secondary.
@@ -2012,18 +2918,6 @@ class App:
         job.pack(side="left", padx=(8, 0))
         add_placeholder(job, self.job_var, "Any server (or paste a Job ID)")
         self.update_recents_box()
-
-        # The Anti-AFK switch and the status line; set-once options live in Settings.
-        footer = ttk.Frame(outer)
-        footer.pack(side="bottom", fill="x", pady=(10, 0))
-        self.multi_var = tk.BooleanVar(value=self.settings.get("multi", True))
-        self.same_server_var = tk.BooleanVar(value=self.settings.get("same_server", True))
-        self.auto_tile_var = tk.BooleanVar(value=self.settings.get("auto_tile", True))
-        self.anti_afk_var = tk.BooleanVar(value=self.settings.get("anti_afk", False))
-        ttk.Checkbutton(footer, text="Anti-AFK", variable=self.anti_afk_var,
-                        command=self.toggle_anti_afk).pack(side="left")
-        self.status = ttk.Label(footer, text="", style="Muted.TLabel")
-        self.status.pack(side="right")
 
         btns = ttk.Frame(outer)
         btns.pack(side="bottom", fill="x", pady=(12, 0))
@@ -2063,6 +2957,7 @@ class App:
         self.tree.bind("<<TreeviewClose>>", lambda _e: self.group_toggled(False))
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self.update_join_label())
         self.tree.bind("<Button-3>", self.show_menu)
+        return outer
 
     def update_join_label(self):
         """The Join button says how many accounts it will launch."""
@@ -2089,6 +2984,26 @@ class App:
     def account(self, account_id):
         return next((a for a in self.accounts if a["id"] == account_id), None)
 
+    def who(self, acc):
+        """How an account is named on screen: '@username', or 'Account 3' in stream mode."""
+        if self.stream_var.get():
+            n = next((i for i, a in enumerate(self.accounts, 1) if a is acc), None)
+            return f"Account {n}" if n else "an account"
+        return "@" + acc["name"]
+
+    def window_title(self, acc):
+        return WINDOW_PREFIX + self.who(acc).lstrip("@")
+
+    def live_state(self, hwnd, pid, title):
+        """(colour, name) for a Live tile: red while the window is frozen, green once its account is
+        in a game, yellow before that (or for a window AltVault didn't launch)."""
+        acc = self.account(self.running.get(pid))
+        name = self.who(acc) if acc else "Roblox" if self.stream_var.get() else title
+        if not responsive(hwnd):
+            return "red", name
+        p = self.presence.get(acc["id"]) if acc else None
+        return ("green" if p and p.get("userPresenceType") == 2 else "yellow"), name
+
     def selected_accounts(self):
         """Selected accounts; selecting a group header selects everyone in it."""
         ids = set()
@@ -2105,6 +3020,7 @@ class App:
             place = self.settings.get("place", "")
         self.settings.update(multi=self.multi_var.get(), same_server=self.same_server_var.get(),
                              auto_tile=self.auto_tile_var.get(), anti_afk=self.anti_afk_var.get(),
+                             stream_mode=self.stream_var.get(), hide_taskbar=self.hide_taskbar_var.get(),
                              place=place)
         save_settings(self.settings)
 
@@ -2152,22 +3068,27 @@ class App:
             parents[group] = self.tree.insert(
                 "", "end", iid=GROUP_PREFIX + group, open=group not in collapsed, tags=("group",),
                 values=(f"{group}", f"{len(members)} account{'s' if len(members) != 1 else ''}", "", ""))
+        stream = self.stream_var.get()   # names and avatars stay off screen
         for acc in self.accounts:
-            haystack = f"{acc['name']} {acc['displayName']} {acc.get('note', '')} {self.group_of(acc) or ''}".lower()
+            names = self.who(acc) if stream else f"{acc['name']} {acc['displayName']}"
+            haystack = f"{names} {acc.get('note', '')} {self.group_of(acc) or ''}".lower()
             if query and query not in haystack:
                 continue
             text, tag = self.status_of(acc)
             self.tree.insert(parents.get(self.group_of(acc), ""), "end", iid=str(acc["id"]),
-                             image=self.avatars.get(acc["id"], self.blank_avatar),
-                             values=(acc["displayName"], "@" + acc["name"], text, acc.get("note", "")),
+                             image=self.blank_avatar if stream else self.avatars.get(acc["id"], self.blank_avatar),
+                             values=(self.who(acc) if stream else acc["displayName"], "" if stream else "@" + acc["name"],
+                                     text, acc.get("note", "")),
                              tags=(tag,) if tag else ())
         for group, iid in parents.items():   # hide groups the search filtered empty
             if query and not self.tree.get_children(iid):
                 self.tree.delete(iid)
         self.tree.selection_set([i for i in selection if self.tree.exists(i)])
-        shown = ("display", "user", "status") + (("note",) if any(a.get("note") for a in self.accounts) else ())
+        shown = ("display",) + (() if stream else ("user",)) + ("status",) + \
+            (("note",) if any(a.get("note") for a in self.accounts) else ())
         if tuple(self.tree["displaycolumns"]) != shown:
             self.tree["displaycolumns"] = shown
+            self.tree.heading("display", text="Account" if stream else "Display name")
         if self.accounts:
             self.empty_hint.place_forget()
         else:
@@ -2203,7 +3124,7 @@ class App:
                 acc.pop("group", None)
         self.save()
         self.refresh()
-        who = f"@{accounts[0]['name']}" if len(accounts) == 1 else f"{len(accounts)} accounts"
+        who = self.who(accounts[0]) if len(accounts) == 1 else f"{len(accounts)} accounts"
         self.status.config(text=f"Moved {who} to {group}." if group else f"Took {who} out of their group.")
 
     def ask_new_group(self, accounts):
@@ -2322,9 +3243,13 @@ class App:
         self.ui(apply)
 
     def on_restore(self, event):
-        if event.widget is self.root and self.presence_stale:
+        if event.widget is not self.root:
+            return
+        if self.presence_stale:
             self.presence_stale = False
             self.refresh_presence(reschedule=False)
+        if self.page == "live":
+            self.pages["live"].resume()
 
     def refresh_presence(self, reschedule=True):
         if reschedule:
@@ -2353,27 +3278,38 @@ class App:
             windows = roblox_windows()
             self.update_window_buttons(len(windows))
             alive = {pid for _, pid, _ in windows}
-            by_name = {a["name"].lower(): a["id"] for a in self.accounts}
+            by_title = {}   # a window is titled with the username, or 'Account n' in stream mode
+            for i, a in enumerate(self.accounts, 1):
+                by_title[(WINDOW_PREFIX + a["name"]).lower()] = by_title[f"{WINDOW_PREFIX}account {i}"] = a["id"]
             before = dict(self.running)
             for hwnd, pid, title in windows:
-                if pid not in self.running and title.startswith(WINDOW_PREFIX):
-                    account_id = by_name.get(title[len(WINDOW_PREFIX):].lower())
+                if pid not in self.running:
+                    account_id = by_title.get(title.lower())
                     if account_id:
                         self.running[pid] = account_id   # window from before AltVault was reopened
                 acc = self.account(self.running.get(pid))
-                if acc and title != WINDOW_PREFIX + acc["name"]:
-                    _user32.SetWindowTextW(hwnd, WINDOW_PREFIX + acc["name"])
+                if acc and title != self.window_title(acc) and responsive(hwnd):
+                    _user32.SetWindowTextW(hwnd, self.window_title(acc))
             self.running = {pid: a for pid, a in self.running.items() if pid in alive}
             if self.running != before:
                 self.refresh()
+            want = not self.hide_taskbar_var.get()
+            self.set_taskbar([hwnd for hwnd, _, _ in windows if on_taskbar(hwnd) != want], want)
+            if self.page == "live" and self.root.state() not in ("iconic", "withdrawn"):
+                self.pages["live"].sync(windows)
         except Exception:
             log.exception("Window check failed")
-        self.root.after(TICK_INTERVAL, self.tick)
+        self.tick_job = self.root.after(TICK_INTERVAL, self.tick)
 
     # ------------------------------------------------------------ account actions
     def add_many(self, items):
-        """Saves several checked accounts at once: [(user, {'cookie', 'group', 'note'})]."""
+        """Saves several checked accounts at once: [(user, {'cookie', 'group', 'note'})]. Entries
+        from an AltVault export also carry 'fps_cap', 'low_graphics', 'muted' and 'afk_skip'; they
+        fill in what isn't set here yet and never undo a setting made on this PC."""
         by_id = {a["id"]: a for a in self.accounts}
+        caps = self.fps_caps()
+        flags = {key: self.flagged(key) for key in ("low_graphics", "muted")}
+        flags["afk_skip"] = self.afk_skip_ids()
         for user, entry in items:
             acc = by_id.get(user["id"])
             if acc is None:
@@ -2385,7 +3321,16 @@ class App:
                 acc["note"] = entry["note"]
             if entry.get("group") and not self.group_of(acc):
                 acc["group"] = entry["group"]
+            if entry.get("fps_cap") and str(user["id"]) not in caps:
+                caps[str(user["id"])] = entry["fps_cap"]
+            for key, ids in flags.items():
+                if entry.get(key):
+                    ids.add(user["id"])
             self.expired.discard(user["id"])
+        if any(set(e) & {"fps_cap", *flags} for _, e in items):
+            self.settings["fps_caps"] = caps
+            self.settings.update({key: sorted(ids) for key, ids in flags.items()})
+            save_settings(self.settings)
         if items:
             self.save()
             self.refresh()
@@ -2405,7 +3350,7 @@ class App:
         self.expired.discard(user["id"])
         self.save()
         self.refresh()
-        self.status.config(text=f"Saved @{user['name']}.")
+        self.status.config(text=f"Saved {self.who(self.account(user['id']))}.")
         threading.Thread(target=self.fetch_missing_avatars, daemon=True).start()
         self.refresh_presence(reschedule=False)
 
@@ -2413,7 +3358,7 @@ class App:
         sel = self.selected_accounts()
         if not sel:
             return
-        names = ", ".join("@" + a["name"] for a in sel)
+        names = ", ".join(self.who(a) for a in sel)
         if not messagebox.askyesno("Remove", f"Remove {names} from AltVault?\n\n"
                                    "This only deletes the saved login here, not the Roblox account.",
                                    parent=self.root):
@@ -2423,7 +3368,7 @@ class App:
         self.refresh()
 
     def edit_note(self, acc):
-        note = simpledialog.askstring("Edit note", f"Note for @{acc['name']}:",
+        note = simpledialog.askstring("Edit note", f"Note for {self.who(acc)}:",
                                       initialvalue=acc.get("note", ""), parent=self.root)
         if note is not None:
             acc["note"] = note.strip()
@@ -2523,7 +3468,7 @@ class App:
         self.settings["fps_caps"] = caps
         save_settings(self.settings)
         self.refresh()
-        who = f"@{accounts[0]['name']}" if len(accounts) == 1 else f"{len(accounts)} accounts"
+        who = self.who(accounts[0]) if len(accounts) == 1 else f"{len(accounts)} accounts"
         self.status.config(text=f"{who}: {f'{cap} FPS cap' if cap else 'no FPS cap'}, from their next join.")
 
     def ask_fps_cap(self, accounts):
@@ -2567,7 +3512,7 @@ class App:
         self.settings[key] = sorted(ids)
         save_settings(self.settings)
         self.refresh()
-        who = f"@{accounts[0]['name']}" if len(accounts) == 1 else f"{len(accounts)} accounts"
+        who = self.who(accounts[0]) if len(accounts) == 1 else f"{len(accounts)} accounts"
         self.status.config(text=f"{who}: {label} {'on' if on else 'off'}, from their next join.")
 
     def client_overrides(self, acc):
@@ -2692,6 +3637,117 @@ class App:
         self.root.clipboard_append(text)
         self.status.config(text=f"Copied {text}.")
 
+    # ------------------------------------------------------------ privacy
+    def toggle_stream(self):
+        on = self.stream_var.get()
+        self.save_settings()
+        self.refresh()
+        self.tick_now()
+        self.status.config(text="Stream mode is on: names and avatars are hidden." if on else "Stream mode is off.")
+
+    def toggle_taskbar(self):
+        hide = self.hide_taskbar_var.get()
+        self.save_settings()
+        self.tick_now()
+        self.status.config(text="Roblox windows are off the taskbar. Open them from the Live page." if hide
+                           else "Roblox windows are back on the taskbar.")
+
+    def tick_now(self):
+        """Applies window titles and taskbar changes straight away instead of at the next tick."""
+        if self.tick_job:
+            self.root.after_cancel(self.tick_job)
+        self.tick()
+
+    def set_taskbar(self, hwnds, shown):
+        """Moves windows on or off the taskbar on a worker thread, since each change waits on Roblox.
+        Anything left over (a window that was frozen, say) is picked up by the next tick."""
+        if self.taskbar_busy or not hwnds:
+            return
+        self.taskbar_busy = True
+
+        def work():
+            try:
+                for hwnd in hwnds:
+                    set_on_taskbar(hwnd, shown)
+            finally:
+                self.taskbar_busy = False
+        threading.Thread(target=work, daemon=True).start()
+
+    # ------------------------------------------------------------ export / import
+    def export_payload(self):
+        caps, skip = self.fps_caps(), self.afk_skip_ids()
+        low, muted = self.flagged("low_graphics"), self.flagged("muted")
+        accounts = [{"id": a["id"], "name": a["name"], "displayName": a["displayName"], "cookie": a["cookie"],
+                     "note": a.get("note", ""), "group": self.group_of(a), "fps_cap": caps.get(str(a["id"])),
+                     "low_graphics": a["id"] in low, "muted": a["id"] in muted, "afk_skip": a["id"] in skip}
+                    for a in self.accounts]
+        return {"app": APP_TITLE, "version": APP_VERSION, "accounts": accounts, "favorites": self.favorites()}
+
+    def export_accounts(self):
+        n = len(self.accounts)
+        if not n:
+            messagebox.showinfo("Export accounts", "There are no accounts to export yet.", parent=self.root)
+            return
+        path = filedialog.asksaveasfilename(parent=self.root, title="Export accounts", defaultextension=EXPORT_EXT,
+                                            initialfile="AltVault accounts" + EXPORT_EXT,
+                                            filetypes=[("AltVault export", "*" + EXPORT_EXT)])
+        if not path:
+            return
+        who = f"all {n} accounts" if n > 1 else "the account"
+        password = PasswordDialog(self, "Export accounts", "Choose a password for the file. Anyone with the file "
+                                  f"and its password can log into {who}, so keep both private. A forgotten "
+                                  "password can't be recovered.", confirm=True).password
+        if not password:
+            return
+        try:
+            data = seal_export(self.export_payload(), password)
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
+        except OSError as e:
+            log.warning("Export failed: %s", e)
+            messagebox.showerror("Export accounts", f"Couldn't save the file:\n{e}", parent=self.root)
+            return
+        log.info("Exported %d accounts", n)
+        self.status.config(text=f"Exported {n} account{'s' if n != 1 else ''} to {os.path.basename(path)}.")
+
+    def import_accounts(self):
+        path = filedialog.askopenfilename(parent=self.root, title="Import accounts",
+                                          filetypes=[("AltVault export", "*" + EXPORT_EXT)])
+        if not path:
+            return
+        try:
+            if os.path.getsize(path) > MAX_EXPORT_BYTES:
+                raise OSError("The file is too big to be an AltVault export.")
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            messagebox.showerror("Import accounts", f"Couldn't read the file:\n{e}", parent=self.root)
+            return
+        payload = PasswordDialog(self, "Import accounts", "Type the password this file was exported with.",
+                                 check=lambda pw: open_export(data, pw)).result
+        if payload is None:
+            return
+        self.status.config(text="Checking imported accounts...")
+
+        def report(text):
+            messagebox.showinfo("Import accounts", text, parent=self.root)
+        threading.Thread(target=check_and_add, args=(self, export_entries(payload), report, payload.get("favorites")),
+                         daemon=True).start()
+
+    def merge_favorites(self, items):
+        favs = self.favorites()
+        known = {f["id"] for f in favs}
+        for item in items if isinstance(items, list) else []:
+            place = str(item.get("id", "")) if isinstance(item, dict) else ""
+            if re.fullmatch(r"\d{1,20}", place) and place not in known:
+                favs.append({"id": place, "name": str(item.get("name") or f"Place {place}")[:100]})
+                known.add(place)
+        self.settings["favorites"] = favs
+        save_settings(self.settings)
+        self.update_recents_box()
+
     # ------------------------------------------------------------ Roblox window actions
     def tile(self):
         order = {a["id"]: i for i, a in enumerate(self.accounts)}
@@ -2750,6 +3806,7 @@ class App:
         if self.afk_job:
             self.root.after_cancel(self.afk_job)
         self.afk_job = self.root.after(int(seconds * 1000), self.afk_due)
+        self.afk_next_at = time.time() + seconds
 
     def afk_skip_ids(self):
         ids = self.settings.get("afk_skip")
@@ -2765,7 +3822,7 @@ class App:
         self.settings["afk_skip"] = sorted(skip)
         save_settings(self.settings)
         self.refresh()
-        who = f"@{accounts[0]['name']}" if len(accounts) == 1 else f"{len(accounts)} accounts"
+        who = self.who(accounts[0]) if len(accounts) == 1 else f"{len(accounts)} accounts"
         self.status.config(text=f"Anti-AFK {'off' if skip_them else 'on'} for {who}.")
 
     def afk_due(self):
@@ -2861,7 +3918,7 @@ class App:
         pid = wt.DWORD()
         _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         acc = self.account(self.running.get(pid.value))
-        return "@" + acc["name"] if acc else f"window {hwnd}"
+        return self.who(acc) if acc else f"window {hwnd}"
 
     def afk_finished(self, pinged, minimised, missed, reasons=None, blocker=None, pass_id=None, oldest=None):
         if pass_id is not None and pass_id != self.afk_pass_id:
@@ -2873,6 +3930,8 @@ class App:
         for h in pinged:
             self.afk_last[h] = now
             self.afk_misses.pop(h, None)
+        if pinged:
+            self.afk_last_ping_at = time.time()
         for h in missed:
             self.afk_misses[h] = self.afk_misses.get(h, 0) + 1
         parts = [f"pinged {len(pinged)}"]
@@ -2957,7 +4016,7 @@ class App:
         expired = [a for a in sel if a["id"] in self.expired]
         if expired:
             messagebox.showerror("Join", "These accounts need to log in again first (right-click > Log in again):\n" +
-                                 "\n".join("@" + a["name"] for a in expired), parent=self.root)
+                                 "\n".join(self.who(a) for a in expired), parent=self.root)
             return
         if len(sel) > 1 and not self.multi_var.get():
             if not messagebox.askyesno("Join", "Multi-Roblox is off, so each launch will close the "
@@ -3006,7 +4065,7 @@ class App:
                     return
             for i, acc in enumerate(accounts):
                 last = i == len(accounts) - 1
-                self.set_status(f"Launching @{acc['name']} ({i + 1}/{len(accounts)})...")
+                self.set_status(f"Launching {self.who(acc)} ({i + 1}/{len(accounts)})...")
                 before = {pid for _, pid, _ in roblox_windows()}
                 if fps_file:
                     try:
@@ -3019,15 +4078,15 @@ class App:
                     launch(acc["cookie"], place_id, job_id, link_code)
                 except CookieExpired:
                     self.expired.add(acc["id"])
-                    problems.append(f"@{acc['name']}: login expired — right-click > Log in again.")
+                    problems.append(f"{self.who(acc)}: login expired — right-click > Log in again.")
                     continue
                 except (RobloxError, OSError) as e:
                     log.warning("Launch of %s failed: %s", acc["name"], e)
-                    problems.append(f"@{acc['name']}: {e}")
+                    problems.append(f"{self.who(acc)}: {e}")
                     continue
                 pid = self.wait_for_new_window(before)
                 if pid is None:
-                    problems.append(f"@{acc['name']}: Roblox didn't open a window within {WINDOW_TIMEOUT}s.")
+                    problems.append(f"{self.who(acc)}: Roblox didn't open a window within {WINDOW_TIMEOUT}s.")
                     continue
                 self.ui(self.running.__setitem__, pid, acc["id"])
                 time.sleep(3)
@@ -3043,10 +4102,10 @@ class App:
                     threading.Thread(target=self.remember_place, args=(acc["cookie"], place_id),
                                      daemon=True).start()
                 if same_server and not job_id and not link_code and not last:
-                    self.set_status(f"Waiting for @{acc['name']} to reach a server...")
+                    self.set_status(f"Waiting for {self.who(acc)} to reach a server...")
                     job_id = self.wait_for_server(acc, place_id) or ""
                     if not job_id:
-                        problems.append(f"Couldn't see which server @{acc['name']} joined, so the other "
+                        problems.append(f"Couldn't see which server {self.who(acc)} joined, so the other "
                                         "accounts went to random servers. (Their 'Joins' privacy "
                                         "setting may hide it.)")
                         same_server = False
@@ -3130,6 +4189,9 @@ class App:
         if self.root.state() != "withdrawn":
             self.settings["geometry"] = self.root.geometry()
         self.save_settings()
+        for hwnd, _, _ in roblox_windows():   # never leave Roblox windows without a taskbar button
+            if not on_taskbar(hwnd):
+                set_on_taskbar(hwnd, True)
         if self.tray:
             self.tray.remove()
         self.root.destroy()

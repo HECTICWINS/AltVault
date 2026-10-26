@@ -43,6 +43,10 @@ A secure, lightweight Roblox account manager for Windows. Download, unzip, doubl
 - **Auto-tile:** arrange any number of Roblox windows in an even grid.
 - **Live status:** see who's online or in game, with avatars.
 - **Anti-AFK:** stops Roblox's 20-minute idle kick for every open client, while you keep using your PC.
+- **Live view:** every Roblox window as a live tile, with who's in a game, Roblox's CPU and RAM, and an egg hatch calculator.
+- **Stream mode:** hides usernames and avatars, in AltVault and in Roblox's window titles, for screen sharing.
+- **Hide from taskbar:** keeps a dozen Roblox windows out of the taskbar and Alt+Tab.
+- **Export and import:** move your accounts to another PC in a password-protected file.
 
 ## Install
 
@@ -73,7 +77,7 @@ Get-FileHash .\AltVault-*-win64.zip
 If you have the [GitHub CLI](https://cli.github.com), you can also confirm GitHub built the file from this repository:
 
 ```powershell
-gh attestation verify .\AltVault-2.6.0-win64.zip --repo HECTICWINS/AltVault
+gh attestation verify .\AltVault-2.7.0-win64.zip --repo HECTICWINS/AltVault
 ```
 
 The download includes its own copy of Python, so one or two lesser-known engines may flag it; that's a common false positive for Python apps.
@@ -97,11 +101,22 @@ Double-clicking `altvault.py` only works if `.py` files open with Python on your
 
 ## Finding your way around
 
-- **Top:** search, and **⚙ Settings** for things you set once (Multi-Roblox, same server, window arranging, the Anti-AFK key).
+- **Sidebar:** **Accounts**, **Live** and **Settings** (also Ctrl+1, Ctrl+2, Ctrl+3).
+- **Accounts page, top:** search the list.
 - **Game box:** what to join. **★** pins a game; **Servers...** shows its servers. The **Server** box under it is optional.
 - **Account list:** select accounts (Ctrl+click, Shift+click, Ctrl+A, or click a group's header). The **Join** button shows how many will launch.
 - **Right-click** an account or group: **Join**, **Performance** (FPS cap, lowest graphics, mute, Anti-AFK), **Group**, **Account** (note, profile, log in again), and **Remove**.
-- **Bottom:** the **Anti-AFK** switch and what AltVault last did.
+- **Bottom (every page):** the **Anti-AFK** switch and what AltVault last did.
+- **Live page:** a tile for every Roblox window. Click one to bring that window to the front; its **✕** closes it. The dot shows its state: green in a game, yellow still loading, red not responding. On the right: how many windows are in a game, Roblox's CPU and RAM use, your PC's free RAM, Anti-AFK's last and next ping, and the **egg hatch** calculator. Type one alt's speed (eggs per minute, eggs per hour or seconds per egg) and it multiplies it by the accounts in a game. Previews are drawn by Windows itself (like taskbar previews), only while the page is open, so they cost nothing the rest of the time.
+- **Settings page:** things you set once: Multi-Roblox, same server, window arranging, the Anti-AFK key, **Stream mode**, **Hide Roblox from the taskbar**, and **Export / Import**.
+
+## Moving your accounts to another PC
+
+Updates keep your accounts by themselves: they live in `%LOCALAPPDATA%\AltVault`, not next to the app, so replacing the app folder with a new version changes nothing.
+
+That data only opens for your Windows user on this PC. To move accounts elsewhere, open **Settings > Export...**, pick a file and a password (8 characters or more). On the other PC, **Settings > Import...** and type the password. Groups, notes, FPS caps, graphics and mute settings, Anti-AFK choices and favourite games come along; every login is checked with Roblox first.
+
+The file is encrypted with AES-256-GCM using a key made from your password with scrypt, so it can't be read or changed without the password. Still, anyone with the file **and** the password can log into those accounts: keep both private, and delete the file once you've imported it.
 
 ## Adding an account
 
@@ -201,7 +216,7 @@ The key is only pressed once a Roblox window is confirmed to be in focus, so it 
 
 - To exclude accounts, select them, right-click and untick **Performance** > **Anti-AFK**.
 - Don't minimise Roblox windows; Windows can't send them input. Leave them behind other windows instead.
-- To change the key it presses, open **⚙ Settings** and pick a letter, Space or F13.
+- To change the key it presses, open **Settings** and pick a letter, Space or F13.
 
 ## Security and privacy
 

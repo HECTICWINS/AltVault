@@ -2,6 +2,17 @@
 
 Every release on the [Releases](../../releases) page is built by GitHub from the tagged commit, comes with a build attestation, and is scanned by VirusTotal. See [Verify your download](README.md#verify-your-download).
 
+## 2.7.0
+
+- **New look with a sidebar:** **Accounts**, **Live** and **Settings** pages, a bigger window, and the Anti-AFK switch on every page.
+- **Live page:** every Roblox window as a live tile with a status dot (in a game, loading, not responding). Click a tile to bring that window forward, or close it from its header. Tiles fill the space, no scrolling. Windows draws the previews itself, and only while the page is open.
+- **Stats panel:** how many windows are in a game, Roblox's CPU and RAM, your PC's free RAM, and Anti-AFK's last and next ping. Sampled every 3 seconds, and only while you're looking.
+- **Egg hatch calculator:** type one alt's speed in eggs/min, eggs/hour or seconds per egg and see the total per minute, hour and day for every account in a game.
+- **Stream mode:** hides usernames and avatars in AltVault and in Roblox's window titles.
+- **Hide Roblox from the taskbar:** also keeps them out of Alt+Tab. The taskbar buttons come back when you turn it off or quit.
+- **Export and import accounts** as a password-protected `.altvault` file (scrypt + AES-256-GCM), with groups, notes and per-account settings.
+- Settings is now a page instead of a separate window.
+
 ## 2.6.0
 
 - **Cleaner layout.** The game comes first, with the server box as a clearly optional second line. The **Join** button says how many accounts it will launch, and the footer holds only the Anti-AFK switch and status.
