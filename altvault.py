@@ -32,7 +32,7 @@ import zlib
 from tkinter import messagebox, simpledialog, ttk
 
 APP_TITLE = "AltVault"
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 APP_DIR = os.path.join(os.environ["LOCALAPPDATA"], "AltVault")
 DATA_FILE = os.path.join(APP_DIR, "accounts.dat")
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
@@ -62,6 +62,7 @@ AFK_SLOW_AFTER = 5
 AFK_SETTLE = 0.35                # after focusing: Roblox runs slowly while hidden, let it catch up
 AFK_HOLD = 0.2                   # key hold; a short tap can fall between a slowed client's frames
 AFK_STUCK = 90                   # seconds after which a still-running pass is treated as stuck
+AFK_ALERT_AFTER = 4              # misses in a row (about 2 minutes) before a tray alert
 AFK_KEYS = {"space": 0x20, "f13": 0x7C, **{c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"}}
 
 log = logging.getLogger("altvault")
@@ -345,6 +346,40 @@ def force_foreground(hwnd):
     return _user32.GetForegroundWindow() == hwnd
 
 
+_user32.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+_user32.OpenInputDesktop.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+_user32.OpenInputDesktop.restype = wt.HANDLE
+_user32.CloseDesktop.argtypes = [wt.HANDLE]
+DESKTOP_SWITCHDESKTOP = 0x0100
+
+# Things that commonly sit in front and block Anti-AFK, named in plain words for the log and alert.
+KNOWN_BLOCKERS = {"credential dialog xaml host": "a Windows permission (UAC) prompt",
+                  "lockapp.exe": "the lock screen", "logonui.exe": "the sign-in screen"}
+
+
+def describe_foreground():
+    """What's in front, for the log and the tray alert: the program's file name and window class.
+    Window titles are left out because they can hold private text (a browser tab, an email)."""
+    desktop = _user32.OpenInputDesktop(0, False, DESKTOP_SWITCHDESKTOP)
+    if not desktop:   # the input desktop isn't ours: locked, signing in, or a secure UAC prompt
+        return "the lock screen or a Windows security prompt"
+    _user32.CloseDesktop(desktop)
+    hwnd = _user32.GetForegroundWindow()
+    if not hwnd:
+        return "no window (nothing has focus)"
+    pid = wt.DWORD()
+    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    name = _process_name(pid.value)
+    cls = ctypes.create_unicode_buffer(128)
+    _user32.GetClassNameW(hwnd, cls, len(cls))
+    for key, words in KNOWN_BLOCKERS.items():
+        if key in (name, cls.value.lower()):
+            return f"{words} ({name or cls.value})"
+    if not name:
+        return f"a program running as administrator (window class {cls.value})"
+    return f"{name} (window class {cls.value})"
+
+
 def tap_key(vk, hold=AFK_HOLD):
     scan = _user32.MapVirtualKeyW(vk, 0)
     _user32.keybd_event(vk, scan, 0, 0)
@@ -398,11 +433,13 @@ def anti_afk_pass(hwnds, vk):
     doing. So any Roblox window that's covered is first moved off-screen, pinged there, and put
     back in its old place and stacking order afterwards; it is never seen. A window that's fully
     visible already is pinged where it is, since raising it changes nothing on screen.
-    Returns (pinged, minimised, missed) lists of hwnds and {hwnd: why it was missed}."""
+    Returns (pinged, minimised, missed) lists of hwnds, {hwnd: why it was missed}, and what was in
+    front when a window refused focus (None if none did)."""
     _step("starting")
     prev = _user32.GetForegroundWindow()
     pinged, minimised, missed, moved = [], [], [], []
     reasons = {}
+    blocker = None
     off_x, off_y = _offscreen_origin()
     stacking = []   # every top-level window, front to back, as it was before the pass
     _user32.EnumWindows(WNDENUMPROC(lambda h, _l: stacking.append(h) or True), 0)
@@ -431,6 +468,8 @@ def anti_afk_pass(hwnds, vk):
             _step("focusing a Roblox window")
             if not force_foreground(hwnd):
                 reasons[hwnd] = "wouldn't take focus"
+                if blocker is None:
+                    blocker = describe_foreground()
             else:
                 time.sleep(AFK_SETTLE)
                 if _user32.GetForegroundWindow() == hwnd:
@@ -453,7 +492,7 @@ def anti_afk_pass(hwnds, vk):
                 flags = SWP_NOZORDER
             _move_async(hwnd, x, y, above or None, flags)
         _step("idle")
-    return pinged, minimised, missed, reasons
+    return pinged, minimised, missed, reasons, blocker
 
 
 def tile_windows(hwnds):
@@ -586,6 +625,7 @@ WM_TRAY_SHOW = 0x8002   # WM_APP + 2: a second launch asking this AltVault to sh
 HWND_MESSAGE = -3
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO = 0x1, 0x2, 0x4, 0x10
+NIIF_WARNING = 0x2
 WM_DESTROY, WM_CLOSE, WM_LBUTTONUP, WM_RBUTTONUP = 0x0002, 0x0010, 0x0202, 0x0205
 TPM_RETURNCMD, TPM_RIGHTBUTTON = 0x0100, 0x0002
 MF_STRING, MF_SEPARATOR, MF_CHECKED = 0x0, 0x800, 0x8
@@ -736,9 +776,10 @@ class TrayIcon:
         if action:
             self._tk(action)
 
-    def notify(self, title, text):
+    def notify(self, title, text, warning=False):
         nid = self._data(NIF_INFO)
         nid.szInfoTitle, nid.szInfo = title[:63], text[:255]
+        nid.dwInfoFlags = NIIF_WARNING if warning else 0
         _shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
 
     def remove(self):
@@ -1529,6 +1570,7 @@ class App:
         self.afk_wait_started = None  # when a due ping started waiting for the user to pause
         self.afk_last = {}            # hwnd -> monotonic time of its last successful ping
         self.afk_misses = {}          # hwnd -> passes in a row that couldn't ping it
+        self.afk_alerted = False      # a "blocked" tray alert is showing for the current stuck spell
         self.afk_busy_since = 0.0     # when the running pass started (watchdog)
         self.afk_pass_id = 0          # identifies the current pass, so a late stuck one is ignored
         self.afk_waiting_for = None   # why a due ping is being held back, for the log
@@ -2016,6 +2058,7 @@ class App:
         self.afk_wait_started = None
         self.afk_last.clear()   # unknown how long they've been idle, so every window is due now
         self.afk_misses.clear()
+        self.afk_alerted = False
         self.afk_on = self.anti_afk_var.get()
         log.info("Anti-AFK %s", "on" if self.afk_on else "off")
         if self.anti_afk_var.get():
@@ -2113,7 +2156,7 @@ class App:
                 result = anti_afk_pass(hwnds, vk)
             except Exception:
                 log.exception("Anti-AFK pass failed")
-                result = ([], [], list(targets), {h: "pass failed" for h in targets})
+                result = ([], [], list(targets), {h: "pass failed" for h in targets}, None)
             self.ui(self.afk_finished, *result, pass_id, oldest)
 
         threading.Thread(target=work, daemon=True).start()
@@ -2141,7 +2184,7 @@ class App:
         acc = self.account(self.running.get(pid.value))
         return "@" + acc["name"] if acc else f"window {hwnd}"
 
-    def afk_finished(self, pinged, minimised, missed, reasons=None, pass_id=None, oldest=None):
+    def afk_finished(self, pinged, minimised, missed, reasons=None, blocker=None, pass_id=None, oldest=None):
         if pass_id is not None and pass_id != self.afk_pass_id:
             log.info("Anti-AFK: a ping that had got stuck finished late (pinged %d)", len(pinged))
             return   # a newer pass has taken over; its result is the one that counts
@@ -2160,7 +2203,10 @@ class App:
             parts.append(f"{len(missed)} missed, retrying")
         details = "; ".join(f"{self.afk_window_name(h)} {(reasons or {}).get(h, 'missed')}"
                             f" ({self.afk_misses[h]}x)" for h in missed)
+        if blocker:
+            details += f"; in front: {blocker}"
         gap = f", longest gap {oldest / 60:.1f} min" if oldest not in (None, math.inf) else ""
+        self.afk_alert(missed, blocker, oldest)
         if not self.anti_afk_var.get():
             log.info("Anti-AFK: %s%s%s", ", ".join(parts), gap, f" [{details}]" if details else "")
             return
@@ -2170,6 +2216,25 @@ class App:
         log.info("Anti-AFK: %s%s; next ping ~%s%s", ", ".join(parts), gap, nxt,
                  f" [{details}]" if details else "")
         self.status.config(text=f"Anti-AFK {time.strftime('%H:%M')}: " + ", ".join(parts) + f" · next ~{nxt}")
+
+    def afk_alert(self, missed, blocker, oldest):
+        """One tray alert per stuck spell: once a window has missed AFK_ALERT_AFTER pings in a row,
+        say which accounts and what's in the way. A second message says when it's working again."""
+        stuck = [h for h in missed if self.afk_misses.get(h, 0) >= AFK_ALERT_AFTER]
+        if stuck and not self.afk_alerted:
+            self.afk_alerted = True
+            names = ", ".join(self.afk_window_name(h) for h in stuck)
+            minutes = "" if oldest in (None, math.inf) else \
+                f" They'll be idle-kicked in about {max(0, round(20 - oldest / 60))} min."
+            text = f"Can't reach {names}. In front: {blocker or 'unknown'}.{minutes}"
+            log.warning("Anti-AFK blocked: %s", text)
+            if self.tray:
+                self.tray.notify("Anti-AFK is blocked", text, warning=True)
+        elif not self.afk_misses and self.afk_alerted:
+            self.afk_alerted = False
+            log.info("Anti-AFK: working again")
+            if self.tray:
+                self.tray.notify("Anti-AFK is working again", "Every Roblox window was pinged.")
 
     def ensure_multi(self):
         """Makes Multi-Roblox active before a join. Returns False if the user cancelled."""

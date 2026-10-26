@@ -495,7 +495,7 @@ class TestAntiAfkTiming(unittest.TestCase):
                     worst[h] = max(worst[h], clock[0] - last[h])
                     last[h] = clock[0]
             clock[0] += 0.7 * len(hwnds)
-            return pinged, [], missed, reasons
+            return pinged, [], missed, reasons, ("lockapp.exe" if missed else None)
 
         timer = [None]
         fake = types.SimpleNamespace(
@@ -503,10 +503,10 @@ class TestAntiAfkTiming(unittest.TestCase):
                                        after_cancel=lambda job: timer.__setitem__(0, None)),
             anti_afk_var=types.SimpleNamespace(get=lambda: True), settings={}, running={}, joining=False,
             afk_busy=False, afk_busy_since=0, afk_pass_id=0, afk_wait_started=None, afk_waiting_for=None,
-            afk_waiting_since=0, afk_waiting_logged=False, afk_last={}, afk_misses={}, afk_job=None,
+            afk_waiting_since=0, afk_waiting_logged=False, afk_last={}, afk_misses={}, afk_job=None, afk_alerted=False, tray=None,
             status=types.SimpleNamespace(config=lambda **k: None), account=lambda i: None)
         for name in ("schedule_afk", "afk_skip_ids", "afk_due", "_afk_due", "_afk_waiting",
-                     "afk_finished", "afk_next_delay", "afk_window_name"):
+                     "afk_finished", "afk_next_delay", "afk_window_name", "afk_alert"):
             setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
         fake.ui = lambda fn, *a: fn(*a)
 
@@ -518,7 +518,7 @@ class TestAntiAfkTiming(unittest.TestCase):
                 mock.patch.object(av, "anti_afk_pass", fake_pass), \
                 mock.patch.object(av.random, "uniform", rnd.uniform), \
                 mock.patch.object(av.threading, "Thread", lambda target, daemon: types.SimpleNamespace(start=target)), \
-                mock.patch.object(av.log, "info"):
+                mock.patch.object(av.log, "info"), mock.patch.object(av.log, "warning"):
             fake.schedule_afk(3)
             end, swapped = hours * 3600, False
             while clock[0] < end:
@@ -545,6 +545,82 @@ class TestAntiAfkTiming(unittest.TestCase):
     def test_calm_conditions_ping_on_schedule(self):
         worst = self.simulate(1, flaky=0, busy_user=0)
         self.assertLess(max(worst.values()) / 60, 9.5)
+
+
+class TestAntiAfkBlocked(unittest.TestCase):
+    """What's in front when Anti-AFK can't switch windows, and the tray alert about it."""
+
+    def describe(self, desktop=1, name="chrome.exe", cls="Chrome_WidgetWin_1", hwnd=42):
+        def class_name(h, buf, n):
+            buf.value = cls
+            return len(cls)
+        with mock.patch.object(av._user32, "OpenInputDesktop", lambda *a: desktop), \
+                mock.patch.object(av._user32, "CloseDesktop", lambda h: 1), \
+                mock.patch.object(av._user32, "GetForegroundWindow", lambda: hwnd), \
+                mock.patch.object(av._user32, "GetWindowThreadProcessId", lambda h, p: 1), \
+                mock.patch.object(av._user32, "GetClassNameW", class_name), \
+                mock.patch.object(av, "_process_name", lambda pid: name):
+            return av.describe_foreground()
+
+    def test_blockers_are_named_in_plain_words(self):
+        self.assertIn("lock screen", self.describe(desktop=0))
+        self.assertIn("lock screen", self.describe(name="lockapp.exe", cls="Windows.UI.Core.CoreWindow"))
+        self.assertIn("UAC", self.describe(name="consent.exe", cls="Credential Dialog Xaml Host"))
+        self.assertIn("administrator", self.describe(name=""))
+        self.assertEqual(self.describe(), "chrome.exe (window class Chrome_WidgetWin_1)")
+        self.assertIn("nothing has focus", self.describe(hwnd=0))
+
+    def test_real_foreground_is_described_without_its_title(self):
+        text = av.describe_foreground()
+        self.assertTrue(text)
+        hwnd = av._user32.GetForegroundWindow()
+        if hwnd:
+            n = av._user32.GetWindowTextLengthW(hwnd)
+            buf = av.ctypes.create_unicode_buffer(n + 1)
+            av._user32.GetWindowTextW(hwnd, buf, n + 1)
+            if len(buf.value) > 3 and buf.value not in ("Program Manager",):
+                self.assertNotIn(buf.value, text, "window titles can be private and must not be logged")
+
+    def make_app(self):
+        notes = []
+        fake = types.SimpleNamespace(afk_misses={}, afk_alerted=False,
+                                     tray=types.SimpleNamespace(notify=lambda t, x, warning=False: notes.append((t, x, warning))),
+                                     afk_window_name=lambda h: f"@alt{h}")
+        fake.afk_alert = types.MethodType(av.App.afk_alert, fake)
+        return fake, notes
+
+    def test_one_alert_per_stuck_spell_then_a_recovery_note(self):
+        app, notes = self.make_app()
+        with mock.patch.object(av.log, "warning"), mock.patch.object(av.log, "info"):
+            for miss in range(1, av.AFK_ALERT_AFTER):          # early misses: no alert yet
+                app.afk_misses = {1: miss, 2: miss}
+                app.afk_alert([1, 2], "the lock screen", 300)
+            self.assertEqual(notes, [])
+            for miss in range(av.AFK_ALERT_AFTER, av.AFK_ALERT_AFTER + 5):   # stuck: exactly one alert
+                app.afk_misses = {1: miss, 2: miss}
+                app.afk_alert([1, 2], "the lock screen", 600)
+            self.assertEqual(len(notes), 1)
+            title, text, warning = notes[0]
+            self.assertTrue(warning)
+            self.assertIn("@alt1, @alt2", text)
+            self.assertIn("the lock screen", text)
+            self.assertIn("about 10 min", text)
+            app.afk_misses = {}                                  # pings get through again
+            app.afk_alert([], None, 600)
+            self.assertEqual(notes[-1][0], "Anti-AFK is working again")
+            app.afk_alert([], None, 600)
+            self.assertEqual(len(notes), 2, "the recovery note is shown once")
+            app.afk_misses = {1: av.AFK_ALERT_AFTER}             # a new stuck spell alerts again
+            app.afk_alert([1], "consent.exe", 400)
+            self.assertEqual(len(notes), 3)
+
+    def test_works_without_a_tray_icon(self):
+        app, _ = self.make_app()
+        app.tray = None
+        app.afk_misses = {1: av.AFK_ALERT_AFTER}
+        with mock.patch.object(av.log, "warning") as warned:
+            app.afk_alert([1], None, None)
+        warned.assert_called_once()
 
 
 class TestRepoHygiene(unittest.TestCase):

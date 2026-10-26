@@ -2,6 +2,11 @@
 
 Every release on the [Releases](../../releases) page is built by GitHub from the tagged commit, comes with a build attestation, and is scanned by VirusTotal. See [Verify your download](README.md#verify-your-download).
 
+## 2.4.0
+
+- **Anti-AFK tells you when it's blocked.** If it can't reach the Roblox windows for about 2 minutes, a tray alert names the accounts, what's in front (the lock screen, a UAC prompt, an administrator app such as an installer) and roughly how long until they'd be idle-kicked. A second alert says when it's working again.
+- The log now records what was in front whenever a window refused focus. Only the program's file name is recorded, never window titles.
+
 ## 2.3.0
 
 - **FPS caps per account:** right-click one or more accounts > **FPS cap** and pick 15, 20, 30, 45 or 60 FPS, or any custom number from 5 to 240. The cap applies from the account's next join, and the status column shows it.

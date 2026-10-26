@@ -68,7 +68,7 @@ Get-FileHash .\AltVault-*-win64.zip
 If you have the [GitHub CLI](https://cli.github.com), you can also confirm GitHub built the file from this repository:
 
 ```powershell
-gh attestation verify .\AltVault-2.3.0-win64.zip --repo HECTICWINS/AltVault
+gh attestation verify .\AltVault-2.4.0-win64.zip --repo HECTICWINS/AltVault
 ```
 
 The download includes its own copy of Python, so one or two lesser-known engines may flag it; that's a common false positive for Python apps.
@@ -147,6 +147,12 @@ Tick **Anti-AFK** in the footer. Every 6–9 minutes AltVault:
 Each window is tracked on its own. If one can't be pinged (for example while it's teleporting), only that window is retried, every 30 seconds.
 If a window reaches 15 minutes without a ping, it's pinged straight away instead of waiting for you to pause, so no client gets near Roblox's 20-minute limit.
 Every pass is written to `%LOCALAPPDATA%\AltVault\altvault.log`, and any missed window is listed by account with the reason.
+
+If something keeps Anti-AFK from reaching the Roblox windows for about 2 minutes, AltVault shows a **tray alert**.
+It says which accounts are affected, what's in the way and roughly how long until they'd be idle-kicked.
+Usual causes are the lock screen, a Windows permission (UAC) prompt, or an app running as administrator that's in front, such as an installer or updater.
+Once pings get through again, a second alert says Anti-AFK is working again.
+Only the blocking program's file name is recorded, never window titles, which can contain private text.
 
 Roblox ignores input sent to background windows, so a brief focus switch is the only reliable method.
 Any Roblox window hidden behind your other apps is moved off-screen for that moment and put back exactly where it was, so you never see it flash.
