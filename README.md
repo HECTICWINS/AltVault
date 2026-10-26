@@ -38,6 +38,19 @@ You don't need Python or anything else installed.
 2. Unzip it anywhere, such as your Documents folder.
 3. Double-click **AltVault.exe**.
 
+### Verify your download
+
+Every release is scanned automatically by [VirusTotal](https://www.virustotal.com), which checks it with about 70 antivirus engines.
+The release notes link to the full results for that exact file and list its SHA-256 hash.
+To confirm your download is the file that was scanned, run this in PowerShell and compare the hash:
+
+```powershell
+Get-FileHash .\AltVault-2.1.1-win64.zip
+```
+
+The download includes its own copy of Python, so one or two lesser-known engines may flag it; that's a common false positive for Python apps.
+You can always read `altvault.py` yourself, or run it directly with your own Python instead of the download.
+
 `AltVault.exe` is the official, digitally signed Python runtime from python.org, renamed.
 That's why Windows Smart App Control and SmartScreen let it run without warnings, unlike unsigned `.exe` builds.
 It's also why the file itself shows the Python icon: changing it would break the signature.
@@ -64,7 +77,12 @@ Log in again only if Roblox ends that session, for example after a password chan
 The login window uses a brand-new, empty browser profile, so your normal browser, its logins and its history aren't touched.
 AltVault reads only the Roblox login from that window, over a connection that exists only on your PC and only while the window is open.
 
-Prefer not to use a browser window? Choose **Paste a cookie instead** and paste the account's `.ROBLOSECURITY` value.
+Prefer not to use a browser window? Choose **Paste a cookie instead**. To get the account's cookie:
+
+1. Open a private window (Ctrl+Shift+N in Chrome or Edge) and log into the account on roblox.com.
+2. Press **F12**, open the **Application** tab (in Firefox, **Storage**), then **Cookies** > `https://www.roblox.com`.
+3. Click `.ROBLOSECURITY`, copy its whole **Value**, and paste it into AltVault.
+4. Close the private window. Don't click **Log Out**, because that makes the cookie stop working.
 
 > **A Roblox login cookie is equivalent to your password.** Only give it to software you trust and have read.
 > AltVault is a single readable file so that you can check exactly what it does with it.

@@ -1,0 +1,63 @@
+name: VirusTotal scan
+
+# When a release is published, every .zip attached to it is uploaded to VirusTotal, and a table with
+# each file's SHA-256 and a link to its scan results is added to the release notes.
+# Needs a VT_API_KEY repository secret (the API key of a free virustotal.com account).
+# To scan an existing release again: Actions > VirusTotal scan > Run workflow.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to scan, e.g. v2.1.1
+        required: true
+
+permissions:
+  contents: write   # to download the release files and edit the release notes
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Scan release files and add the results to the notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VT_API_KEY: ${{ secrets.VT_API_KEY }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "$VT_API_KEY" ]; then
+            echo "::error::Add a VT_API_KEY secret under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          vt() { curl -sSf --retry 3 --header "x-apikey: $VT_API_KEY" "$@"; }
+
+          mkdir assets && cd assets
+          gh release download "$TAG" --repo "$REPO" --pattern '*.zip'
+
+          section=$'\n\n## Verify your download\n\n'
+          section+=$'Check the file you downloaded matches: in PowerShell, run `Get-FileHash <file>` and compare the hash below.\n\n'
+          section+=$'| File | SHA-256 | VirusTotal |\n|---|---|---|\n'
+          for f in *.zip; do
+            sha=$(sha256sum "$f" | cut -d' ' -f1)
+            echo "Uploading $f ($sha)"
+            id=$(vt --form "file=@$f" https://www.virustotal.com/api/v3/files | jq -r .data.id)
+            # The free API allows 4 requests a minute, so check every 20 seconds.
+            for _ in $(seq 60); do
+              result=$(vt "https://www.virustotal.com/api/v3/analyses/$id")
+              [ "$(jq -r .data.attributes.status <<<"$result")" = completed ] && break
+              sleep 20
+            done
+            summary=$(jq -r '.data.attributes.stats |
+              "\(.malicious + .suspicious) of \(.malicious + .suspicious + .undetected + .harmless) engines flagged it"' <<<"$result")
+            echo "$f: $summary"
+            section+="| \`$f\` | \`$sha\` | [$summary](https://www.virustotal.com/gui/file/$sha) |"$'\n'
+          done
+
+          body=$(gh release view "$TAG" --repo "$REPO" --json body -q .body)
+          body="${body%%$'\n\n## Verify your download'*}"   # a re-run replaces the earlier table
+          gh release edit "$TAG" --repo "$REPO" --notes "$body$section"
