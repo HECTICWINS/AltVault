@@ -32,7 +32,7 @@ import zlib
 from tkinter import messagebox, simpledialog, ttk
 
 APP_TITLE = "AltVault"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 APP_DIR = os.path.join(os.environ["LOCALAPPDATA"], "AltVault")
 DATA_FILE = os.path.join(APP_DIR, "accounts.dat")
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
@@ -48,13 +48,19 @@ SERVER_TIMEOUT = 45              # seconds to wait for the first account to reac
 PRESENCE_INTERVAL = 30_000       # ms between online/in-game status refreshes
 TICK_INTERVAL = 1_500            # ms between Roblox window checks
 MAX_RECENTS = 12
-# Anti-AFK: Roblox kicks after 20 idle minutes. Worst case between pings is the longest interval
-# + waiting for the user to pause + retries = 11 + 5 + 1.5 min, still under 20.
-AFK_INTERVAL = (480, 660)        # seconds between pings, randomised so it isn't a fixed rhythm
+# Anti-AFK: Roblox kicks after 20 idle minutes, and many games rejoin "idle" players into another
+# server shortly before that. Every window's own last ping is tracked, and a window that reaches
+# AFK_URGENT is pinged without waiting for the user to pause, so none can go past ~15 minutes.
+AFK_INTERVAL = (360, 540)        # seconds between pings, randomised so it isn't a fixed rhythm
 AFK_IDLE = 2                     # seconds of no mouse/keyboard use before stealing focus
 AFK_MAX_WAIT = 300               # if the user never pauses that long, ping anyway
-AFK_RETRY = 30                   # seconds before retrying windows that refused focus
-AFK_MAX_RETRIES = 3
+AFK_URGENT = 900                 # a window this long without a ping is pinged right away
+AFK_MIN_GAP = 240                # a pass leaves out windows pinged more recently than this
+AFK_RETRY = 30                   # seconds before retrying windows that couldn't be pinged
+AFK_RETRY_SLOW = 60              # retry delay once a window has missed AFK_SLOW_AFTER times in a row
+AFK_SLOW_AFTER = 5
+AFK_SETTLE = 0.35                # after focusing: Roblox runs slowly while hidden, let it catch up
+AFK_HOLD = 0.2                   # key hold; a short tap can fall between a slowed client's frames
 AFK_STUCK = 90                   # seconds after which a still-running pass is treated as stuck
 AFK_KEYS = {"space": 0x20, "f13": 0x7C, **{c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"}}
 
@@ -339,10 +345,10 @@ def force_foreground(hwnd):
     return _user32.GetForegroundWindow() == hwnd
 
 
-def tap_key(vk):
+def tap_key(vk, hold=AFK_HOLD):
     scan = _user32.MapVirtualKeyW(vk, 0)
     _user32.keybd_event(vk, scan, 0, 0)
-    time.sleep(0.06)
+    time.sleep(hold)
     _user32.keybd_event(vk, scan, KEYEVENTF_KEYUP, 0)
 
 
@@ -392,10 +398,11 @@ def anti_afk_pass(hwnds, vk):
     doing. So any Roblox window that's covered is first moved off-screen, pinged there, and put
     back in its old place and stacking order afterwards; it is never seen. A window that's fully
     visible already is pinged where it is, since raising it changes nothing on screen.
-    Returns (pinged, minimised, missed) lists of hwnds."""
+    Returns (pinged, minimised, missed) lists of hwnds and {hwnd: why it was missed}."""
     _step("starting")
     prev = _user32.GetForegroundWindow()
     pinged, minimised, missed, moved = [], [], [], []
+    reasons = {}
     off_x, off_y = _offscreen_origin()
     stacking = []   # every top-level window, front to back, as it was before the pass
     _user32.EnumWindows(WNDENUMPROC(lambda h, _l: stacking.append(h) or True), 0)
@@ -409,6 +416,7 @@ def anti_afk_pass(hwnds, vk):
                 continue
             if not responsive(hwnd):     # frozen (e.g. mid-teleport): retry it shortly instead
                 missed.append(hwnd)
+                reasons[hwnd] = "not responding"
                 continue
             if hwnd != prev and not fully_visible(hwnd):
                 _step("moving a covered window off-screen")
@@ -418,15 +426,19 @@ def anti_afk_pass(hwnds, vk):
                 moved.append((hwnd, r.left, r.top, above))
                 if not _move_async(hwnd, off_x, off_y, flags=SWP_NOZORDER):
                     missed.append(hwnd)   # didn't move in time; focusing it now would flash it
+                    reasons[hwnd] = "didn't move off-screen in time"
                     continue
             _step("focusing a Roblox window")
-            if force_foreground(hwnd):
-                time.sleep(0.1)
+            if not force_foreground(hwnd):
+                reasons[hwnd] = "wouldn't take focus"
+            else:
+                time.sleep(AFK_SETTLE)
                 if _user32.GetForegroundWindow() == hwnd:
                     _step("pressing the key")
                     tap_key(vk)
                     pinged.append(hwnd)
                     continue
+                reasons[hwnd] = "lost focus before the key press"
             missed.append(hwnd)
     finally:   # whatever happens above, never leave the user without focus or a window off-screen
         _step("restoring focus")
@@ -441,7 +453,7 @@ def anti_afk_pass(hwnds, vk):
                 flags = SWP_NOZORDER
             _move_async(hwnd, x, y, above or None, flags)
         _step("idle")
-    return pinged, minimised, missed
+    return pinged, minimised, missed, reasons
 
 
 def tile_windows(hwnds):
@@ -1424,8 +1436,8 @@ class App:
         self.afk_job = None           # pending after() id for the next anti-AFK ping
         self.afk_busy = False
         self.afk_wait_started = None  # when a due ping started waiting for the user to pause
-        self.afk_retry_hwnds = None   # windows to retry after a pass that couldn't focus them
-        self.afk_retries = 0
+        self.afk_last = {}            # hwnd -> monotonic time of its last successful ping
+        self.afk_misses = {}          # hwnd -> passes in a row that couldn't ping it
         self.afk_busy_since = 0.0     # when the running pass started (watchdog)
         self.afk_pass_id = 0          # identifies the current pass, so a late stuck one is ignored
         self.afk_waiting_for = None   # why a due ping is being held back, for the log
@@ -1829,13 +1841,15 @@ class App:
         if self.afk_job:
             self.root.after_cancel(self.afk_job)
             self.afk_job = None
-        self.afk_wait_started, self.afk_retry_hwnds, self.afk_retries = None, None, 0
+        self.afk_wait_started = None
+        self.afk_last.clear()   # unknown how long they've been idle, so every window is due now
+        self.afk_misses.clear()
         self.afk_on = self.anti_afk_var.get()
         log.info("Anti-AFK %s", "on" if self.afk_on else "off")
         if self.anti_afk_var.get():
             self.schedule_afk(3)
             if not quiet:
-                self.status.config(text="Anti-AFK is on — open Roblox windows get a jump every ~10 min.")
+                self.status.config(text="Anti-AFK is on — open Roblox windows get a jump every 6–9 min.")
         else:
             self.status.config(text="Anti-AFK is off.")
         self.save_settings()
@@ -1890,24 +1904,33 @@ class App:
             self._afk_waiting("a join to finish")
             self.schedule_afk(5)
             return
+        skip = self.afk_skip_ids()
+        windows = [hwnd for hwnd, pid, _ in roblox_windows() if self.running.get(pid) not in skip]
+        for gone in (set(self.afk_last) | set(self.afk_misses)) - set(windows):
+            self.afk_last.pop(gone, None)
+            self.afk_misses.pop(gone, None)
+        ages = {h: now - self.afk_last[h] if h in self.afk_last else math.inf for h in windows}
+        # A window never pinged (just opened, or Anti-AFK just turned on) counts as due. Windows
+        # pinged a moment ago are left out, so a retry for one window doesn't disturb the rest.
+        targets = [h for h in windows if not _user32.IsIconic(h) and (ages[h] >= AFK_MIN_GAP or h in self.afk_misses)]
+        if not targets:
+            if not windows:
+                log.info("Anti-AFK: no Roblox windows to ping; checking again in a few minutes")
+            self.afk_wait_started = None
+            self.schedule_afk(self.afk_next_delay(now))
+            return
+        oldest = max(ages[h] for h in targets)
         if self.afk_wait_started is None:
             self.afk_wait_started = now
-        if idle_seconds() < AFK_IDLE and now - self.afk_wait_started < AFK_MAX_WAIT:
+        if (oldest < AFK_URGENT and idle_seconds() < AFK_IDLE
+                and now - self.afk_wait_started < AFK_MAX_WAIT):
+            self._afk_waiting("you to pause using the mouse/keyboard")
             self.schedule_afk(1)
             return
         self.afk_wait_started = None
         self.afk_waiting_for = None
 
-        skip = self.afk_skip_ids()
-        hwnds = [hwnd for hwnd, pid, _ in roblox_windows() if self.running.get(pid) not in skip]
-        if self.afk_retry_hwnds is not None:
-            hwnds = [h for h in hwnds if h in self.afk_retry_hwnds]
-        if not hwnds:
-            if self.afk_retry_hwnds is None:
-                log.info("Anti-AFK: no Roblox windows to ping; checking again in ~10 min")
-            self.afk_retry_hwnds, self.afk_retries = None, 0
-            self.schedule_afk(random.uniform(*AFK_INTERVAL))
-            return
+        hwnds = targets + [h for h in windows if _user32.IsIconic(h)]   # minimised ones are only reported
         vk = AFK_KEYS.get(str(self.settings.get("afk_key", "space")).lower(), AFK_KEYS["space"])
         self.afk_busy, self.afk_busy_since = True, now
         self.afk_pass_id += 1
@@ -1918,8 +1941,8 @@ class App:
                 result = anti_afk_pass(hwnds, vk)
             except Exception:
                 log.exception("Anti-AFK pass failed")
-                result = ([], [], [])
-            self.ui(self.afk_finished, *result, pass_id)
+                result = ([], [], list(targets), {h: "pass failed" for h in targets})
+            self.ui(self.afk_finished, *result, pass_id, oldest)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1931,30 +1954,49 @@ class App:
             log.info("Anti-AFK: ping waiting for %s", reason)
             self.afk_waiting_logged = True
 
-    def afk_finished(self, pinged, minimised, missed, pass_id=None):
+    def afk_next_delay(self, now):
+        """Seconds until the next pass: soon if a window needs a retry, else when the window that
+        has gone longest without a ping reaches a fresh random interval."""
+        if self.afk_misses:
+            return AFK_RETRY_SLOW if max(self.afk_misses.values()) >= AFK_SLOW_AFTER else AFK_RETRY
+        if not self.afk_last:
+            return random.uniform(*AFK_INTERVAL)
+        return max(5, min(self.afk_last.values()) + random.uniform(*AFK_INTERVAL) - now)
+
+    def afk_window_name(self, hwnd):
+        pid = wt.DWORD()
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        acc = self.account(self.running.get(pid.value))
+        return "@" + acc["name"] if acc else f"window {hwnd}"
+
+    def afk_finished(self, pinged, minimised, missed, reasons=None, pass_id=None, oldest=None):
         if pass_id is not None and pass_id != self.afk_pass_id:
             log.info("Anti-AFK: a ping that had got stuck finished late (pinged %d)", len(pinged))
             return   # a newer pass has taken over; its result is the one that counts
         self.afk_busy = False
         self.afk_waiting_logged = False
+        now = time.monotonic()
+        for h in pinged:
+            self.afk_last[h] = now
+            self.afk_misses.pop(h, None)
+        for h in missed:
+            self.afk_misses[h] = self.afk_misses.get(h, 0) + 1
         parts = [f"pinged {len(pinged)}"]
         if minimised:
             parts.append(f"{len(minimised)} minimised (restore to keep them safe)")
         if missed:
-            parts.append(f"{len(missed)} busy, retrying")
+            parts.append(f"{len(missed)} missed, retrying")
+        details = "; ".join(f"{self.afk_window_name(h)} {(reasons or {}).get(h, 'missed')}"
+                            f" ({self.afk_misses[h]}x)" for h in missed)
+        gap = f", longest gap {oldest / 60:.1f} min" if oldest not in (None, math.inf) else ""
         if not self.anti_afk_var.get():
-            log.info("Anti-AFK: %s", ", ".join(parts))
+            log.info("Anti-AFK: %s%s%s", ", ".join(parts), gap, f" [{details}]" if details else "")
             return
-        if missed and self.afk_retries < AFK_MAX_RETRIES:
-            self.afk_retries += 1
-            self.afk_retry_hwnds = set(missed)
-            delay = AFK_RETRY
-        else:
-            self.afk_retry_hwnds, self.afk_retries = None, 0
-            delay = random.uniform(*AFK_INTERVAL)
+        delay = self.afk_next_delay(now)
         self.schedule_afk(delay)
         nxt = time.strftime("%H:%M", time.localtime(time.time() + delay))
-        log.info("Anti-AFK: %s; next ping ~%s", ", ".join(parts), nxt)
+        log.info("Anti-AFK: %s%s; next ping ~%s%s", ", ".join(parts), gap, nxt,
+                 f" [{details}]" if details else "")
         self.status.config(text=f"Anti-AFK {time.strftime('%H:%M')}: " + ", ".join(parts) + f" · next ~{nxt}")
 
     def ensure_multi(self):

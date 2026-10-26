@@ -71,11 +71,15 @@ Prefer not to use a browser window? Choose **Paste a cookie instead** and paste 
 
 ## Anti-AFK
 
-Tick **Anti-AFK** in the footer. Every 8–11 minutes AltVault:
+Tick **Anti-AFK** in the footer. Every 6–9 minutes AltVault:
 
 1. waits until you've stopped using your mouse and keyboard for 2 seconds,
-2. gives each Roblox window focus for a split second and presses Space (a jump),
+2. gives each Roblox window focus for a split second and holds Space (a jump),
 3. returns focus to the app you were using.
+
+Each window is tracked on its own. If one can't be pinged (for example while it's teleporting), only that window is retried, every 30 seconds.
+If a window reaches 15 minutes without a ping, it's pinged straight away instead of waiting for you to pause, so no client gets near Roblox's 20-minute limit.
+Every pass is written to `%LOCALAPPDATA%\AltVault\altvault.log`, and any missed window is listed by account with the reason.
 
 Roblox ignores input sent to background windows, so a brief focus switch is the only reliable method.
 Any Roblox window hidden behind your other apps is moved off-screen for that moment and put back exactly where it was, so you never see it flash.
