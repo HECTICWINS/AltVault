@@ -30,7 +30,7 @@ import urllib.request
 import uuid
 import webbrowser
 import zlib
-from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
+from tkinter import filedialog, font as tkfont, ttk
 
 APP_TITLE = "AltVault"
 APP_VERSION = "2.7.0"
@@ -852,7 +852,7 @@ def safe_geometry(saved):
 # Drawn in code (a vault door on an indigo tile) so the app stays one readable file. Shapes are
 # signed-distance fields, which give smooth edges at every size without supersampling.
 ICON_SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
-ICON_VERSION = 1
+ICON_VERSION = 2
 
 
 def _png(size, rgba, height=None):
@@ -880,7 +880,7 @@ def _sd_trapezoid(x, y, r1, r2, he):
 
 def _render_icon(size):
     small = size <= 24   # thicker strokes and a bigger keyhole so it still reads at 16px
-    top, bottom = (0x6F, 0x7B, 0xFF), (0x3C, 0x45, 0xB8)
+    top, bottom = (0x93, 0x6B, 0xFF), (0x4A, 0x27, 0xA6)
     px = 1 / size        # one pixel in unit coordinates, for anti-aliasing
     ring_r, ring_w = (0.31, 0.085) if small else (0.31, 0.055)
     k = 1.25 if small else 1.0   # keyhole scale
@@ -1879,11 +1879,17 @@ def parse_job_id(text):
 
 # ---------------------------------------------------------------- UI theme
 
-C = {"bg": "#1e1f22", "panel": "#2b2d31", "field": "#383a40", "sel": "#404249",
-     "fg": "#e3e5e8", "muted": "#949ba4", "accent": "#5865f2", "accent_hover": "#4752c4",
-     "green": "#23a55a", "red": "#f23f43", "yellow": "#f0b232", "accent_text": "#8c95ff"}
+# "Purple night": near-blacks with a faint violet tint, and a dark violet accent used sparingly
+# (the selected page, main buttons, ticks, focus rims, chart lines).
+C = {"bg": "#17161b", "panel": "#211f27", "field": "#2b2832", "sel": "#393443", "hover": "#312d39",
+     "fg": "#ebe8f0", "muted": "#9c96a8", "dim": "#6c6678", "deep": "#0e0d11",
+     "accent": "#7446e0", "accent_hover": "#6438c9", "accent_pressed": "#552fae", "accent_light": "#8a5ff0",
+     "accent_text": "#b49cff", "green": "#23a55a", "red": "#f23f43", "yellow": "#f0b232",
+     "outline": "#5a5466", "thumb": "#4a4555", "check": "#7d7789", "field_hover": "#504a5d",
+     "pressed": "#45404f", "disabled": "#1d1b22", "panel_disabled": "#29262f",
+     "danger": "#da373c", "danger_hover": "#bf2f33", "danger_pressed": "#a3282b"}
 FONT = ("Segoe UI", 10)
-NAV_HOVER = "#35373c"
+NAV_HOVER = C["hover"]
 
 
 def _rgb(color):
@@ -1942,9 +1948,10 @@ def shape_image(w, h, radius, fill=None, border=None, border_w=1.0, box=None, ch
 
 
 # Colours of the drawn widgets, per state.
-BUTTON = {"normal": C["panel"], "active": "#35373c", "pressed": C["sel"], "disabled": "#232428"}
-ACCENT = {"normal": C["accent"], "active": "#4752c4", "pressed": "#3c45a5", "disabled": C["panel"]}
-PANEL_BUTTON = {"normal": C["field"], "active": C["sel"], "pressed": "#4a4c53", "disabled": "#303237"}
+BUTTON = {"normal": C["panel"], "active": C["hover"], "pressed": C["sel"], "disabled": C["disabled"]}
+ACCENT = {"normal": C["accent"], "active": C["accent_hover"], "pressed": C["accent_pressed"], "disabled": C["panel"]}
+DANGER = {"normal": C["danger"], "active": C["danger_hover"], "pressed": C["danger_pressed"], "disabled": C["panel"]}
+PANEL_BUTTON = {"normal": C["field"], "active": C["sel"], "pressed": C["pressed"], "disabled": C["panel_disabled"]}
 
 
 def apply_theme(root, scale):
@@ -1973,20 +1980,21 @@ def apply_theme(root, scale):
                 focuscolor=C["accent"], selectbackground=C["accent"], selectforeground="white",
                 insertcolor=C["fg"], font=FONT)
     for style, name, colors in (("TButton", "AVButton", BUTTON), ("Accent.TButton", "AVAccent", ACCENT),
-                                ("Panel.TButton", "AVPanelButton", PANEL_BUTTON)):
+                                ("Panel.TButton", "AVPanelButton", PANEL_BUTTON), ("Danger.TButton", "AVDanger", DANGER)):
         element = button_element(name, colors)
         s.layout(style, [("Button.background", {"sticky": "nsew", "children": [(element, {"sticky": "nsew", "children": [
             ("Button.padding", {"sticky": "nsew", "children": [("Button.label", {"sticky": "nsew"})]})]})]})])
     s.configure("TButton", padding=(13, 5), borderwidth=0, anchor="center")
-    s.map("TButton", foreground=[("disabled", "#6d6f78")], background=[("active", C["bg"])])
+    s.map("TButton", foreground=[("disabled", C["dim"])], background=[("active", C["bg"])])
     s.configure("Accent.TButton", foreground="white", font=("Segoe UI Semibold", 10))
-    s.map("Accent.TButton", foreground=[("disabled", "#6d6f78")])
+    s.map("Accent.TButton", foreground=[("disabled", C["dim"])])
+    s.configure("Danger.TButton", foreground="white", font=("Segoe UI Semibold", 10))
     s.configure("Panel.TButton", background=C["panel"])
     s.map("Panel.TButton", background=[("active", C["panel"])])
 
     # Text boxes and drop-downs: a rounded field whose rim lights up on hover and on focus.
     field = {"normal": image("field", side, side, r, C["field"]),
-             "hover": image("field-hover", side, side, r, C["field"], "#55575f"),
+             "hover": image("field-hover", side, side, r, C["field"], C["field_hover"]),
              "focus": image("field-focus", side, side, r, C["field"], C["accent"], border_w=max(1.5 * scale, 1.2))}
     s.element_create("AVField.field", "image", field["normal"], ("focus", field["focus"]),
                      ("hover", field["hover"]), border=r + 1, sticky="nsew")
@@ -2017,10 +2025,10 @@ def apply_theme(root, scale):
     br = max(round(4 * scale), 2)
     rim = max(1.4 * scale, 1.1)
     kw = {"box": (0.5, 0.5, box - 1, box - 1)}
-    checks = {"off": image("check-off", box + gap, box, br, None, "#80848e", border_w=rim, **kw),
+    checks = {"off": image("check-off", box + gap, box, br, None, C["check"], border_w=rim, **kw),
               "off-hover": image("check-off-hover", box + gap, box, br, None, C["fg"], border_w=rim, **kw),
               "on": image("check-on", box + gap, box, br, C["accent"], check="#ffffff", check_w=1.8 * scale, **kw),
-              "on-hover": image("check-on-hover", box + gap, box, br, "#6b77ff", check="#ffffff",
+              "on-hover": image("check-on-hover", box + gap, box, br, C["accent_light"], check="#ffffff",
                                 check_w=1.8 * scale, **kw)}
     s.element_create("AVCheck.indicator", "image", checks["off"], ("selected active", checks["on-hover"]),
                      ("selected", checks["on"]), ("active", checks["off-hover"]), sticky="w")
@@ -2034,8 +2042,8 @@ def apply_theme(root, scale):
     tw, th = max(round(10 * scale), 8), max(round(24 * scale), 16)
     inset = max(round(2.5 * scale), 2)
     thumb_box = (inset, inset, tw - 2 * inset, th - 2 * inset)
-    thumb = image("thumb", tw, th, (tw - 2 * inset) / 2, "#4e5058", box=thumb_box)
-    thumb_hover = image("thumb-hover", tw, th, (tw - 2 * inset) / 2, "#6d6f78", box=thumb_box)
+    thumb = image("thumb", tw, th, (tw - 2 * inset) / 2, C["thumb"], box=thumb_box)
+    thumb_hover = image("thumb-hover", tw, th, (tw - 2 * inset) / 2, C["dim"], box=thumb_box)
     s.element_create("AVScroll.thumb", "image", thumb, ("active", thumb_hover), ("pressed", thumb_hover),
                      border=(0, tw // 2 + 1), sticky="nsew")
     s.layout("Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
@@ -2079,8 +2087,134 @@ def add_placeholder(entry, var, text):
     return hint
 
 
+_icon_fonts = {}
+
+
+def icon_font(widget):
+    """Windows' icon font: Segoe Fluent Icons on Windows 11, Segoe MDL2 Assets on Windows 10."""
+    root = widget.winfo_toplevel()
+    if root not in _icon_fonts:
+        families = set(tkfont.families(root))
+        _icon_fonts[root] = next((f for f in ("Segoe Fluent Icons", "Segoe MDL2 Assets") if f in families),
+                                 "Segoe UI Symbol")
+    return _icon_fonts[root]
+
+
+class Dialog(tk.Toplevel):
+    """AltVault's own message box, so no bright Windows dialog flashes over the dark app. Shows an
+    icon, a title, the message, an optional text box and buttons; .result is the chosen button's
+    value (or the typed text), None if closed with Esc or the window's X."""
+
+    KINDS = {"info": ("", "accent_text"), "question": ("", "accent_text"),
+             "warning": ("", "yellow"), "error": ("", "red")}
+
+    def __init__(self, parent, title, message, kind="info", buttons=(("OK", True),), danger=False,
+                 entry=None, validate=None):
+        parent = (parent or tk._default_root).winfo_toplevel()
+        super().__init__(parent, bg=C["bg"])
+        self.withdraw()
+        self.result, self.validate = None, validate
+        scale = parent.winfo_fpixels("1i") / 96
+        self.title(title)
+        self.resizable(False, False)
+        if parent.winfo_viewable():
+            self.transient(parent)
+        frm = ttk.Frame(self, padding=(int(22 * scale), int(20 * scale)))
+        frm.pack(fill="both", expand=True)
+        glyph, color = self.KINDS[kind]
+        tk.Label(frm, text=glyph, font=(icon_font(parent), 20), bg=C["bg"], fg=C[color]).grid(
+            row=0, column=0, rowspan=3, sticky="n", padx=(0, int(16 * scale)), pady=(int(2 * scale), 0))
+        ttk.Label(frm, text=title, font=("Segoe UI Semibold", 12)).grid(row=0, column=1, sticky="w")
+        ttk.Label(frm, text=message, wraplength=int(380 * scale), justify="left").grid(
+            row=1, column=1, sticky="w", pady=(int(4 * scale), 0))
+        self.var = None
+        if entry is not None:
+            self.var = tk.StringVar(value=entry)
+            box = ttk.Entry(frm, textvariable=self.var, width=40)
+            box.grid(row=2, column=1, sticky="ew", pady=(int(12 * scale), 0))
+            box.bind("<Return>", lambda _e: self.choose(True))
+            box.select_range(0, "end")
+        self.error = ttk.Label(frm, text="", style="Error.TLabel")
+        self.error.grid(row=3, column=1, sticky="w", pady=(int(6 * scale), 0))
+        self.error.grid_remove()   # shown only when there's something to say
+        row = ttk.Frame(frm)
+        row.grid(row=4, column=0, columnspan=2, sticky="e", pady=(int(18 * scale), 0))
+        last = len(buttons) - 1
+        for i, (label, value) in enumerate(buttons):   # the last button is the main one
+            style = ("Danger.TButton" if danger else "Accent.TButton") if i == last else "TButton"
+            btn = ttk.Button(row, text=label, style=style, command=lambda v=value: self.choose(v))
+            btn.pack(side="left", padx=(int(8 * scale) if i else 0, 0))
+            if i == last and entry is None:
+                btn.focus_set()
+        self.bind("<Escape>", lambda _e: self.destroy())
+        if entry is None:
+            self.bind("<Return>", lambda _e: self.choose(buttons[last][1]))
+        self.update_idletasks()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        if parent.winfo_viewable():
+            x = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+            y = parent.winfo_rooty() + (parent.winfo_height() - h) // 3
+        else:
+            x, y = (self.winfo_screenwidth() - w) // 2, (self.winfo_screenheight() - h) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.deiconify()
+        dark_title_bar(self)
+        self.lift()
+        self.grab_set()
+        if entry is not None:
+            box.focus_set()
+        self.wait_window()
+
+    def choose(self, value):
+        if self.var is not None and value is True:
+            text = self.var.get()
+            problem = self.validate(text) if self.validate else None
+            if problem:
+                self.error.config(text=problem)
+                self.error.grid()
+                return
+            value = text
+        self.result = value
+        self.destroy()
+
+
+def show_info(title, message, parent=None):
+    Dialog(parent, title, message, "info")
+
+
+def show_warning(title, message, parent=None):
+    Dialog(parent, title, message, "warning")
+
+
+def show_error(title, message, parent=None):
+    Dialog(parent, title, message, "error")
+
+
+def ask_yes_no(title, message, parent=None, yes="Yes", no="Cancel", danger=False):
+    return Dialog(parent, title, message, "warning" if danger else "question",
+                  ((no, False), (yes, True)), danger=danger).result is True
+
+
+def ask_string(title, prompt, parent=None, initialvalue=""):
+    return Dialog(parent, title, prompt, "question", (("Cancel", None), ("OK", True)), entry=initialvalue or "").result
+
+
+def ask_integer(title, prompt, parent=None, minvalue=None, maxvalue=None, initialvalue=None):
+    def check(text):
+        try:
+            n = int(text.strip())
+        except ValueError:
+            return "Type a whole number."
+        if (minvalue is not None and n < minvalue) or (maxvalue is not None and n > maxvalue):
+            return f"Pick a number from {minvalue} to {maxvalue}."
+        return None
+    text = Dialog(parent, title, prompt, "question", (("Cancel", None), ("OK", True)),
+                  entry="" if initialvalue is None else str(initialvalue), validate=check).result
+    return int(text.strip()) if text is not None else None
+
+
 def themed_menu(root):
-    return tk.Menu(root, tearoff=0, bg="#111214", fg=C["fg"], activebackground=C["accent"],
+    return tk.Menu(root, tearoff=0, bg=C["deep"], fg=C["fg"], activebackground=C["accent"],
                    activeforeground="white", bd=0, relief="flat", activeborderwidth=4, font=FONT)
 
 
@@ -2331,11 +2465,13 @@ class SettingsPage(ttk.Frame):
         super().__init__(parent)
         self.app = app
         wrap = int(300 * app.scale)
-        ttk.Label(self, text="Settings", style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
-        left, right = ttk.Frame(self), ttk.Frame(self)
-        left.grid(row=1, column=0, sticky="nwe", padx=(0, int(24 * app.scale)))
-        right.grid(row=1, column=1, sticky="nwe")
-        self.columnconfigure((0, 1), weight=1, uniform="col")
+        page_header(self, "Settings", "Things you set once. Changes are saved straight away.")
+        cols = ttk.Frame(self)
+        cols.pack(fill="both", expand=True, pady=(int(4 * app.scale), 0))
+        left, right = ttk.Frame(cols), ttk.Frame(cols)
+        left.grid(row=0, column=0, sticky="nwe", padx=(0, int(32 * app.scale)))
+        right.grid(row=0, column=1, sticky="nwe")
+        cols.columnconfigure((0, 1), weight=1, uniform="col")
         self.wrapped = []   # labels that rewrap when the page is resized
 
         def section(frm, title, first=False):
@@ -2813,8 +2949,8 @@ class LivePage(ttk.Frame):
 
     def close_window(self, hwnd):
         tile = self.tiles.get(hwnd)
-        if tile and messagebox.askyesno("Close Roblox", f"Close {tile.label.cget('text')}'s Roblox window?",
-                                        parent=self.app.root):
+        if tile and ask_yes_no("Close Roblox", f"Close {tile.label.cget('text')}'s Roblox window?",
+                                     parent=self.app.root, yes="Close", danger=True):
             self.app.close_windows([tile.pid])
 
 
@@ -2842,18 +2978,18 @@ class LiveTile(tk.Frame):
             btn.bind("<Enter>", lambda _e, b=btn: b.config(fg=C["fg"], bg=C["sel"]))
             btn.bind("<Leave>", lambda _e, b=btn: b.config(fg=C["muted"], bg=C["panel"]))
             btn.bind("<Button-1>", lambda _e, a=action: a(hwnd) or "break")
-            btn.bind("<Enter>", lambda _e: self.config(bg="#5c5f66"), add="+")
+            btn.bind("<Enter>", lambda _e: self.config(bg=C["outline"]), add="+")
             btn.bind("<Leave>", self.leave, add="+")
         self.dot = tk.Label(head, text="●", font=("Segoe UI", 9), bg=C["panel"], fg=C["muted"])
         self.dot.pack(side="left", padx=(int(8 * s), 0))
         self.label = tk.Label(head, text="", font=("Segoe UI Semibold", 9), bg=C["panel"], fg=C["fg"], anchor="w")
         self.label.pack(side="left", fill="x", expand=True, padx=(int(4 * s), 0))
-        self.body = tk.Frame(self, bg="#111214")
+        self.body = tk.Frame(self, bg=C["deep"])
         self.body.pack(fill="both", expand=True, padx=int(3 * s), pady=(0, int(3 * s)))
-        self.note = tk.Label(self.body, text="", bg="#111214", fg=C["muted"], font=FONT)
+        self.note = tk.Label(self.body, text="", bg=C["deep"], fg=C["muted"], font=FONT)
         for widget in (self, head, self.dot, self.label, self.body, self.note):
             widget.bind("<Button-1>", lambda _e: page.show_window(hwnd))
-            widget.bind("<Enter>", lambda _e: self.config(bg="#5c5f66"), add="+")
+            widget.bind("<Enter>", lambda _e: self.config(bg=C["outline"]), add="+")
             widget.bind("<Leave>", self.leave, add="+")
 
     def leave(self, _event):
@@ -3102,10 +3238,13 @@ class Chart(tk.Canvas):
             return
         top = self.top()
         small = ("Segoe UI", 8)
+        empty = not any(v for values, _, _ in self.series for v in values)
         for frac in (0, 0.5, 1):
             y = bottom - frac * (bottom - top_y)
-            self.create_line(left, y, right, y, fill="#35373c")
-            self.create_text(left - int(6 * self.scale), y, text=self.fmt(top * frac), anchor="e", fill=C["muted"], font=small)
+            self.create_line(left, y, right, y, fill=C["hover"])
+            if not empty:
+                self.create_text(left - int(6 * self.scale), y, text=self.fmt(top * frac), anchor="e",
+                                 fill=C["muted"], font=small)
         self.create_text(left, bottom + int(4 * self.scale), text=self.labels[0], anchor="nw", fill=C["muted"], font=small)
         self.create_text(right, bottom + int(4 * self.scale), text=self.labels[1], anchor="ne", fill=C["muted"], font=small)
         x = right   # legend, right-aligned above the chart
@@ -3116,12 +3255,16 @@ class Chart(tk.Canvas):
             self.create_oval(x - 2 * dot, int(9 * self.scale) - dot, x, int(9 * self.scale) + dot, fill=color, width=0)
             x -= 2 * dot + int(14 * self.scale)
         n = max((len(v) for v, _, _ in self.series), default=0)
-        if not n:
+        if empty:
+            self.create_text((left + right) / 2, (top_y + bottom) / 2, fill=C["muted"], font=("Segoe UI", 9),
+                             text="No data yet. AltVault fills this in while it runs.")
             return
         y_of = lambda v: bottom - min(v / top, 1) * (bottom - top_y)
         if self.kind == "bars":
-            width = max((right - left) / n * 0.62, 1)
-            for values, color, _ in self.series:   # later series are drawn over earlier ones
+            slot = (right - left) / n
+            for k, (values, color, _) in enumerate(self.series):
+                # Later series sit inside earlier ones (narrower), so a part-of-a-whole stays readable.
+                width = max(slot * (0.66 if k == 0 else 0.4), 1)
                 for i, v in enumerate(values):
                     if v:
                         cx = self.x_of(i, n, left, right)
@@ -3168,7 +3311,7 @@ class Chart(tk.Canvas):
         tx = x + pad * 2 if x + pad * 2 + (x1 - x0) < right else x - pad * 2 - (x1 - x0)
         self.coords(text, tx, top_y + pad)
         x0, y0, x1, y1 = self.bbox(text)
-        box = self.create_rectangle(x0 - pad, y0 - pad, x1 + pad, y1 + pad, fill="#111214", outline=C["sel"], tags="hover")
+        box = self.create_rectangle(x0 - pad, y0 - pad, x1 + pad, y1 + pad, fill=C["deep"], outline=C["sel"], tags="hover")
         self.tag_raise(text, box)
 
 
@@ -3248,7 +3391,7 @@ class StatsPage(ttk.Frame):
                                  C["red"] if closed else None)
         labels = hour_labels(hours)
         ends = (f"{span} ago", "now")
-        self.windows_chart.set([(h.series("open", hours, per="open_n"), "#4e5058", "Open"),
+        self.windows_chart.set([(h.series("open", hours, per="open_n"), C["outline"], "Open"),
                                 (h.series("ingame", hours, per="ingame_n"), C["green"], "In a game")], ends, labels)
         self.afk_chart.set([(h.series("pings", hours), C["accent"], "Pings"),
                             (h.series("missed", hours), C["red"], "Missed")], ends, labels)
@@ -3414,9 +3557,8 @@ class GamesPage(ttk.Frame):
         self.tree.tag_configure("fav", foreground=C["fg"])
         self.tree.tag_configure("recent", foreground=C["muted"])
         scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
         self.tree.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
+        auto_scrollbar(self.tree, scroll)
         add_row_hover(self.tree)
         self.empty = ttk.Label(table, text="No games yet. Join one from Accounts, or paste a link above.",
                                style="PanelMuted.TLabel")
@@ -3587,6 +3729,7 @@ class ProfilesPage(ttk.Frame):
             self.tree.heading(col, text="   " + title, anchor="w")
             self.tree.column(col, width=int(width * s), anchor="w")
         self.tree.pack(side="left", fill="both", expand=True)
+        auto_scrollbar(self.tree, ttk.Scrollbar(table, orient="vertical", command=self.tree.yview))
         add_row_hover(self.tree)
         self.empty = ttk.Label(table, text="No profiles yet. Click “+ New profile” to save a setup, for example\n"
                                "“Farm: 12 alts in Pet Simulator”.", style="PanelMuted.TLabel", justify="center")
@@ -3655,8 +3798,8 @@ class ProfilesPage(ttk.Frame):
         if iid is None:
             return
         profiles = self.profiles()
-        if messagebox.askyesno("Delete profile", f"Delete the profile “{profiles[int(iid)]['name']}”?\n\n"
-                               "The accounts themselves stay.", parent=self.app.root):
+        if ask_yes_no("Delete profile", f"Delete the profile “{profiles[int(iid)]['name']}”?\n\n"
+                               "The accounts themselves stay.", parent=self.app.root, yes="Delete", danger=True):
             del profiles[int(iid)]
             self.save(profiles)
 
@@ -3703,9 +3846,8 @@ class ProfileDialog(tk.Toplevel):
                                selectbackground=C["accent"], selectforeground="white", highlightthickness=0,
                                bd=0, font=FONT, exportselection=False)
         scroll = ttk.Scrollbar(listing, orient="vertical", command=self.list.yview)
-        self.list.configure(yscrollcommand=scroll.set)
         self.list.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
+        auto_scrollbar(self.list, scroll)
         chosen = set(profile["accounts"]) if profile else {a["id"] for a in app.selected_accounts()}
         for i, acc in enumerate(app.accounts):
             group = app.group_of(acc)
@@ -3738,6 +3880,18 @@ class ProfileDialog(tk.Toplevel):
             self.result = {"name": name, "accounts": accounts, "place": place,
                            "place_name": known.get(place) or (m.group(1) if m else f"Place {place}")}
             self.destroy()
+
+
+def auto_scrollbar(widget, scroll):
+    """Shows the scrollbar only while the list is longer than its box."""
+    def update(first, last):
+        scroll.set(first, last)
+        needed = float(first) > 0 or float(last) < 1
+        if needed and not scroll.winfo_manager():
+            scroll.pack(side="right", fill="y")
+        elif not needed and scroll.winfo_manager():
+            scroll.pack_forget()
+    widget.configure(yscrollcommand=update)
 
 
 def add_row_hover(tree):
@@ -3922,37 +4076,33 @@ class App:
 
     def build_accounts(self, host):
         outer = ttk.Frame(host)
-        header = ttk.Frame(outer)
-        header.pack(fill="x")
-        ttk.Label(header, text="Accounts", style="Title.TLabel").pack(side="left")
-        self.summary = ttk.Label(header, text="", style="Muted.TLabel")
-        self.summary.pack(side="left", padx=(12, 0), pady=(6, 0))
+        header, self.summary = page_header(outer, "Accounts", "")
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *_: self.refresh())
         search = ttk.Entry(header, textvariable=self.search_var, width=28)
         search.pack(side="right", anchor="s")
         add_placeholder(search, self.search_var, "Search accounts")
 
-        # Where to join: the game first; a specific server is optional and secondary.
+        # Where to join: the game, then an optional server, side by side with labels above.
         game = ttk.Frame(outer)
-        game.pack(fill="x", pady=(12, 0))
+        game.pack(fill="x", pady=(14, 0))
         ttk.Label(game, text="Game", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(game, text="Server (optional)", style="Muted.TLabel").grid(row=0, column=3, sticky="w", padx=(14, 0))
         self.place_var = tk.StringVar(value=self.settings.get("place", ""))
         self.place_box = ttk.Combobox(game, textvariable=self.place_var)
-        self.place_box.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        self.place_box.grid(row=1, column=0, sticky="ew", pady=(3, 0))
         add_placeholder(self.place_box, self.place_var, "Paste a game or private server link, or pick one")
         self.star_btn = ttk.Button(game, text="☆", width=3, command=self.toggle_favorite)
-        self.star_btn.grid(row=1, column=1, padx=(6, 0), pady=(2, 0))
-        ttk.Button(game, text="Servers...", command=self.open_servers).grid(row=1, column=2, padx=(6, 0), pady=(2, 0))
+        self.star_btn.grid(row=1, column=1, padx=(6, 0), pady=(3, 0), sticky="ns")
+        ttk.Button(game, text="Servers...", command=self.open_servers).grid(row=1, column=2, padx=(6, 0), pady=(3, 0),
+                                                                           sticky="ns")
         self.place_var.trace_add("write", lambda *_: self.update_star())
-        game.columnconfigure(0, weight=1)
-        server = ttk.Frame(game)
-        server.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        ttk.Label(server, text="Server", style="Muted.TLabel").pack(side="left")
         self.job_var = tk.StringVar()
-        job = ttk.Entry(server, textvariable=self.job_var, width=40)
-        job.pack(side="left", padx=(8, 0))
-        add_placeholder(job, self.job_var, "Any server (or paste a Job ID)")
+        job = ttk.Entry(game, textvariable=self.job_var)
+        job.grid(row=1, column=3, sticky="ew", padx=(14, 0), pady=(3, 0))
+        add_placeholder(job, self.job_var, "Any server, or paste a Job ID")
+        game.columnconfigure(0, weight=3)
+        game.columnconfigure(3, weight=2)
         self.update_recents_box()
 
         btns = ttk.Frame(outer)
@@ -3979,9 +4129,8 @@ class App:
         self.tree.tag_configure("ingame", foreground=C["green"])
         self.tree.tag_configure("group", foreground=C["muted"], font=("Segoe UI Semibold", 10))
         scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
         self.tree.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
+        auto_scrollbar(self.tree, scroll)
         self.empty_hint = ttk.Label(table, text="No accounts yet. Click “+ Add account” to start.",
                                     style="Muted.TLabel", background=C["panel"])
         # Double-clicking a group header only opens or closes it; it never launches the whole group.
@@ -4104,7 +4253,7 @@ class App:
             members = [a for a in self.accounts if self.group_of(a) == group]
             parents[group] = self.tree.insert(
                 "", "end", iid=GROUP_PREFIX + group, open=group not in collapsed, tags=("group",),
-                values=(f"{group}", f"{len(members)} account{'s' if len(members) != 1 else ''}", "", ""))
+                values=(f"{group}   ·   {len(members)} account{'s' if len(members) != 1 else ''}", "", "", ""))
         stream = self.stream_var.get()   # names and avatars stay off screen
         for acc in self.accounts:
             names = self.who(acc) if stream else f"{acc['name']} {acc['displayName']}"
@@ -4165,13 +4314,13 @@ class App:
         self.status.config(text=f"Moved {who} to {group}." if group else f"Took {who} out of their group.")
 
     def ask_new_group(self, accounts):
-        name = simpledialog.askstring("New group", "Group name (for example Mains or Alts):", parent=self.root)
+        name = ask_string("New group", "Group name (for example Mains or Alts):", parent=self.root)
         name = (name or "").strip()[:40]
         if name:
             self.set_group(accounts, name)
 
     def rename_group(self, old):
-        name = simpledialog.askstring("Rename group", "New name:", initialvalue=old, parent=self.root)
+        name = ask_string("Rename group", "New name:", initialvalue=old, parent=self.root)
         name = (name or "").strip()[:40]
         if name and name != old:
             self.set_group([a for a in self.accounts if self.group_of(a) == old], name)
@@ -4379,7 +4528,7 @@ class App:
     def launch_profile(self, profile):
         accounts = [a for a in (self.account(i) for i in profile["accounts"]) if a]
         if not accounts:
-            messagebox.showinfo("Launch profile", "None of this profile's accounts are in AltVault any more. "
+            show_info("Launch profile", "None of this profile's accounts are in AltVault any more. "
                                 "Edit the profile to pick accounts.", parent=self.root)
             return
         self.search_var.set("")   # rows hidden by a search can't be selected
@@ -4448,16 +4597,16 @@ class App:
         if not sel:
             return
         names = ", ".join(self.who(a) for a in sel)
-        if not messagebox.askyesno("Remove", f"Remove {names} from AltVault?\n\n"
-                                   "This only deletes the saved login here, not the Roblox account.",
-                                   parent=self.root):
+        if not ask_yes_no("Remove accounts", f"Remove {names} from AltVault?\n\n"
+                          "This only deletes the saved login here, not the Roblox account.",
+                          parent=self.root, yes="Remove", danger=True):
             return
         self.accounts = [a for a in self.accounts if a not in sel]
         self.save()
         self.refresh()
 
     def edit_note(self, acc):
-        note = simpledialog.askstring("Edit note", f"Note for {self.who(acc)}:",
+        note = ask_string("Edit note", f"Note for {self.who(acc)}:",
                                       initialvalue=acc.get("note", ""), parent=self.root)
         if note is not None:
             acc["note"] = note.strip()
@@ -4563,7 +4712,7 @@ class App:
     def ask_fps_cap(self, accounts):
         lo, hi = FPS_RANGE
         current = {self.fps_cap_of(a) for a in accounts}
-        cap = simpledialog.askinteger("FPS cap", f"Frames per second ({lo}–{hi}):", parent=self.root,
+        cap = ask_integer("FPS cap", f"Frames per second ({lo}–{hi}):", parent=self.root,
                                       minvalue=lo, maxvalue=hi,
                                       initialvalue=current.pop() if len(current) == 1 and None not in current else 30)
         if cap:
@@ -4675,13 +4824,13 @@ class App:
     def ask_join_player(self, accounts):
         if not accounts:
             return
-        name = simpledialog.askstring("Join a player", "Their Roblox username:", parent=self.root)
+        name = ask_string("Join a player", "Their Roblox username:", parent=self.root)
         name = (name or "").strip()
         if not name:
             return
         viewer = next((a for a in accounts if a["id"] not in self.expired), None)
         if not viewer:
-            messagebox.showerror("Join a player", "The selected accounts need to log in again first.", parent=self.root)
+            show_error("Join a player", "The selected accounts need to log in again first.", parent=self.root)
             return
         self.status.config(text=f"Finding {name}...")
 
@@ -4691,7 +4840,7 @@ class App:
             except RobloxError as e:
                 message = str(e)   # e itself is cleared when the except block ends
                 self.ui(lambda: (self.status.config(text=""),
-                                 messagebox.showerror("Join a player", message, parent=self.root)))
+                                 show_error("Join a player", message, parent=self.root)))
                 return
 
             def go():
@@ -4706,12 +4855,12 @@ class App:
     def open_servers(self):
         text = self.place_var.get()
         if parse_private_server(text):
-            messagebox.showinfo("Servers", "A private server link already points at one server, so there's "
+            show_info("Servers", "A private server link already points at one server, so there's "
                                 "no list to browse. Just click Join.", parent=self.root)
             return
         place_id = parse_place_id(text)
         if not place_id:
-            messagebox.showinfo("Servers", "Enter a game first (a place ID or roblox.com/games link).",
+            show_info("Servers", "Enter a game first (a place ID or roblox.com/games link).",
                                 parent=self.root)
             return
         ServerBrowser(self, place_id)
@@ -4775,7 +4924,7 @@ class App:
     def export_accounts(self):
         n = len(self.accounts)
         if not n:
-            messagebox.showinfo("Export accounts", "There are no accounts to export yet.", parent=self.root)
+            show_info("Export accounts", "There are no accounts to export yet.", parent=self.root)
             return
         path = filedialog.asksaveasfilename(parent=self.root, title="Export accounts", defaultextension=EXPORT_EXT,
                                             initialfile="AltVault accounts" + EXPORT_EXT,
@@ -4796,7 +4945,7 @@ class App:
             os.replace(tmp, path)
         except OSError as e:
             log.warning("Export failed: %s", e)
-            messagebox.showerror("Export accounts", f"Couldn't save the file:\n{e}", parent=self.root)
+            show_error("Export accounts", f"Couldn't save the file:\n{e}", parent=self.root)
             return
         log.info("Exported %d accounts", n)
         self.status.config(text=f"Exported {n} account{'s' if n != 1 else ''} to {os.path.basename(path)}.")
@@ -4812,7 +4961,7 @@ class App:
             with open(path, "rb") as f:
                 data = f.read()
         except OSError as e:
-            messagebox.showerror("Import accounts", f"Couldn't read the file:\n{e}", parent=self.root)
+            show_error("Import accounts", f"Couldn't read the file:\n{e}", parent=self.root)
             return
         payload = PasswordDialog(self, "Import accounts", "Type the password this file was exported with.",
                                  check=lambda pw: open_export(data, pw)).result
@@ -4821,7 +4970,7 @@ class App:
         self.status.config(text="Checking imported accounts...")
 
         def report(text):
-            messagebox.showinfo("Import accounts", text, parent=self.root)
+            show_info("Import accounts", text, parent=self.root)
         threading.Thread(target=check_and_add, args=(self, export_entries(payload), report, payload.get("favorites")),
                          daemon=True).start()
 
@@ -4851,7 +5000,8 @@ class App:
         if not roblox_windows():
             self.status.config(text="No Roblox windows open.")
             return
-        if not messagebox.askyesno("Close all Roblox", "Close every Roblox window?", parent=self.root):
+        if not ask_yes_no("Close all Roblox", "Close every Roblox window?", parent=self.root, yes="Close all",
+                          danger=True):
             return
         self.expected_close |= {pid for _, pid, _ in roblox_windows()}
         close_all_roblox()
@@ -5066,14 +5216,15 @@ class App:
         """Makes Multi-Roblox active before a join. Returns False if the user cancelled."""
         if not self.multi_var.get() or enable_multi_roblox():
             return True
-        if not messagebox.askyesno(
+        if not ask_yes_no(
                 "Multi-Roblox", "Roblox was opened before Multi-Roblox could start, so new windows "
-                "would close it.\n\nClose all Roblox windows now and continue?", parent=self.root):
+                "would close it.\n\nClose all Roblox windows now and continue?", parent=self.root,
+                yes="Close Roblox and join", danger=True):
             return False
         if close_roblox_and_enable_multi():
             self.status.config(text="Multi-Roblox is on.")
             return True
-        messagebox.showerror("Multi-Roblox", "Couldn't turn on Multi-Roblox. Close Roblox from "
+        show_error("Multi-Roblox", "Couldn't turn on Multi-Roblox. Close Roblox from "
                              "Task Manager, then Join again.", parent=self.root)
         return False
 
@@ -5083,32 +5234,32 @@ class App:
             return
         sel = self.selected_accounts()
         if not sel:
-            messagebox.showinfo("Join", "Select one or more accounts first (Ctrl+click for several).",
+            show_info("Join", "Select one or more accounts first (Ctrl+click for several).",
                                 parent=self.root)
             return
         private = parse_private_server(self.place_var.get())
         if private and not private.get("share_code") and not private.get("place_id"):
-            messagebox.showerror("Join", "That private server link doesn't say which game it's for. Copy the "
+            show_error("Join", "That private server link doesn't say which game it's for. Copy the "
                                  "link again from the private server's menu on roblox.com.", parent=self.root)
             return
         place_id = private.get("place_id") if private else parse_place_id(self.place_var.get())
         if not private and not place_id:
-            messagebox.showerror("Join", "Enter a place ID, a roblox.com/games/... link or a private server link.",
+            show_error("Join", "Enter a place ID, a roblox.com/games/... link or a private server link.",
                                  parent=self.root)
             return
         job_id = "" if private else parse_job_id(self.job_var.get())
         if job_id is None:
-            messagebox.showerror("Join", "The server / Job ID should look like "
+            show_error("Join", "The server / Job ID should look like "
                                  "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (or leave it empty).", parent=self.root)
             return
         expired = [a for a in sel if a["id"] in self.expired]
         if expired:
-            messagebox.showerror("Join", "These accounts need to log in again first (right-click > Log in again):\n" +
+            show_error("Join", "These accounts need to log in again first (right-click > Log in again):\n" +
                                  "\n".join(self.who(a) for a in expired), parent=self.root)
             return
         if len(sel) > 1 and not self.multi_var.get():
-            if not messagebox.askyesno("Join", "Multi-Roblox is off, so each launch will close the "
-                                       "previous window. Continue anyway?", parent=self.root):
+            if not ask_yes_no("Join", "Multi-Roblox is off, so each launch will close the "
+                              "previous window. Continue anyway?", parent=self.root, yes="Continue"):
                 return
         if not self.ensure_multi():
             return
@@ -5251,7 +5402,7 @@ class App:
             self.root.after(5000, self.tile)
         self.root.after(8000, lambda: self.refresh_presence(reschedule=False))
         if problems:
-            messagebox.showwarning("Join", "\n\n".join(problems), parent=self.root)
+            show_warning("Join", "\n\n".join(problems), parent=self.root)
 
     def on_close(self):
         """The window's X: hide to the tray so Anti-AFK keeps working. Quit is in the tray menu."""
@@ -5325,7 +5476,7 @@ def main():
         # Only interrupt with a dialog while the user is in AltVault. An error from a background
         # timer must never pop up over Roblox or whatever else they're doing.
         if _user32.GetForegroundWindow() == _user32.GetParent(root.winfo_id()):
-            messagebox.showerror(APP_TITLE, f"Something went wrong:\n{val}\n\nDetails are in {LOG_FILE}")
+            show_error(APP_TITLE, f"Something went wrong:\n{val}\n\nDetails are in {LOG_FILE}")
     root.report_callback_exception = report
 
     try:
@@ -5333,7 +5484,7 @@ def main():
     except (OSError, ValueError) as e:
         # Don't start with an empty list, or the next save would wipe the real file.
         log.exception("Couldn't read accounts")
-        messagebox.showerror(APP_TITLE, f"Couldn't read saved accounts:\n{e}\n\nFile: {DATA_FILE}")
+        show_error(APP_TITLE, f"Couldn't read saved accounts:\n{e}\n\nFile: {DATA_FILE}")
         root.destroy()
         return
     threading.Thread(target=remove_stale_login_profiles, daemon=True).start()

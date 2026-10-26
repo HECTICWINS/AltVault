@@ -16,6 +16,9 @@ Every release on the [Releases](../../releases) page is built by GitHub from the
 - **Hide Roblox from the taskbar:** also keeps them out of Alt+Tab. The taskbar buttons come back when you turn it off or quit.
 - **Export and import accounts** as a password-protected `.altvault` file (scrypt + AES-256-GCM), with groups, notes and per-account settings.
 - Settings is now a page instead of a separate window.
+- **Purple night theme:** near-black with a faint violet tint, and a dark violet accent on the selected page, main buttons, ticks and charts. New purple app icon.
+- **Dark dialogs everywhere:** confirmations, warnings and text prompts match the app instead of flashing a bright Windows box. Destructive actions (Remove, Close all, Delete) use a red button.
+- Scrollbars only appear when a list is longer than its box. Game and Server boxes sit side by side, and empty charts say so instead of showing blank axes.
 
 ## 2.6.0
 
