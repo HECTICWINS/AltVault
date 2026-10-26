@@ -34,6 +34,7 @@ from tkinter import filedialog, font as tkfont, ttk
 
 APP_TITLE = "AltVault"
 APP_VERSION = "2.7.0"
+GITHUB_URL = "https://github.com/HECTICWINS/AltVault"
 APP_DIR = os.path.join(os.environ["LOCALAPPDATA"], "AltVault")
 DATA_FILE = os.path.join(APP_DIR, "accounts.dat")
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
@@ -2522,11 +2523,11 @@ class SettingsPage(ttk.Frame):
         ttk.Button(row, text="Import...", command=app.import_accounts).pack(side="left", padx=(6, 0))
 
         section(right, "About")
-        ttk.Label(right, text=f"AltVault {APP_VERSION}").pack(anchor="w", pady=(6, 0))
+        ttk.Label(right, text=f"AltVault {APP_VERSION}  ·  Made by HecticWins").pack(anchor="w", pady=(6, 0))
         links = ttk.Frame(right)
         links.pack(anchor="w", pady=(6, 0))
         ttk.Button(links, text="Open on GitHub",
-                   command=lambda: webbrowser.open("https://github.com/HECTICWINS/AltVault")).pack(side="left")
+                   command=lambda: webbrowser.open(GITHUB_URL)).pack(side="left")
         ttk.Button(links, text="Open log folder", command=lambda: os.startfile(APP_DIR)).pack(side="left", padx=(6, 0))
         left.bind("<Configure>", self.rewrap)
 
@@ -4003,6 +4004,13 @@ class App:
         logo_px = int(30 * s)
         self.logo = tk.PhotoImage(data=base64.b64encode(_png(logo_px, _render_icon(logo_px))))
         tk.Label(rail, image=self.logo, bg=C["panel"]).pack(pady=(int(14 * s), int(10 * s)))
+        # The maker's mark, quietly at the foot of the sidebar; it lights up and links to GitHub.
+        mark = tk.Label(rail, text="HecticWins", bg=C["panel"], fg=C["dim"], font=("Segoe UI Semibold", 7),
+                        cursor="hand2")
+        mark.pack(side="bottom", pady=(0, int(10 * s)))
+        mark.bind("<Enter>", lambda _e: mark.config(fg=C["accent_text"]))
+        mark.bind("<Leave>", lambda _e: mark.config(fg=C["dim"]))
+        mark.bind("<Button-1>", lambda _e: webbrowser.open(GITHUB_URL))
         self.nav = {key: self.nav_item(rail, key, glyph, label) for key, glyph, label in self.NAV}
 
         main = ttk.Frame(self.root, padding=(16, 14, 16, 12))
@@ -4033,7 +4041,7 @@ class App:
         bottom = key == "settings"
         item = tk.Frame(rail, bg=C["panel"], cursor="hand2")
         item.pack(side="bottom" if bottom else "top", fill="x", padx=int(6 * s),
-                  pady=(int(2 * s), int(12 * s) if bottom else int(2 * s)))
+                  pady=(int(2 * s), int(6 * s) if bottom else int(2 * s)))
         bar = tk.Frame(item, bg=C["accent"], width=max(int(3 * s), 2))
         icon = tk.Label(item, text=glyph, font=(self.icon_font, 15), bg=C["panel"], fg=C["muted"])
         icon.pack(pady=(int(8 * s), 0))
