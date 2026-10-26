@@ -33,6 +33,7 @@ A secure, lightweight Roblox account manager for Windows. Download, unzip, doubl
 - **Saved accounts:** logins are encrypted with Windows DPAPI.
 - **Join:** launch one or many accounts into a game, optionally all into the same server or a specific Job ID.
 - **Private servers:** paste a private server link and every selected account joins that private server.
+- **FPS caps per account:** give each alt its own frame-rate limit, such as 20 or 30, to save power while your main stays smooth.
 - **Multi-Roblox:** run several clients at once.
 - **Auto-tile:** arrange any number of Roblox windows in an even grid.
 - **Live status:** see who's online or in game, with avatars.
@@ -67,7 +68,7 @@ Get-FileHash .\AltVault-*-win64.zip
 If you have the [GitHub CLI](https://cli.github.com), you can also confirm GitHub built the file from this repository:
 
 ```powershell
-gh attestation verify .\AltVault-2.2.0-win64.zip --repo HECTICWINS/AltVault
+gh attestation verify .\AltVault-2.3.0-win64.zip --repo HECTICWINS/AltVault
 ```
 
 The download includes its own copy of Python, so one or two lesser-known engines may flag it; that's a common false positive for Python apps.
@@ -124,6 +125,16 @@ Paste the private server link into the **Game** box, select the accounts and cli
 Every selected account joins that private server, so the **Server / Job ID** box and **Same server** are ignored.
 Each account must be allowed in: for a friends-only private server, every alt needs to be friends with the owner.
 A private server link works like an invite, so AltVault never saves it to `settings.json` or the log.
+
+## FPS caps
+
+Right-click an account (or several) > **FPS cap**, then pick 15, 20, 30, 45 or 60 FPS, or **Custom...** for any number from 5 to 240.
+Alts you're only AFK grinding on rarely need more than 15–30 FPS, and capping them saves a lot of CPU, GPU and power.
+
+The cap applies from that account's **next join**; windows that are already open aren't touched.
+It uses Roblox's own Maximum Frame Rate setting: just before launching an account, AltVault writes that account's cap into Roblox's `GlobalBasicSettings_13.xml`, and once the client has started it puts your own setting back.
+Only that one number is changed, and nothing is injected into Roblox.
+To check a cap, press **Shift+F5** in that Roblox window to show its frame rate.
 
 ## Anti-AFK
 

@@ -2,6 +2,11 @@
 
 Every release on the [Releases](../../releases) page is built by GitHub from the tagged commit, comes with a build attestation, and is scanned by VirusTotal. See [Verify your download](README.md#verify-your-download).
 
+## 2.3.0
+
+- **FPS caps per account:** right-click one or more accounts > **FPS cap** and pick 15, 20, 30, 45 or 60 FPS, or any custom number from 5 to 240. The cap applies from the account's next join, and the status column shows it.
+- Caps use Roblox's own Maximum Frame Rate setting, written just before each launch; your own setting is put back once the client starts, and nothing is injected into Roblox.
+
 ## 2.2.0
 
 - **Private servers:** paste a private server link into the Game box and every selected account joins that private server. Works with Roblox's share links (`roblox.com/share?code=...&type=Server`) and older `privateServerLinkCode` links. Before, pasting one joined a public server of that game instead.

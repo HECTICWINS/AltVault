@@ -203,10 +203,11 @@ class TestPrivateServers(unittest.TestCase):
             launched.append((cookie, place_id, job_id, link_code))
             windows.append((1000 + len(windows), 2000 + len(windows), "Roblox"))
 
-        fake = types.SimpleNamespace(expired=set(), running={}, presence={},
+        fake = types.SimpleNamespace(expired=set(), running={}, presence={}, settings={},
                                      set_status=lambda text: None, ui=lambda fn, *a: fn(*a),
                                      join_finished=finished.append, remember_place=lambda c, p: None)
-        for name in ("join_worker", "resolve_private", "wait_for_new_window"):
+        for name in ("join_worker", "resolve_private", "wait_for_new_window", "fps_caps", "fps_cap_of",
+                     "apply_fps_cap", "restore_fps_cap"):
             setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
         fake.wait_for_server = lambda *a: self.fail("same-server logic ran for a private server")
         with mock.patch.object(av, "resolve_share_link", fake_resolve), \
@@ -249,6 +250,119 @@ class TestPrivateServers(unittest.TestCase):
             av.App.save_settings(fake)
         self.assertNotIn("SECRET123", repr(saved))
         self.assertEqual(saved[-1]["place"], "https://www.roblox.com/games/1/Public")
+
+
+ROBLOX_SETTINGS_SAMPLE = (
+    b'<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" version="4">\r\n'
+    b'\t<Item class="UserGameSettings" referent="RBX0">\r\n\t\t<Properties>\r\n'
+    b'\t\t\t<int name="FramerateCap">60</int>\r\n'
+    b'\t\t\t<int name="GraphicsQualityLevel">3</int>\r\n'
+    b'\t\t\t<float name="MasterVolume">0.5</float>\r\n'
+    b'\t\t\t<int name="RCCProfilerRecordFrameRate">1</int>\r\n'
+    b'\t\t</Properties>\r\n\t</Item>\r\n</roblox>')
+
+
+class TestFpsCaps(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.mkdtemp(dir=TEMP_HOME)
+        self.path = os.path.join(self.folder, "GlobalBasicSettings_13.xml")
+        with open(self.path, "wb") as f:
+            f.write(ROBLOX_SETTINGS_SAMPLE)
+
+    def contents(self):
+        with open(self.path, "rb") as f:
+            return f.read()
+
+    def test_only_the_frame_rate_changes(self):
+        self.assertEqual(av.read_fps_cap(self.path), 60)
+        av.write_fps_cap(self.path, 20)
+        self.assertEqual(av.read_fps_cap(self.path), 20)
+        self.assertEqual(self.contents(), ROBLOX_SETTINGS_SAMPLE.replace(b">60<", b">20<"))
+        self.assertIn(b'"RCCProfilerRecordFrameRate">1<', self.contents())   # similar name, untouched
+        self.assertFalse(os.path.exists(self.path + ".altvault.tmp"))
+
+    def test_file_without_the_setting_is_left_alone(self):
+        with open(self.path, "wb") as f:
+            f.write(b"<roblox></roblox>")
+        with self.assertRaises(OSError):
+            av.write_fps_cap(self.path, 20)
+        self.assertEqual(self.contents(), b"<roblox></roblox>")
+        self.assertIsNone(av.read_fps_cap(os.path.join(self.folder, "missing.xml")))
+
+    def test_picks_the_player_settings_file(self):
+        roblox = os.path.join(TEMP_HOME, "Roblox")
+        os.makedirs(roblox, exist_ok=True)
+        for name in ("GlobalBasicSettings_9.xml", "GlobalBasicSettings_13.xml",
+                     "GlobalBasicSettings_14_Studio.xml", "GlobalSettings_20.xml"):
+            open(os.path.join(roblox, name), "wb").close()
+        self.assertEqual(os.path.basename(av.roblox_settings_file()), "GlobalBasicSettings_13.xml")
+
+    def make_app(self, caps, **settings):
+        fake = types.SimpleNamespace(settings={"fps_caps": caps, **settings}, ui=lambda fn, *a: fn(*a))
+        for name in ("fps_caps", "fps_cap_of", "apply_fps_cap", "restore_fps_cap"):
+            setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
+        return fake
+
+    def test_each_account_starts_with_its_own_cap(self):
+        app = self.make_app({"1": 20, "3": 45})
+        seen = []
+        with mock.patch.object(av, "save_settings", lambda s: None):
+            for acc_id in (1, 2, 3):
+                app.apply_fps_cap(self.path, {"id": acc_id})
+                seen.append(av.read_fps_cap(self.path))     # what this client would start with
+                app.restore_fps_cap(self.path)
+                self.assertEqual(av.read_fps_cap(self.path), 60, "your own setting must come back")
+        self.assertEqual(seen, [20, 60, 45])
+        self.assertEqual(app.settings["fps_own"], 60)
+
+    def test_a_closing_alt_cant_overwrite_your_own_setting(self):
+        av.write_fps_cap(self.path, 20)          # an alt saved its cap when it closed
+        app = self.make_app({"1": 20}, fps_own=60, fps_written=60)
+        with mock.patch.object(av, "save_settings", lambda s: None):
+            app.apply_fps_cap(self.path, {"id": 2})
+        self.assertEqual(app.settings["fps_own"], 60)
+        self.assertEqual(av.read_fps_cap(self.path), 60)
+
+    def test_your_in_game_change_is_respected(self):
+        av.write_fps_cap(self.path, 144)         # you picked 144 in Roblox's menu
+        app = self.make_app({"1": 20}, fps_own=60, fps_written=60)
+        with mock.patch.object(av, "save_settings", lambda s: None):
+            app.apply_fps_cap(self.path, {"id": 1})
+            self.assertEqual(av.read_fps_cap(self.path), 20)
+            app.restore_fps_cap(self.path)
+        self.assertEqual(app.settings["fps_own"], 144)
+        self.assertEqual(av.read_fps_cap(self.path), 144)
+
+    def test_invalid_caps_are_ignored(self):
+        app = self.make_app({"1": 20, "2": 0, "3": 9999, "4": "30", "5": None, "6": 240, "7": 5})
+        self.assertEqual(app.fps_caps(), {"1": 20, "6": 240, "7": 5})
+        self.assertEqual(self.make_app("garbage").fps_caps(), {})
+
+    def test_join_applies_caps_in_order(self):
+        events = []
+        windows = []
+        accounts = [{"id": i, "name": f"alt{i}", "cookie": f"cookie{i}"} for i in (1, 2, 3)]
+        fake = types.SimpleNamespace(expired=set(), running={}, presence={}, ui=lambda fn, *a: fn(*a),
+                                     settings={"fps_caps": {"1": 20, "3": 45}},
+                                     set_status=lambda text: None, join_finished=lambda p: events.append(("done", p)),
+                                     remember_place=lambda c, p: None, wait_for_server=lambda *a: None)
+        for name in ("join_worker", "wait_for_new_window", "fps_caps", "fps_cap_of",
+                     "apply_fps_cap", "restore_fps_cap"):
+            setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
+
+        def fake_launch(cookie, *a):
+            events.append((cookie, av.read_fps_cap(self.path)))
+            windows.append((len(windows), 500 + len(windows), "Roblox"))
+        with mock.patch.object(av, "roblox_settings_file", lambda: self.path), \
+                mock.patch.object(av, "launch", fake_launch), \
+                mock.patch.object(av, "roblox_windows", lambda: list(windows)), \
+                mock.patch.object(av, "save_settings", lambda s: None), \
+                mock.patch.object(av.time, "sleep", lambda s: None), \
+                mock.patch.object(av.threading, "Thread", lambda target, args=(), daemon=None:
+                                  types.SimpleNamespace(start=lambda: target(*args))):
+            fake.join_worker(accounts, "1", "", False)
+        self.assertEqual(events, [("cookie1", 20), ("cookie2", 60), ("cookie3", 45), ("done", [])])
+        self.assertEqual(av.read_fps_cap(self.path), 60)
 
 
 class TestSecretsNeverLeak(unittest.TestCase):

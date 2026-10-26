@@ -32,7 +32,7 @@ import zlib
 from tkinter import messagebox, simpledialog, ttk
 
 APP_TITLE = "AltVault"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 APP_DIR = os.path.join(os.environ["LOCALAPPDATA"], "AltVault")
 DATA_FILE = os.path.join(APP_DIR, "accounts.dat")
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
@@ -775,6 +775,50 @@ def acquire_instance_lock():
             focus_window(hwnd)
         return None
     return handle
+
+
+# ---------------------------------------------------------------- per-account FPS caps
+# Roblox's own Maximum Frame Rate setting (FramerateCap in GlobalBasicSettings_<n>.xml) is read
+# once, when a client starts. Writing an account's cap just before launching it, then putting
+# the user's own value back, gives every account its own cap without touching running clients.
+FPS_PRESETS = (15, 20, 30, 45, 60)
+FPS_RANGE = (5, 240)
+_FPS_TAG = re.compile(rb'(<int name="FramerateCap">)(-?\d+)(</int>)')
+
+
+def roblox_settings_file():
+    """Roblox's player settings file (the newest GlobalBasicSettings_<n>.xml), or None."""
+    folder = os.path.join(os.environ["LOCALAPPDATA"], "Roblox")
+    try:
+        names = [n for n in os.listdir(folder) if re.fullmatch(r"GlobalBasicSettings_\d+\.xml", n)]
+    except OSError:
+        return None
+    if not names:
+        return None
+    return os.path.join(folder, max(names, key=lambda n: int(re.search(r"\d+", n).group())))
+
+
+def read_fps_cap(path):
+    try:
+        with open(path, "rb") as f:
+            m = _FPS_TAG.search(f.read())
+    except OSError:
+        return None
+    return int(m.group(2)) if m else None
+
+
+def write_fps_cap(path, value):
+    """Changes only the FramerateCap number; every other byte of Roblox's file stays as it was."""
+    with open(path, "rb") as f:
+        data = f.read()
+    new, found = _FPS_TAG.subn(lambda m: m.group(1) + str(int(value)).encode() + m.group(3), data, count=1)
+    if not found:
+        raise OSError("Roblox's settings file has no frame rate setting")
+    if new != data:
+        tmp = path + ".altvault.tmp"
+        with open(tmp, "wb") as f:
+            f.write(new)
+        os.replace(tmp, path)
 
 
 # ---------------------------------------------------------------- storage
@@ -1632,16 +1676,20 @@ class App:
         kind = p.get("userPresenceType") if p else None
         if kind == 2:
             where = p.get("lastLocation") or "a game"
-            return f"● In game · {where}" + ("" if running else " (another device)"), "ingame"
+            cap = self.fps_cap_of(acc) if running else None
+            return (f"● In game · {where}" + ("" if running else " (another device)")
+                    + (f" · {cap} FPS" if cap else "")), "ingame"
+        cap = self.fps_cap_of(acc)
+        fps = f" · {cap} FPS" if cap else ""
         if running:
-            return "● Roblox open" + (" · no anti-AFK" if self.afk_skipped(acc) else ""), "ingame"
+            return "● Roblox open" + (" · no anti-AFK" if self.afk_skipped(acc) else "") + fps, "ingame"
         if kind == 3:
-            return "● In Studio", ""
+            return "● In Studio" + fps, ""
         if kind == 1:
-            return "● Online", ""
+            return "● Online" + fps, ""
         if kind == 0:
-            return "Offline", "offline"
-        return "", ""
+            return "Offline" + fps, "offline"
+        return fps.lstrip(" ·"), ""
 
     def refresh(self):
         selection = self.tree.selection()
@@ -1833,13 +1881,87 @@ class App:
             menu.add_command(label="Turn anti-AFK on for this account" if self.afk_skipped(acc)
                              else "Turn anti-AFK off for this account",
                              command=lambda: self.toggle_afk_skip(acc))
+            menu.add_cascade(label="FPS cap", menu=self.fps_menu(menu, sel))
             menu.add_command(label="Edit note", command=lambda: self.edit_note(acc))
             menu.add_command(label="Log in again", command=lambda: AddAccountDialog(self, acc))
             menu.add_command(label="Move up", command=lambda: self.move(acc, -1))
             menu.add_command(label="Move down", command=lambda: self.move(acc, 1))
+        else:
+            menu.add_cascade(label=f"FPS cap ({len(sel)} accounts)", menu=self.fps_menu(menu, sel))
         menu.add_separator()
         menu.add_command(label="Remove", command=self.remove_selected)
         menu.tk_popup(event.x_root, event.y_root)
+
+    # ------------------------------------------------------------ FPS caps
+    def fps_caps(self):
+        caps = self.settings.get("fps_caps")
+        if not isinstance(caps, dict):
+            return {}
+        lo, hi = FPS_RANGE
+        return {k: v for k, v in caps.items() if isinstance(v, int) and lo <= v <= hi}
+
+    def fps_cap_of(self, acc):
+        return self.fps_caps().get(str(acc["id"]))
+
+    def set_fps_cap(self, accounts, cap):
+        caps = self.fps_caps()
+        for acc in accounts:
+            if cap:
+                caps[str(acc["id"])] = cap
+            else:
+                caps.pop(str(acc["id"]), None)
+        self.settings["fps_caps"] = caps
+        save_settings(self.settings)
+        self.refresh()
+        who = f"@{accounts[0]['name']}" if len(accounts) == 1 else f"{len(accounts)} accounts"
+        self.status.config(text=f"{who}: {f'{cap} FPS cap' if cap else 'no FPS cap'}, from their next join.")
+
+    def ask_fps_cap(self, accounts):
+        lo, hi = FPS_RANGE
+        current = {self.fps_cap_of(a) for a in accounts}
+        cap = simpledialog.askinteger("FPS cap", f"Frames per second ({lo}–{hi}):", parent=self.root,
+                                      minvalue=lo, maxvalue=hi,
+                                      initialvalue=current.pop() if len(current) == 1 and None not in current else 30)
+        if cap:
+            self.set_fps_cap(accounts, cap)
+
+    def fps_menu(self, parent, accounts):
+        menu = themed_menu(parent)
+        caps = {self.fps_cap_of(a) for a in accounts}
+        mark = caps.pop() if len(caps) == 1 else "mixed"
+        menu.add_command(label=("✓ " if mark is None else "    ") + "No cap (your Roblox setting)",
+                         command=lambda: self.set_fps_cap(accounts, None))
+        for value in FPS_PRESETS:
+            menu.add_command(label=("✓ " if mark == value else "    ") + f"{value} FPS",
+                             command=lambda v=value: self.set_fps_cap(accounts, v))
+        custom = mark not in (None, "mixed") and mark not in FPS_PRESETS
+        menu.add_command(label=("✓ " if custom else "    ") + (f"Custom ({mark} FPS)..." if custom else "Custom..."),
+                         command=lambda: self.ask_fps_cap(accounts))
+        return menu
+
+    def apply_fps_cap(self, path, acc):
+        """Writes the cap this account should start with (its own cap, or the user's own Roblox
+        setting). The user's own value is learned the first time, and again whenever the file holds
+        a value AltVault didn't write. A capped client can save its cap back when it closes, so a
+        value matching one of AltVault's caps is never mistaken for the user's own."""
+        current = read_fps_cap(path)
+        own = self.settings.get("fps_own")
+        if current is not None and (own is None or (current != self.settings.get("fps_written")
+                                                     and current not in self.fps_caps().values())):
+            self.settings["fps_own"] = own = current
+        target = self.fps_cap_of(acc) or own
+        if target is not None and target != current:
+            write_fps_cap(path, target)
+            self.settings["fps_written"] = target
+        self.ui(save_settings, self.settings)
+
+    def restore_fps_cap(self, path):
+        """Puts the user's own Roblox frame-rate setting back once a capped client has started."""
+        own = self.settings.get("fps_own")
+        if own is not None and read_fps_cap(path) not in (None, own):
+            write_fps_cap(path, own)
+            self.settings["fps_written"] = own
+            self.ui(save_settings, self.settings)
 
     def use_server_of(self, presence):
         self.place_var.set(str(presence.get("rootPlaceId") or presence.get("placeId")))
@@ -2125,6 +2247,12 @@ class App:
     def join_worker(self, accounts, place_id, job_id, same_server, private=None):
         problems = []
         link_code = ""
+        fps_file = None
+        if self.fps_caps() or self.settings.get("fps_own") is not None:
+            fps_file = roblox_settings_file()
+            if fps_file is None:
+                problems.append("Couldn't find Roblox's settings file, so FPS caps weren't applied. "
+                                "Start Roblox once normally, then try again.")
         try:
             if private:
                 try:
@@ -2136,6 +2264,13 @@ class App:
                 last = i == len(accounts) - 1
                 self.set_status(f"Launching @{acc['name']} ({i + 1}/{len(accounts)})...")
                 before = {pid for _, pid, _ in roblox_windows()}
+                if fps_file:
+                    try:
+                        self.apply_fps_cap(fps_file, acc)
+                    except OSError as e:
+                        log.warning("Couldn't set the FPS cap: %s", e)
+                        problems.append(f"Couldn't set FPS caps ({e}), so accounts start with your normal frame rate.")
+                        fps_file = None
                 try:
                     launch(acc["cookie"], place_id, job_id, link_code)
                 except CookieExpired:
@@ -2152,6 +2287,11 @@ class App:
                     continue
                 self.ui(self.running.__setitem__, pid, acc["id"])
                 time.sleep(3)
+                if fps_file:   # the client has read its cap by now
+                    try:
+                        self.restore_fps_cap(fps_file)
+                    except OSError as e:
+                        log.warning("Couldn't restore the FPS setting: %s", e)
                 if before - {p for _, p, _ in roblox_windows()}:
                     problems.append("An earlier Roblox window closed when this one opened, so "
                                     "Multi-Roblox isn't working with this Roblox version.")
@@ -2170,6 +2310,11 @@ class App:
             log.exception("Join failed")
             problems.append(f"Unexpected error: {e}")
         finally:
+            if fps_file:   # never leave an alt's cap as the user's own Roblox setting
+                try:
+                    self.restore_fps_cap(fps_file)
+                except OSError as e:
+                    log.warning("Couldn't restore the FPS setting: %s", e)
             self.ui(self.join_finished, problems)
 
     def wait_for_new_window(self, before):
