@@ -7,7 +7,7 @@ A secure, lightweight Roblox account manager for Windows. Download, unzip, doubl
 
 > **The only official download is the [Releases](https://github.com/HECTICWINS/AltVault/releases) page of this repository.**
 > Fake "AltVault" downloads on other sites, YouTube descriptions or Discord servers are a common way to steal Roblox accounts.
-> There's no paid version, no "pro" build and no installer. If someone offers you one, it isn't AltVault.
+> There is no installer: if someone gives you a "setup" file for AltVault, it isn't AltVault. A key (see [Access key](#access-key)) only ever comes from the maker, and getting one never needs your Roblox password or cookie.
 
 ## Why AltVault
 
@@ -22,7 +22,7 @@ A secure, lightweight Roblox account manager for Windows. Download, unzip, doubl
   You or anyone you trust can review it before pasting in a login.
 - **Anti-AFK that doesn't get in your way.** It keeps every client from being kicked for idling without flashing Roblox windows over your browser or game.
   It also waits until you pause typing.
-- **Featherweight.** About 50 MB of RAM and well under 1% of one CPU core while running.
+- **Featherweight.** Roughly 25 MB of RAM and well under 1% of one CPU core while running.
 - **Runs quietly in the tray.** Closing the window keeps AltVault running as a small icon next to the clock, with Anti-AFK still on.
   Click the icon to open AltVault, or right-click it to switch Anti-AFK on or off or to quit.
 - **One window only.** Opening AltVault again just brings it back, even from the tray.
@@ -99,7 +99,6 @@ Double-clicking `altvault.py` only works if `.py` files open with Python on your
 
 **Upgrading from PyRAM?** Close PyRAM, then start AltVault. Your saved accounts, settings and avatars move over automatically.
 
-<!-- >>> keyed -->
 ## Access key
 
 This build needs a key, and a key works on one PC only.
@@ -109,7 +108,6 @@ This build needs a key, and a key works on one PC only.
 3. If they approve, they send back a key. Paste it into the window and click **Activate**.
 
 The key is saved in AltVault's data folder, so updating AltVault keeps it. You only need a new one if you reinstall Windows or move to another PC. Earlier versions (2.6.0 and before) don't need a key.
-<!-- <<< keyed -->
 
 ## Finding your way around
 
@@ -124,7 +122,7 @@ The key is saved in AltVault's data folder, so updating AltVault keeps it. You o
 - **Account list:** select accounts (Ctrl+click, Shift+click, Ctrl+A, or click a group's header). The **Join** button shows how many will launch.
 - **Right-click** an account or group: **Join**, **Performance** (FPS cap, lowest graphics, mute, Anti-AFK), **Group**, **Account** (note, profile, log in again), and **Remove**.
 - **Bottom (every page):** the **Anti-AFK** switch and what AltVault last did.
-- **Live page:** a tile for every Roblox window. Click one to bring that window to the front; its **✕** closes it. The dot shows its state: green in a game, yellow still loading, red not responding. On the right: how many windows are in a game, Roblox's CPU and RAM use, your PC's free RAM, Anti-AFK's last and next ping, and the **egg hatch** calculator. Type one alt's speed (eggs per minute, eggs per hour or seconds per egg) and it multiplies it by the accounts in a game. Previews are drawn by Windows itself (like taskbar previews), only while the page is open, so they cost nothing the rest of the time.
+- **Live page:** a tile for every Roblox window. Click one to bring that window to the front; its **✕** closes it. The dot shows its state: green in a game, yellow still joining, red not responding, grey for a window AltVault didn't open. On the right: how many windows are in a game, Roblox's CPU and RAM use, your PC's free RAM, the **egg hatch** calculator, and the last 24 hours at a glance (time in a game, launches that worked, Anti-AFK pings, windows closed outside AltVault). Type one alt's speed (eggs per minute, eggs per hour or seconds per egg) and it multiplies it by the accounts in a game. Previews are drawn by Windows itself (like taskbar previews), only while the page is open, so they cost nothing the rest of the time.
 - **Settings page:** things you set once: Multi-Roblox, same server, window arranging, the Anti-AFK key, **Stream mode**, **Hide Roblox from the taskbar**, and **Export / Import**.
 
 ## Moving your accounts to another PC

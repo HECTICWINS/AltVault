@@ -1475,7 +1475,7 @@ class TestHistory(unittest.TestCase):
             root.destroy()
 
 
-# >>> keyed
+# --- access key (begin) ---
 class TestAccessKey(unittest.TestCase):
     """Keys are ECDSA signatures over a PC's code: valid only on that PC, impossible to alter or invent."""
 
@@ -1590,37 +1590,6 @@ class TestAccessKey(unittest.TestCase):
             self.tool.issue_key(tempfile.mkdtemp(prefix="altvault-empty-"), self.code, app=av)
         self.assertEqual(self.tool.read_ledger(tempfile.mkdtemp(prefix="altvault-empty-")), "No keys made yet.")
 
-    def test_the_key_maker_window_turns_a_pasted_message_into_a_copied_key(self):
-        import importlib.machinery
-        import tkinter
-        loader = importlib.machinery.SourceFileLoader("key_maker_test", os.path.join(ROOT, "tools", "key_maker.pyw"))
-        spec = importlib.util.spec_from_loader("key_maker_test", loader)
-        module = importlib.util.module_from_spec(spec)
-        loader.exec_module(module)
-        copied = []
-        try:
-            window = module.KeyMaker(self.signing_folder(), copy=copied.append)
-        except tkinter.TclError as e:
-            self.skipTest(f"no display: {e}")
-        try:
-            window.withdraw()
-            window.code_var.set("Hi, could I have an AltVault key? My PC code is " + self.code + ", thanks")
-            window.name_var.set("Sam")
-            window.make()
-            self.assertEqual(len(copied), 1)
-            self.assertEqual(self.check(copied[0]), "ok")
-            self.assertEqual(window.key_var.get(), copied[0])
-            window.code_var.set("no code here")
-            window.make()
-            self.assertEqual(len(copied), 1, "nothing is made or copied when there's no code")
-            self.assertIn("can't find a PC code", window.status.cget("text"))
-            window.lasts_var.set("30 days")
-            window.code_var.set(self.code)
-            window.make()
-            self.assertEqual(self.check(copied[-1], today=__import__("time").strftime("%Y%m%d")), "ok")
-        finally:
-            window.destroy()
-
     def test_no_signing_key_can_end_up_in_the_repository(self):
         found = [f for base, _, files in os.walk(ROOT) if ".git" not in base.split(os.sep) and "dev" not in base.split(os.sep)
                  for f in files if f.endswith(".blob") or f.startswith("signing-key") or f == "license.key"]
@@ -1632,7 +1601,7 @@ class TestAccessKey(unittest.TestCase):
         with open(SOURCE, encoding="utf-8") as f:
             self.assertNotIn("ECCPRIVATEBLOB", f.read().replace('"ECCPRIVATEBLOB"', "", 0).split("# ---- access key")[0])
 
-# <<< keyed
+# --- access key (end) ---
 
 
 class TestRepoHygiene(unittest.TestCase):

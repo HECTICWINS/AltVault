@@ -1446,13 +1446,13 @@ def open_export(data, password):
         raise RobloxError("That export file has no accounts in it.")
     return payload
 
-# >>> keyed (everything between these markers is removed from the keyless build)
+# --- access key (begin) ---
 # ---------------------------------------------------------------- access key
 # This build only starts with a key. A key is a digital signature, made with the maker's private
 # key (which is never in this program or its repository), over this PC's code, so it works on one
 # PC and nowhere else, and it can't be changed or invented without the private key. Only the
 # matching public key is here, and it can check a key but not make one. The check happens offline.
-# To turn it off, set LICENSE_REQUIRED to False (see tools/license_tool.py for making keys).
+# Keys are made with tools/license_tool.py.
 LICENSE_REQUIRED = True
 LICENSE_PUBLIC_KEY = "4543533120000000c92aba53f172a26fdd6dd7ce55b42d6b76aef5d87a014fa82738a2ceb837442a266171f83048f983868040e5df78d951d685017ea9779356b186c76f30ff9217"   # hex of an ECDSA P-256 public key blob
 LICENSE_FILE = os.path.join(APP_DIR, "license.key")   # in the data folder, so updates keep it
@@ -1556,7 +1556,7 @@ def save_key(text):
     with open(LICENSE_FILE, "w", encoding="utf-8") as f:
         f.write(text.strip() + "\n")
 
-# <<< keyed
+# --- access key (end) ---
 
 # ---------------------------------------------------------------- Roblox web API
 
@@ -4437,7 +4437,7 @@ def add_row_hover(tree):
     tree.bind("<<TreeviewSelect>>", lambda _e: clear(), add="+")
 
 
-# >>> keyed
+# --- access key (begin) ---
 class ActivationWindow(tk.Toplevel):
     """Shown at start when this PC has no valid key: the PC code to send to the key's maker, and a box
     for the key. .activated is True once a good key has been saved; closing the window ends AltVault."""
@@ -4512,7 +4512,7 @@ class ActivationWindow(tk.Toplevel):
         self.activated = True
         self.destroy()
 
-# <<< keyed
+# --- access key (end) ---
 
 
 class App:
@@ -6146,7 +6146,7 @@ def main():
         show_error(APP_TITLE, f"Couldn't read saved accounts:\n{e}\n\nFile: {DATA_FILE}")
         root.destroy()
         return
-    # >>> keyed
+    # --- access key (begin) ---
     state, why = license_state()
     if state != "ok":   # no valid key on this PC: ask for one, or end here
         apply_theme(root, root.winfo_fpixels("1i") / 96)
@@ -6157,7 +6157,7 @@ def main():
             return
         root.deiconify()
         log.info("Activated")
-    # <<< keyed
+    # --- access key (end) ---
     threading.Thread(target=remove_stale_login_profiles, daemon=True).start()
     if os.path.exists(DATA_FILE):
         threading.Thread(target=restrict_to_owner, args=(DATA_FILE,), daemon=True).start()

@@ -9,16 +9,14 @@ Every release on the [Releases](../../releases) page is built by GitHub from the
 - **Games:** favourites and recent games in one list with their icons. Pick one for joining, browse its servers, star it or open it on roblox.com.
 - **Stats:** time in a game, launches that worked, Anti-AFK pings and windows closed outside AltVault, over 24 hours or 7 days, with hourly charts (hover for values). Only numbers are kept, in `history.json`, for a week.
 - **Pulse:** your PC's and Roblox's CPU and memory, live while the page is open and sampled once a minute otherwise, charted over the last hour, 24 hours or 7 days.
-- **Live page:** every Roblox window as a live tile with a status dot (in a game, loading, not responding). Click a tile to bring that window forward, or close it from its header. Tiles fill the space, no scrolling. Windows draws the previews itself, and only while the page is open.
-- **Stats panel:** how many windows are in a game, Roblox's CPU and RAM, your PC's free RAM, and Anti-AFK's last and next ping. Sampled every 3 seconds, and only while you're looking.
+- **Live page:** every Roblox window as a live tile with a status dot (in a game, joining, not responding, or grey for a window AltVault didn't open). Click a tile to bring that window forward, or close it from its header. Tiles fill the space, no scrolling. Windows draws the previews itself, and only while the page is open.
+- **Stats panel:** how many windows are in a game, Roblox's CPU and RAM, your PC's free RAM, and the last 24 hours at a glance. Sampled every 3 seconds, and only while you're looking.
 - **Egg hatch calculator:** type one alt's speed in eggs/min, eggs/hour or seconds per egg and see the total per minute, hour and day for every account in a game.
 - **Stream mode:** hides usernames and avatars in AltVault and in Roblox's window titles.
 - **Hide Roblox from the taskbar:** also keeps them out of Alt+Tab. The taskbar buttons come back when you turn it off or quit.
 - **Export and import accounts** as a password-protected `.altvault` file (scrypt + AES-256-GCM), with groups, notes and per-account settings.
 - Settings is now a page instead of a separate window.
-<!-- >>> keyed -->
 - **Access key:** this build asks for a key, which works on one PC only and is requested from the maker. The key is saved in AltVault's data folder, so updates keep it. Earlier versions need no key.
-<!-- <<< keyed -->
 - **Eggs hatched (estimate):** type one alt's hatch speed once and AltVault keeps a running count: speed x accounts in a game x time, kept across restarts. See it on Stats (24 hours or 7 days, plus a total) and in the Live panel. It's an estimate, since the game's own counter can't be read; **Set total…** on Stats lines it up with the game's number and carries on from there.
 - **Purple night theme:** near-black with a faint violet tint, and a dark violet accent on the selected page, main buttons, ticks and charts. New purple app icon.
 - **Dark dialogs everywhere:** confirmations, warnings and text prompts match the app instead of flashing a bright Windows box. Destructive actions (Remove, Close all, Delete) use a red button.
