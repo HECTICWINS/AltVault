@@ -22,6 +22,7 @@ import datetime
 import hashlib
 import importlib.util
 import os
+import re
 import struct
 import sys
 
@@ -121,6 +122,42 @@ def _private_only(path):
                    capture_output=True)
 
 
+def find_pc_code(text):
+    """The PC code inside whatever someone sent you (their whole message, or just the code), or None."""
+    found = re.search(r"\b[A-Za-z2-7]{4}(?:-[A-Za-z2-7]{4}){3}\b", text or "")
+    return found.group(0).upper() if found else None
+
+
+def issue_key(directory, pc_code, name="", days=None, app=None):
+    """Makes a key with the signing key in `directory`, notes it in the ledger there, and returns it."""
+    path = os.path.join(directory, KEY_FILE)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"No signing key at {path}. Run:  py -3 tools/license_tool.py init")
+    with open(path, "rb") as f:
+        key = make_key(f.read(), pc_code, days, app=app)
+    ledger = os.path.join(directory, LEDGER)
+    first = not os.path.exists(ledger)
+    with open(ledger, "a", encoding="utf-8") as f:
+        if first:
+            f.write("date,name,pc_code,days" + chr(10))
+        row = f"{datetime.date.today()},{name.replace(',', ' ')},{pc_code},{days or 'never expires'}"
+        f.write(row + chr(10))
+    return key
+
+
+def read_ledger(directory):
+    ledger = os.path.join(directory, LEDGER)
+    if not os.path.exists(ledger):
+        return "No keys made yet."
+    with open(ledger, encoding="utf-8") as f:
+        return f.read()
+
+
+def copy_to_clipboard(text):
+    import subprocess
+    subprocess.run(["clip"], input=text.encode("utf-16le"), check=False)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -147,25 +184,16 @@ def main(argv=None):
         print(f"Private signing key saved to {path}\nKeep a private backup, and never put it in a repository.\n")
         print("Public key (paste into LICENSE_PUBLIC_KEY in altvault.py):\n" + public_blob.hex())
     elif args.command == "list":
-        ledger = os.path.join(args.dir, LEDGER)
-        print(open(ledger, encoding="utf-8").read() if os.path.exists(ledger) else "No keys made yet.")
+        print(read_ledger(args.dir))
     else:
-        if not os.path.exists(path):
-            sys.exit(f"No signing key at {path}. Run:  py -3 tools/license_tool.py init")
-        with open(path, "rb") as f:
-            private_blob = f.read()
-        key = make_key(private_blob, args.pc_code, args.days)
+        code = find_pc_code(args.pc_code) or args.pc_code
+        try:
+            key = issue_key(args.dir, code, args.name, args.days)
+        except (FileNotFoundError, ValueError) as e:
+            sys.exit(str(e))
         print(key)
-        ledger = os.path.join(args.dir, LEDGER)
-        first = not os.path.exists(ledger)
-        with open(ledger, "a", encoding="utf-8") as f:
-            if first:
-                f.write("date,name,pc_code,days" + chr(10))
-            row = f"{datetime.date.today()},{args.name.replace(',', ' ')},{args.pc_code},{args.days or 'never expires'}"
-            f.write(row + chr(10))
         if args.copy:
-            import subprocess
-            subprocess.run(["clip"], input=key.encode("utf-16le"), check=False)
+            copy_to_clipboard(key)
             print("(copied to your clipboard)")
 
 

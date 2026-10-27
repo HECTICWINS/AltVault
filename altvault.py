@@ -3092,10 +3092,10 @@ class LivePage(ttk.Frame):
         usage = {pid: process_usage(pid) for pid in pids}
         cpu = self.cpu.percent({pid: u[0] for pid, u in usage.items() if u and u[0] is not None})
         rams = [u[1] if u else None for u in usage.values()]
-        set_value(self.values["cpu"], "…" if cpu is None and pids else f"{cpu or 0:.0f}%")
-        set_value(self.values["ram"], "—" if None in rams else f"{sum(rams) / 2 ** 30:.1f} GB")
+        set_text(self.values["cpu"], "…" if cpu is None and pids else f"{cpu or 0:.0f}%")
+        set_text(self.values["ram"], "—" if None in rams else f"{sum(rams) / 2 ** 30:.1f} GB")
         free, total = memory_status()
-        set_value(self.values["free"], f"{free / 2 ** 30:.1f} of {total / 2 ** 30:.0f} GB")
+        set_text(self.values["free"], f"{free / 2 ** 30:.1f} of {total / 2 ** 30:.0f} GB")
         self.ram_used = 1 - free / total if total else None
         self.draw_ram_bar()
         app = self.app
@@ -3248,10 +3248,10 @@ class LiveTile(tk.Frame):
         for glyph, action in (("", page.close_window), ("", page.show_window)):
             btn = tk.Label(head, text=glyph, font=(icons, 9), bg=C["panel"], fg=C["muted"], padx=int(6 * s))
             btn.pack(side="right", fill="y")
-            btn.bind("<Enter>", lambda _e, b=btn: b.config(fg=C["fg"], bg=C["sel"]))
-            btn.bind("<Leave>", lambda _e, b=btn: b.config(fg=C["muted"], bg=C["panel"]))
-            btn.bind("<Button-1>", lambda _e, a=action: a(hwnd) or "break")
-            btn.bind("<Enter>", lambda _e: fade(self, "highlightbackground", C["line_hover"]), add="+")
+            btn.bind("<Enter>", lambda _e=None, b=btn: b.config(fg=C["fg"], bg=C["sel"]))
+            btn.bind("<Leave>", lambda _e=None, b=btn: b.config(fg=C["muted"], bg=C["panel"]))
+            btn.bind("<Button-1>", lambda _e=None, a=action: a(hwnd) or "break")
+            btn.bind("<Enter>", lambda _e=None: fade(self, "highlightbackground", C["line_hover"]), add="+")
             btn.bind("<Leave>", self.leave, add="+")
         self.dot = tk.Label(head, text="●", font=("Segoe UI", 9), bg=C["panel"], fg=C["muted"])
         self.dot.pack(side="left", padx=(int(8 * s), 0))
@@ -3261,11 +3261,11 @@ class LiveTile(tk.Frame):
         self.body.pack(fill="both", expand=True, padx=int(2 * s), pady=(0, int(2 * s)))
         self.note = tk.Label(self.body, text="", bg=C["deep"], fg=C["muted"], font=FONT)
         for widget in (self, head, self.dot, self.label, self.body, self.note):
-            widget.bind("<Button-1>", lambda _e: page.show_window(hwnd))
-            widget.bind("<Enter>", lambda _e: fade(self, "highlightbackground", C["line_hover"]), add="+")
+            widget.bind("<Button-1>", lambda _e=None: page.show_window(hwnd))
+            widget.bind("<Enter>", lambda _e=None: fade(self, "highlightbackground", C["line_hover"]), add="+")
             widget.bind("<Leave>", self.leave, add="+")
 
-    def leave(self, _event):
+    def leave(self, _event=None):
         """The outline stays lit while the pointer is anywhere on the tile, buttons included."""
         under = self.winfo_containing(*self.winfo_pointerxy())
         while under is not None and under is not self:
@@ -3692,9 +3692,11 @@ class StatCard(ttk.Frame):
         self.bind("<Configure>", lambda e: [w.config(wraplength=max(e.width - 2 * int(16 * scale), 60))
                                             for w in (self.title, self.sub)])
 
+    blink = True   # False for live gauges (CPU, memory) that change on every reading
+
     def set(self, value, sub="", color=None):
         set_text(self.value, fg=color or C["fg"])
-        set_value(self.value, value)
+        (set_value if self.blink else set_text)(self.value, value)
         set_text(self.sub, sub)
 
     def add_link(self, text, command):
@@ -3937,6 +3939,7 @@ class PulsePage(ttk.Frame):
         for i, (key, title) in enumerate((("pc_cpu", "PC CPU"), ("pc_ram", "PC memory"),
                                           ("rbx_cpu", "Roblox CPU"), ("rbx_ram", "Roblox memory"))):
             self.cards[key] = StatCard(cards, title, s)
+            self.cards[key].blink = False
             self.cards[key].grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else int(10 * s), 0))
             cards.columnconfigure(i, weight=1, uniform="card")
         charts = ttk.Frame(self)

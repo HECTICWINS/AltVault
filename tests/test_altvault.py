@@ -1097,6 +1097,17 @@ class TestWindow(unittest.TestCase):
             self.assertEqual(style.lookup("TEntry", "background", [state]), av.C["bg"], state)
             self.assertEqual(style.lookup("TEntry", "fieldbackground", [state]), av.C["field"], state)
 
+    def test_live_gauges_never_blink(self):
+        """CPU and memory change on every reading; blinking them cost real power (Pulse used 3% of a core)."""
+        pulse = self.app.pages["pulse"]
+        self.assertTrue(all(card.blink is False for card in pulse.cards.values()))
+        card = pulse.cards["pc_cpu"]
+        card.set("10%")
+        card.set("20%")
+        self.assertEqual(card.value.__dict__.get("_fade_jobs", {}), {}, "no fade timer may be running for a gauge")
+        stats = self.app.pages["stats"]
+        self.assertTrue(all(card.blink for card in stats.cards.values()), "event counts do still blink")
+
     def test_changed_values_flash_then_settle(self):
         import tkinter
         label = tkinter.Label(self.root, text="3", fg="#ebe8f0")
@@ -1553,6 +1564,62 @@ class TestAccessKey(unittest.TestCase):
                 self.assertEqual(av.license_state()[0], "ok")
         finally:
             root.destroy()
+
+    def signing_folder(self):
+        folder = tempfile.mkdtemp(prefix="altvault-signing-test-")
+        with open(os.path.join(folder, self.tool.KEY_FILE), "wb") as f:
+            f.write(self.private)
+        return folder
+
+    def test_the_pc_code_is_picked_out_of_a_whole_message(self):
+        message = "Hi, could I have an AltVault key? My PC code is abcd-efgh-jklm-npqr, thanks!"
+        self.assertEqual(self.tool.find_pc_code(message), "ABCD-EFGH-JKLM-NPQR")
+        self.assertEqual(self.tool.find_pc_code("ABCD-EFGH-JKLM-NPQR"), "ABCD-EFGH-JKLM-NPQR")
+        for nothing in ("", "no code in here", "ABCD-EFGH-JKLM", None):
+            self.assertIsNone(self.tool.find_pc_code(nothing))
+
+    def test_issuing_a_key_makes_a_working_key_and_notes_who_got_it(self):
+        folder = self.signing_folder()
+        key = self.tool.issue_key(folder, self.code, "Sam, the first", None, app=av)
+        self.assertEqual(self.check(key), "ok")
+        ledger = self.tool.read_ledger(folder)
+        self.assertIn("Sam  the first", ledger, "commas in a name can't break the ledger")
+        self.assertIn(self.code, ledger)
+        self.assertNotIn(key, ledger, "the ledger never holds the keys themselves")
+        with self.assertRaises(FileNotFoundError):
+            self.tool.issue_key(tempfile.mkdtemp(prefix="altvault-empty-"), self.code, app=av)
+        self.assertEqual(self.tool.read_ledger(tempfile.mkdtemp(prefix="altvault-empty-")), "No keys made yet.")
+
+    def test_the_key_maker_window_turns_a_pasted_message_into_a_copied_key(self):
+        import importlib.machinery
+        import tkinter
+        loader = importlib.machinery.SourceFileLoader("key_maker_test", os.path.join(ROOT, "tools", "key_maker.pyw"))
+        spec = importlib.util.spec_from_loader("key_maker_test", loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        copied = []
+        try:
+            window = module.KeyMaker(self.signing_folder(), copy=copied.append)
+        except tkinter.TclError as e:
+            self.skipTest(f"no display: {e}")
+        try:
+            window.withdraw()
+            window.code_var.set("Hi, could I have an AltVault key? My PC code is " + self.code + ", thanks")
+            window.name_var.set("Sam")
+            window.make()
+            self.assertEqual(len(copied), 1)
+            self.assertEqual(self.check(copied[0]), "ok")
+            self.assertEqual(window.key_var.get(), copied[0])
+            window.code_var.set("no code here")
+            window.make()
+            self.assertEqual(len(copied), 1, "nothing is made or copied when there's no code")
+            self.assertIn("can't find a PC code", window.status.cget("text"))
+            window.lasts_var.set("30 days")
+            window.code_var.set(self.code)
+            window.make()
+            self.assertEqual(self.check(copied[-1], today=__import__("time").strftime("%Y%m%d")), "ok")
+        finally:
+            window.destroy()
 
     def test_no_signing_key_can_end_up_in_the_repository(self):
         found = [f for base, _, files in os.walk(ROOT) if ".git" not in base.split(os.sep) and "dev" not in base.split(os.sep)
