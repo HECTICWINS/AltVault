@@ -2181,6 +2181,10 @@ def apply_theme(root, scale):
     s.layout("TEntry", [("AVField.field", {"sticky": "nsew", "children": [
         ("Entry.padding", {"sticky": "nsew", "children": [("Entry.textarea", {"sticky": "nsew"})]})]})])
     s.configure("TEntry", padding=(round(4 * scale), round(5 * scale)), borderwidth=0)
+    # A read-only or disabled box defaults to Windows' light grey; the rounded corners would show it.
+    s.map("TEntry", fieldbackground=[("readonly", C["field"]), ("disabled", C["field"])],
+          background=[("readonly", C["bg"]), ("disabled", C["bg"])],
+          foreground=[("disabled", C["dim"]), ("readonly", C["fg"])])
     s.layout("TCombobox", [("AVField.field", {"sticky": "nsew", "children": [
         ("AVCombo.arrow", {"side": "right", "sticky": ""}),
         ("Combobox.padding", {"sticky": "nsew", "children": [("Combobox.textarea", {"sticky": "nsew"})]})]})])

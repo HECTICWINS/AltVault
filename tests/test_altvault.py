@@ -1089,6 +1089,14 @@ class TestWindow(unittest.TestCase):
             self.root.withdraw()
             self.app.show_page("accounts"); self.pump(300)
 
+    def test_read_only_and_disabled_boxes_stay_dark(self):
+        """Windows' default read-only look is light grey, which showed at the rounded corners."""
+        from tkinter import ttk
+        style = ttk.Style(self.root)
+        for state in ("readonly", "disabled"):
+            self.assertEqual(style.lookup("TEntry", "background", [state]), av.C["bg"], state)
+            self.assertEqual(style.lookup("TEntry", "fieldbackground", [state]), av.C["field"], state)
+
     def test_changed_values_flash_then_settle(self):
         import tkinter
         label = tkinter.Label(self.root, text="3", fg="#ebe8f0")
