@@ -2,7 +2,7 @@
 
 Every release on the [Releases](../../releases) page is built by GitHub from the tagged commit, comes with a build attestation, and is scanned by VirusTotal. See [Verify your download](README.md#verify-your-download).
 
-## 2.7.0
+## 2.7.1
 
 - **New look with a sidebar:** **Accounts**, **Profiles**, **Games**, **Live**, **Stats**, **Pulse** and **Settings**, a bigger window, and the Anti-AFK switch on every page. Buttons, boxes, checkboxes and scrollbars are redrawn with rounded corners and hover, pressed and focus looks; lists highlight the row under the pointer.
 - **Profiles:** save a setup (a name, some accounts and a game) and launch it with one click.

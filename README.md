@@ -77,7 +77,7 @@ Get-FileHash .\AltVault-*-win64.zip
 If you have the [GitHub CLI](https://cli.github.com), you can also confirm GitHub built the file from this repository:
 
 ```powershell
-gh attestation verify .\AltVault-2.7.0-win64.zip --repo HECTICWINS/AltVault
+gh attestation verify .\AltVault-2.7.1-win64.zip --repo HECTICWINS/AltVault
 ```
 
 The download includes its own copy of Python, so one or two lesser-known engines may flag it; that's a common false positive for Python apps.
