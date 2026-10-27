@@ -288,6 +288,18 @@ def roblox_windows():
     return found
 
 
+WM_SETTEXT = 0x000C
+
+
+def set_window_title(hwnd, title):
+    """Renames a window, giving up after half a second if its program has stopped answering (plain
+    SetWindowTextW waits for it indefinitely, which would freeze AltVault along with a frozen Roblox)."""
+    buf = ctypes.create_unicode_buffer(title)
+    result = ctypes.c_size_t()
+    _user32.SendMessageTimeoutW(hwnd, WM_SETTEXT, 0, ctypes.cast(buf, ctypes.c_void_p).value or 0,
+                                SMTO_ABORTIFHUNG, 500, ctypes.byref(result))
+
+
 def kill_process(pid):
     handle = _kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
     if handle:
@@ -831,7 +843,7 @@ def work_area():
 
 def min_size(scale):
     w, h = work_area()
-    return min(int(900 * scale), w), min(int(580 * scale), h)
+    return min(int(900 * scale), w), min(int(640 * scale), h)
 
 
 def fit_to_screen(geometry):
@@ -1119,14 +1131,29 @@ class TrayIcon:
             _user32.SendMessageTimeoutW(hwnd, WM_CLOSE, 0, 0, SMTO_ABORTIFHUNG, 2000, ctypes.byref(result))
 
 
+DWMWA_WINDOW_CORNER_PREFERENCE, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR = 33, 34, 35, 36
+DWMWCP_ROUND = 2
+
+
+def _colorref(color):
+    r, g, b = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+    return r | g << 8 | b << 16
+
+
 def dark_title_bar(win):
+    """Dark title bar in the app's own colours with a hairline border and rounded corners, so the
+    window frame blends into the app. Windows 11 honours all of it; older Windows ignores what it
+    doesn't know and keeps the plain dark title bar."""
     win.update_idletasks()
-    value = ctypes.c_int(1)
-    try:
-        _dwmapi.DwmSetWindowAttribute(_user32.GetParent(win.winfo_id()), DWMWA_USE_IMMERSIVE_DARK_MODE,
-                                      ctypes.byref(value), ctypes.sizeof(value))
-    except OSError:
-        pass
+    hwnd = _user32.GetParent(win.winfo_id())
+    for attribute, value in ((DWMWA_USE_IMMERSIVE_DARK_MODE, 1), (DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND),
+                             (DWMWA_CAPTION_COLOR, _colorref(C["bg"])), (DWMWA_TEXT_COLOR, _colorref(C["muted"])),
+                             (DWMWA_BORDER_COLOR, _colorref(C["line"]))):
+        v = ctypes.c_int(value)
+        try:
+            _dwmapi.DwmSetWindowAttribute(hwnd, attribute, ctypes.byref(v), ctypes.sizeof(v))
+        except OSError:
+            pass
 
 
 def acquire_instance_lock():
@@ -1419,6 +1446,117 @@ def open_export(data, password):
         raise RobloxError("That export file has no accounts in it.")
     return payload
 
+# >>> keyed (everything between these markers is removed from the keyless build)
+# ---------------------------------------------------------------- access key
+# This build only starts with a key. A key is a digital signature, made with the maker's private
+# key (which is never in this program or its repository), over this PC's code, so it works on one
+# PC and nowhere else, and it can't be changed or invented without the private key. Only the
+# matching public key is here, and it can check a key but not make one. The check happens offline.
+# To turn it off, set LICENSE_REQUIRED to False (see tools/license_tool.py for making keys).
+LICENSE_REQUIRED = True
+LICENSE_PUBLIC_KEY = "4543533120000000c92aba53f172a26fdd6dd7ce55b42d6b76aef5d87a014fa82738a2ceb837442a266171f83048f983868040e5df78d951d685017ea9779356b186c76f30ff9217"   # hex of an ECDSA P-256 public key blob
+LICENSE_FILE = os.path.join(APP_DIR, "license.key")   # in the data folder, so updates keep it
+KEY_PREFIX = "AVK"
+LICENSE_CONTACT = "hecticxww on Discord"   # where to ask for a key (a name, Discord tag or link), shown in the activation window
+
+_bcrypt.BCryptImportKeyPair.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wt.LPCWSTR, ctypes.POINTER(ctypes.c_void_p),
+                                        ctypes.c_char_p, wt.ULONG, wt.ULONG]
+_bcrypt.BCryptImportKeyPair.restype = ctypes.c_long
+_bcrypt.BCryptVerifySignature.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, wt.ULONG,
+                                          ctypes.c_char_p, wt.ULONG, wt.ULONG]
+_bcrypt.BCryptVerifySignature.restype = ctypes.c_long
+
+
+def b32(data):
+    return base64.b32encode(data).decode().rstrip("=")
+
+
+def unb32(text):
+    text = re.sub(r"[^A-Za-z2-7]", "", text).upper()
+    return base64.b32decode(text + "=" * (-len(text) % 8))
+
+
+def group(text, size):
+    return "-".join(text[i:i + size] for i in range(0, len(text), size))
+
+
+def pc_raw():
+    """10 bytes that identify this Windows install: a hash of its machine GUID. They stay the same
+    across AltVault updates and change only if Windows is reinstalled."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography", 0,
+                            winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as k:
+            guid = str(winreg.QueryValueEx(k, "MachineGuid")[0])
+    except OSError:
+        guid = f"unknown-{uuid.getnode()}"
+    return hashlib.sha256(b"AltVault pc|" + guid.encode()).digest()[:10]
+
+
+def pc_code():
+    """The code shown to the user, like ABCD-EFGH-JKLM-NPQR, to send to whoever makes their key."""
+    return group(b32(pc_raw()), 4)
+
+
+def license_message(pc, expires):
+    """What a key signs: this PC's bytes and an expiry date as YYYYMMDD (0 = never expires)."""
+    return b"AltVault licence v1|" + pc + b"|" + struct.pack(">I", expires)
+
+
+def _ecdsa_valid(public_blob, digest, signature):
+    alg, key = ctypes.c_void_p(), ctypes.c_void_p()
+    if _bcrypt.BCryptOpenAlgorithmProvider(ctypes.byref(alg), "ECDSA_P256", None, 0):
+        return False
+    try:
+        if _bcrypt.BCryptImportKeyPair(alg, None, "ECCPUBLICBLOB", ctypes.byref(key), public_blob,
+                                       len(public_blob), 0):
+            return False
+        try:
+            return _bcrypt.BCryptVerifySignature(key, None, digest, len(digest), signature, len(signature), 0) == 0
+        finally:
+            _bcrypt.BCryptDestroyKey(key)
+    finally:
+        _bcrypt.BCryptCloseAlgorithmProvider(alg, 0)
+
+
+def check_key(text, pc=None, public_key=None, today=None):
+    """('ok'|'invalid'|'expired', plain explanation) for a key typed or pasted by the user."""
+    compact = re.sub(r"[^A-Za-z2-7]", "", text or "").upper()
+    if not compact.startswith(KEY_PREFIX):
+        return "invalid", "That doesn't look like an AltVault key."
+    try:
+        payload = unb32(compact[len(KEY_PREFIX):])
+        public_blob = bytes.fromhex(public_key or LICENSE_PUBLIC_KEY)
+    except ValueError:
+        return "invalid", "That key is incomplete. Paste the whole key."
+    if len(payload) != 4 + 64:
+        return "invalid", "That key is incomplete. Paste the whole key."
+    expires, signature = struct.unpack(">I", payload[:4])[0], payload[4:]
+    digest = hashlib.sha256(license_message(pc or pc_raw(), expires)).digest()
+    if not _ecdsa_valid(public_blob, digest, signature):
+        return "invalid", "This key isn't valid for this PC. Keys only work on the PC they were made for."
+    if expires and expires < int(today or time.strftime("%Y%m%d")):
+        return "expired", "This key has expired. Ask for a new one."
+    return "ok", "Key accepted."
+
+
+def license_state():
+    """('ok'|'none'|'invalid'|'expired', explanation) for the key saved on this PC, if any."""
+    if not LICENSE_REQUIRED:
+        return "ok", "No key needed."
+    try:
+        with open(LICENSE_FILE, encoding="utf-8") as f:
+            return check_key(f.read(4096))
+    except OSError:
+        return "none", "No key is saved on this PC yet."
+
+
+def save_key(text):
+    os.makedirs(APP_DIR, exist_ok=True)
+    with open(LICENSE_FILE, "w", encoding="utf-8") as f:
+        f.write(text.strip() + "\n")
+
+# <<< keyed
 
 # ---------------------------------------------------------------- Roblox web API
 
@@ -1908,8 +2046,9 @@ C = {"bg": "#17161b", "panel": "#211f27", "field": "#2b2832", "sel": "#393443", 
      "accent_text": "#b49cff", "green": "#23a55a", "red": "#f23f43", "yellow": "#f0b232",
      "outline": "#5a5466", "thumb": "#4a4555", "check": "#7d7789", "field_hover": "#504a5d",
      "pressed": "#45404f", "disabled": "#1d1b22", "panel_disabled": "#29262f",
+     "line": "#2f2b38", "line_hover": "#4a4458", "glass_light": "#6e6585",
      "danger": "#da373c", "danger_hover": "#bf2f33", "danger_pressed": "#a3282b"}
-FONT = ("Segoe UI", 10)
+FONT = ("Segoe UI", 9)
 NAV_HOVER = C["hover"]
 
 
@@ -1927,17 +2066,25 @@ TICK = ((0.26, 0.52), (0.43, 0.69), (0.75, 0.33))
 CHEVRON = ((0.3, 0.4), (0.5, 0.6), (0.7, 0.4))
 
 
-def shape_image(w, h, radius, fill=None, border=None, border_w=1.0, box=None, check=None, check_w=1.5, mark=TICK):
+def shape_image(w, h, radius, fill=None, border=None, border_w=1.0, box=None, check=None, check_w=1.5, mark=TICK,
+                light=None, light_h=16):
     """A PNG (bytes) of an anti-aliased rounded rectangle, the building block of AltVault's
     buttons, boxes, checkboxes and scrollbars. `box` is (x, y, w, h) inside the image (default:
     all of it); `fill`/`border` are '#rrggbb' or None for see-through; `check` draws a tick in
-    that colour (or another two-stroke `mark`). Like the app icon, it's a signed-distance field, so edges are smooth at any size."""
+    that colour (or another two-stroke `mark`). `light` makes the rim glow toward that colour over the
+    top `light_h` pixels, like the lit edge of glass. Like the app icon, it's a signed-distance field,
+    so edges are smooth at any size."""
     bx, by, bw, bh = box or (0, 0, w, h)
     fill_c, border_c, check_c = (_rgb(c) if c else None for c in (fill, border, check))
+    light_c = _rgb(light) if light else None
+    base_border = border_c
     tick = [(bx + bw * fx, by + bh * fy) for fx, fy in mark]
     out = bytearray()
     for j in range(h):
         y = j + 0.5
+        if light_c and base_border:   # this row's rim colour: bright at the top edge, settling to the base
+            t = max(0.0, 1 - j / light_h) ** 1.5
+            border_c = tuple(b + (c - b) * t for b, c in zip(base_border, light_c))
         for i in range(w):
             x = i + 0.5
             qx = abs(x - bx - bw / 2) - (bw / 2 - radius)
@@ -1969,10 +2116,15 @@ def shape_image(w, h, radius, fill=None, border=None, border_w=1.0, box=None, ch
 
 
 # Colours of the drawn widgets, per state.
-BUTTON = {"normal": C["panel"], "active": C["hover"], "pressed": C["sel"], "disabled": C["disabled"]}
-ACCENT = {"normal": C["accent"], "active": C["accent_hover"], "pressed": C["accent_pressed"], "disabled": C["panel"]}
-DANGER = {"normal": C["danger"], "active": C["danger_hover"], "pressed": C["danger_pressed"], "disabled": C["panel"]}
-PANEL_BUTTON = {"normal": C["field"], "active": C["sel"], "pressed": C["pressed"], "disabled": C["panel_disabled"]}
+# Each state is (fill, hairline). Everyday buttons are outlined and flat; only the main action is filled.
+BUTTON = {"normal": (C["panel"], C["line"]), "active": (C["hover"], C["line_hover"]),
+          "pressed": (C["sel"], C["line_hover"]), "disabled": (C["bg"], C["line"])}
+ACCENT = {"normal": (C["accent"], None), "active": (C["accent_hover"], None),
+          "pressed": (C["accent_pressed"], None), "disabled": (C["panel"], None)}
+DANGER = {"normal": (C["danger"], None), "active": (C["danger_hover"], None),
+          "pressed": (C["danger_pressed"], None), "disabled": (C["panel"], None)}
+PANEL_BUTTON = {"normal": (C["bg"], C["line"]), "active": (C["hover"], C["line_hover"]),
+                "pressed": (C["sel"], C["line_hover"]), "disabled": (C["bg"], C["line"])}
 
 
 def apply_theme(root, scale):
@@ -1987,13 +2139,19 @@ def apply_theme(root, scale):
         images[name] = tk.PhotoImage(master=root, data=base64.b64encode(shape_image(*args, **kw)))
         return images[name]
 
-    r = max(round(6 * scale), 3)
-    side = 2 * r + 4
+    r = max(round(4 * scale), 3)
+    # Tk paints the stretchy middle of these images by tiling it. A thin middle means hundreds of
+    # tiles per repaint (a wide entry took ~0.4 s to draw), so the middle is made generous.
+    side = 2 * (r + 1) + round(48 * scale)
+    small = 2 * r + 2   # the smallest a control may shrink to; the image itself is only bigger to paint faster
+    hair = max(scale, 1.0)   # one-pixel hairline
 
     def button_element(name, colors):
-        imgs = {state: image(f"{name}-{state}", side, side, r, color) for state, color in colors.items()}
+        imgs = {state: image(f"{name}-{state}", side, side, r, fill, line, border_w=hair)
+                for state, (fill, line) in colors.items()}
         s.element_create(f"{name}.bg", "image", imgs["normal"], ("disabled", imgs["disabled"]),
-                         ("pressed", imgs["pressed"]), ("active", imgs["active"]), border=r + 1, sticky="nsew")
+                         ("pressed", imgs["pressed"]), ("active", imgs["active"]), border=r + 1,
+                         padding=(r + 2, 1), width=small, height=small, sticky="nsew")
         return f"{name}.bg"
 
     s.configure(".", background=C["bg"], foreground=C["fg"], fieldbackground=C["field"],
@@ -2005,23 +2163,24 @@ def apply_theme(root, scale):
         element = button_element(name, colors)
         s.layout(style, [("Button.background", {"sticky": "nsew", "children": [(element, {"sticky": "nsew", "children": [
             ("Button.padding", {"sticky": "nsew", "children": [("Button.label", {"sticky": "nsew"})]})]})]})])
-    s.configure("TButton", padding=(13, 5), borderwidth=0, anchor="center")
+    s.configure("TButton", padding=(round(8 * scale), round(5 * scale)), borderwidth=0, anchor="center")
     s.map("TButton", foreground=[("disabled", C["dim"])], background=[("active", C["bg"])])
-    s.configure("Accent.TButton", foreground="white", font=("Segoe UI Semibold", 10))
+    s.configure("Accent.TButton", foreground="white", font=("Segoe UI Semibold", 9))
     s.map("Accent.TButton", foreground=[("disabled", C["dim"])])
-    s.configure("Danger.TButton", foreground="white", font=("Segoe UI Semibold", 10))
+    s.configure("Danger.TButton", foreground="white", font=("Segoe UI Semibold", 9))
     s.configure("Panel.TButton", background=C["panel"])
     s.map("Panel.TButton", background=[("active", C["panel"])])
 
     # Text boxes and drop-downs: a rounded field whose rim lights up on hover and on focus.
-    field = {"normal": image("field", side, side, r, C["field"]),
-             "hover": image("field-hover", side, side, r, C["field"], C["field_hover"]),
-             "focus": image("field-focus", side, side, r, C["field"], C["accent"], border_w=max(1.5 * scale, 1.2))}
+    field = {"normal": image("field", side, side, r, C["field"], C["line"], border_w=hair),
+             "hover": image("field-hover", side, side, r, C["field"], C["line_hover"], border_w=hair),
+             "focus": image("field-focus", side, side, r, C["field"], C["accent"], border_w=max(1.4 * scale, 1.2))}
     s.element_create("AVField.field", "image", field["normal"], ("focus", field["focus"]),
-                     ("hover", field["hover"]), border=r + 1, sticky="nsew")
+                     ("hover", field["hover"]), border=r + 1, padding=(r + 2, 1), width=small, height=small,
+                     sticky="nsew")
     s.layout("TEntry", [("AVField.field", {"sticky": "nsew", "children": [
         ("Entry.padding", {"sticky": "nsew", "children": [("Entry.textarea", {"sticky": "nsew"})]})]})])
-    s.configure("TEntry", padding=(8, 6), borderwidth=0)
+    s.configure("TEntry", padding=(round(4 * scale), round(5 * scale)), borderwidth=0)
     s.layout("TCombobox", [("AVField.field", {"sticky": "nsew", "children": [
         ("AVCombo.arrow", {"side": "right", "sticky": ""}),
         ("Combobox.padding", {"sticky": "nsew", "children": [("Combobox.textarea", {"sticky": "nsew"})]})]})])
@@ -2029,7 +2188,7 @@ def apply_theme(root, scale):
     chevrons = [image(f"chevron{i}", aw, aw, 0, None, check=color, check_w=1.6 * scale, mark=CHEVRON,
                       box=(aw * 0.22, aw * 0.22, aw * 0.56, aw * 0.56)) for i, color in enumerate((C["muted"], C["fg"]))]
     s.element_create("AVCombo.arrow", "image", chevrons[0], ("hover", chevrons[1]), ("focus", chevrons[1]))
-    s.configure("TCombobox", padding=(8, 5), borderwidth=0, background=C["field"], arrowcolor=C["muted"],
+    s.configure("TCombobox", padding=(round(3 * scale), round(2 * scale)), borderwidth=0, background=C["field"], arrowcolor=C["muted"],
                 arrowsize=int(12 * scale))
     s.map("TCombobox", fieldbackground=[("readonly", C["field"])], background=[("active", C["field"])],
           arrowcolor=[("active", C["fg"])], selectbackground=[("readonly", C["field"])],
@@ -2041,9 +2200,9 @@ def apply_theme(root, scale):
     root.option_add("*TCombobox*Listbox.font", FONT)
 
     # Checkboxes: a rounded square that fills with the accent colour and a tick when on.
-    box = max(round(17 * scale), 12)
+    box = max(round(15 * scale), 12)
     gap = round(8 * scale)
-    br = max(round(4 * scale), 2)
+    br = max(round(3 * scale), 2)
     rim = max(1.4 * scale, 1.1)
     kw = {"box": (0.5, 0.5, box - 1, box - 1)}
     checks = {"off": image("check-off", box + gap, box, br, None, C["check"], border_w=rim, **kw),
@@ -2060,13 +2219,13 @@ def apply_theme(root, scale):
     s.map("TCheckbutton", background=[("active", C["bg"])], foreground=[("active", "#ffffff")])
 
     # Slim scrollbars: a rounded thumb, no arrows.
-    tw, th = max(round(10 * scale), 8), max(round(24 * scale), 16)
+    tw, th = max(round(10 * scale), 8), max(round(56 * scale), 40)
     inset = max(round(2.5 * scale), 2)
     thumb_box = (inset, inset, tw - 2 * inset, th - 2 * inset)
     thumb = image("thumb", tw, th, (tw - 2 * inset) / 2, C["thumb"], box=thumb_box)
     thumb_hover = image("thumb-hover", tw, th, (tw - 2 * inset) / 2, C["dim"], box=thumb_box)
     s.element_create("AVScroll.thumb", "image", thumb, ("active", thumb_hover), ("pressed", thumb_hover),
-                     border=(0, tw // 2 + 1), sticky="nsew")
+                     border=(0, tw // 2 + 1), width=tw, height=tw, sticky="nsew")
     s.layout("Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
         ("AVScroll.thumb", {"expand": "1", "sticky": "nsew"})]})])
     s.configure("Vertical.TScrollbar", troughcolor=C["panel"], background=C["panel"], borderwidth=0,
@@ -2091,9 +2250,9 @@ def apply_theme(root, scale):
     s.map("Treeview.Heading", background=[("active", C["panel"])], foreground=[("active", C["fg"])])
     s.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
     s.configure("Muted.TLabel", foreground=C["muted"])
-    s.configure("Small.TLabel", foreground=C["muted"], font=("Segoe UI", 9))
-    s.configure("Title.TLabel", font=("Segoe UI Semibold", 16))
-    s.configure("Section.TLabel", foreground=C["muted"], font=("Segoe UI Semibold", 10))
+    s.configure("Small.TLabel", foreground=C["muted"], font=("Segoe UI", 8))
+    s.configure("Title.TLabel", font=("Segoe UI Semibold", 15))
+    s.configure("Section.TLabel", foreground=C["muted"], font=("Segoe UI Semibold", 9))
     s.configure("Error.TLabel", foreground=C["red"])
     s.configure("Hint.TLabel", background=C["field"], foreground=C["muted"])
     s.configure("Success.TLabel", foreground=C["green"])
@@ -2101,6 +2260,13 @@ def apply_theme(root, scale):
     s.configure("PanelMuted.TLabel", background=C["panel"], foreground=C["muted"])
     s.configure("PanelSmall.TLabel", background=C["panel"], foreground=C["muted"], font=("Segoe UI", 9))
     s.configure("Card.TFrame", background=C["panel"])
+    # Glass cards: rounded, a hair of tint, and a rim that glows along the top edge. The fill is flat,
+    # so text labels drawn on a card (with the card's colour behind them) sit cleanly on it.
+    gr = max(round(7 * scale), 4)
+    glass = image("glass", 2 * (gr + 1) + round(56 * scale), 2 * (gr + 1) + round(56 * scale), gr, C["panel"],
+                  C["line"], border_w=hair, light=C["glass_light"], light_h=round(18 * scale))
+    s.element_create("AVGlass.bg", "image", glass, border=gr + 1, width=2 * gr, height=2 * gr, sticky="nsew")
+    s.layout("Glass.TFrame", [("AVGlass.bg", {"sticky": "nsew"})])
 
 
 def add_placeholder(entry, var, text):
@@ -2641,7 +2807,7 @@ class LivePage(ttk.Frame):
     only then; nothing here runs while AltVault is minimised, in the tray, or on another page."""
 
     SAMPLE_MS = 3000
-    GAP = 8
+    GAP = 6
     UNITS = (("min", "eggs/min"), ("hour", "eggs/hour"), ("sec", "sec/egg"))
 
     def __init__(self, app, parent):
@@ -2656,7 +2822,7 @@ class LivePage(ttk.Frame):
         self.ram_used = None   # share of the PC's RAM in use, for the bar
         s = app.scale
         # The stats panel runs the page's full height, beside the title, toolbar and tiles.
-        self.panel = tk.Frame(self, bg=C["panel"], width=int(240 * s))
+        self.panel = ttk.Frame(self, style="Glass.TFrame", width=int(240 * s))
         self.panel.pack(side="right", fill="y", padx=(int(14 * s), 0))
         self.panel.pack_propagate(False)
         left = ttk.Frame(self)
@@ -2702,14 +2868,14 @@ class LivePage(ttk.Frame):
         def label(parent, text="", fg=C["fg"], font=FONT, **kw):
             return tk.Label(parent, text=text, bg=P, fg=fg, font=font, **kw)
 
-        def section(title):
-            row = tk.Frame(self.panel, bg=P)
-            row.pack(fill="x", padx=pad, pady=(int(11 * s), int(1 * s)))
+        def section(title, parent=None):
+            row = tk.Frame(parent or self.panel, bg=P)
+            row.pack(fill="x", padx=pad, pady=(int(9 * s), 0))
             label(row, title, font=("Segoe UI Semibold", 9)).pack(side="left")
             return row
 
-        def stat(key, text, dot=None):
-            row = tk.Frame(self.panel, bg=P)
+        def stat(key, text, dot=None, parent=None):
+            row = tk.Frame(parent or self.panel, bg=P)
             row.pack(fill="x", padx=pad, pady=(int(1 * s), 0))
             if dot:
                 label(row, "●", fg=dot, font=small).pack(side="left", padx=(0, int(6 * s)))
@@ -2725,17 +2891,18 @@ class LivePage(ttk.Frame):
         self.big_of = label(top, " / 0", fg=C["muted"], font=("Segoe UI Semibold", 14))
         self.big_of.pack(side="left", anchor="s", pady=(0, int(5 * s)))
         label(self.panel, "windows in a game", fg=C["muted"], font=small).pack(anchor="w", padx=pad)
-        pill = tk.Frame(self.panel, bg=C["field"])
+        pill = tk.Frame(self.panel, bg=C["panel"], highlightthickness=1, highlightbackground=C["line_hover"])
         pill.pack(anchor="w", padx=pad, pady=(int(8 * s), 0))
-        self.pill_dot = tk.Label(pill, text="●", bg=C["field"], fg=C["muted"], font=small)
+        self.pill_dot = tk.Label(pill, text="●", bg=C["panel"], fg=C["muted"], font=small)
         self.pill_dot.pack(side="left", padx=(int(8 * s), int(4 * s)), pady=int(3 * s))
-        self.pill_text = tk.Label(pill, text="", bg=C["field"], fg=C["fg"], font=small)
+        self.pill_text = tk.Label(pill, text="", bg=C["panel"], fg=C["fg"], font=small)
         self.pill_text.pack(side="left", padx=(0, int(10 * s)))
 
         section("Windows")
         stat("ingame", "In a game", C["green"])
-        stat("loading", "Loading", C["yellow"])
+        stat("loading", "Joining", C["yellow"])
         stat("hung", "Not responding", C["red"])
+        stat("other", "Not from AltVault", C["dim"])
 
         section("This PC")
         stat("cpu", "Roblox CPU")
@@ -2751,7 +2918,9 @@ class LivePage(ttk.Frame):
         value, unit = saved.get("value"), saved.get("unit")
         self.unit = unit if unit in dict(self.UNITS) else "min"
         self.eggs_var = tk.StringVar(value=f"{value:g}" if isinstance(value, (int, float)) and value > 0 else "")
-        ttk.Entry(self.panel, textvariable=self.eggs_var).pack(fill="x", padx=pad, pady=(int(2 * s), 0))
+        eggs = ttk.Entry(self.panel, textvariable=self.eggs_var)
+        eggs.pack(fill="x", padx=pad, pady=(int(2 * s), 0))
+        add_placeholder(eggs, self.eggs_var, "e.g. 58  (one alt's hatch speed)")
         self.eggs_var.trace_add("write", lambda *_: self.eggs_changed())
         seg = tk.Frame(self.panel, bg=C["field"])
         seg.pack(fill="x", padx=pad, pady=(int(6 * s), int(2 * s)))
@@ -2764,21 +2933,58 @@ class LivePage(ttk.Frame):
         stat("per_min", "Per minute")
         stat("per_hour", "Per hour")
         stat("per_day", "Per day")
+        stat("hatched", "Hatched, 24 h (est.)")
         self.values["per_hour"].config(fg=C["accent_text"])
-        self.hatch_hint = label(self.panel, "", fg=C["muted"], font=small, justify="left", wraplength=int(205 * s))
+        self.hint_box = tk.Frame(self.panel, bg=P)   # holds the hint so it keeps its place when hidden
+        self.hint_box.pack(fill="x")
+        self.hint_shown = True
+        self.hatch_hint = label(self.hint_box, "", fg=C["muted"], font=small, justify="left", wraplength=int(205 * s))
         self.hatch_hint.pack(anchor="w", padx=pad, pady=(int(3 * s), 0))
         self.paint_units()
 
-        head = section("Last 24 hours")
+        # Lowest priority: dropped when the window is too short to show it without cutting off.
+        self.day_box = tk.Frame(self.panel, bg=P)
+        self.day_shown = False
+        head = section("Last 24 hours", self.day_box)
         link = label(head, "Open Stats  ›", fg=C["accent_text"], font=small, cursor="hand2")
         link.pack(side="right")
         link.bind("<Button-1>", lambda _e: self.app.show_page("stats"))
         link.bind("<Enter>", lambda _e: link.config(fg=C["fg"], font=small + ("underline",)))
         link.bind("<Leave>", lambda _e: link.config(fg=C["accent_text"], font=small))
-        stat("day_ingame", "In a game", C["green"])
-        stat("day_launch", "Launches that worked", C["accent"])
-        stat("day_pings", "Anti-AFK pings", C["accent_text"])
-        stat("day_closed", "Closed outside AltVault", C["red"])
+        stat("day_ingame", "In a game", C["green"], self.day_box)
+        stat("day_launch", "Launches that worked", C["accent"], self.day_box)
+        stat("day_pings", "Anti-AFK pings", C["accent_text"], self.day_box)
+        stat("day_closed", "Closed outside AltVault", C["red"], self.day_box)
+        self.panel.bind("<Configure>", lambda _e: self.fit_panel())
+
+    def fit_panel(self):
+        """Keeps the stats column from being cut off: the 24-hour block is dropped first if the window
+        is too short, then the explanatory hint under the hatch totals."""
+        wrap = max(self.panel.winfo_width() - 2 * int(16 * self.app.scale), 80)
+        self.hatch_hint.config(wraplength=wrap)
+        self.panel.update_idletasks()
+        optional = (self.day_box, self.hint_box)
+        # Where the last always-shown row really ends on screen (no guessing at padding).
+        fixed_bottom = max(w.winfo_y() + w.winfo_height() for w in self.panel.winfo_children()
+                           if w not in optional and w.winfo_manager())
+        day_h = self.day_box.winfo_reqheight() + int(10 * self.app.scale)
+        hint_h = self.hatch_hint.winfo_reqheight() + int(8 * self.app.scale)
+        room = self.panel.winfo_height() - fixed_bottom - int(8 * self.app.scale)
+        show_day = room >= day_h
+        room -= day_h if show_day else 0
+        show_hint = room >= hint_h
+        if (show_day, show_hint) != (self.day_shown, self.hint_shown):
+            self.after_idle(self.fit_panel)   # layout moved; measure again until it settles
+        if show_day != self.day_shown:
+            self.day_shown = show_day
+            self.day_box.pack(fill="x") if show_day else self.day_box.pack_forget()
+        if show_hint != self.hint_shown:
+            self.hint_shown = show_hint
+            if show_hint:
+                self.hatch_hint.pack(anchor="w", padx=int(16 * self.app.scale), pady=(int(3 * self.app.scale), 0))
+            else:   # an emptied frame keeps its old height unless told otherwise
+                self.hatch_hint.pack_forget()
+                self.hint_box.config(height=1)
 
     def set_unit(self, unit):
         self.unit = unit
@@ -2812,22 +3018,34 @@ class LivePage(ttk.Frame):
         self.update_hatch()
 
     def update_hatch(self):
+        before = str(self.hatch_hint.cget("text"))
+        self._update_hatch()
+        if str(self.hatch_hint.cget("text")) != before:   # the hint's height changed: refit the column
+            self.after_idle(self.fit_panel)
+
+    def _update_hatch(self):
         rate, alts = self.eggs_rate(), self.count("green")
         if rate is None:
             for key in ("per_min", "per_hour", "per_day"):
-                set_text(self.values[key], "—")
-            set_text(self.hatch_hint, "Type one alt's hatch speed, in the unit picked below the box.")
+                set_value(self.values[key], "—")
+            set_text(self.hatch_hint, "Type how fast ONE alt hatches (you read it in the game), then pick its "
+                                      "unit. AltVault multiplies it by the accounts in a game.")
             return
         for key, total in zip(("per_min", "per_hour", "per_day"), hatch_totals(rate, alts)):
-            set_text(self.values[key], short_number(total))
-        set_text(self.hatch_hint, f"{alts} alt{'s' if alts != 1 else ''} in a game · "
-                                    f"{short_number(rate * 60)} per hour each")
+            set_value(self.values[key], short_number(total))
+        if alts:
+            set_text(self.hatch_hint, f"{alts} alt{'s' if alts != 1 else ''} in a game · "
+                                      f"{short_number(rate * 60)} per hour each")
+        else:
+            set_text(self.hatch_hint, "No account is in a game yet, so the totals are 0. They count up "
+                                      "as accounts join.")
 
     def count(self, color):
         return sum(1 for t in self.tiles.values() if t.color == color)
 
     def update_headline(self):
         n, ingame, loading, hung = len(self.tiles), self.count("green"), self.count("yellow"), self.count("red")
+        other = self.count("grey")
         set_text(self.big, str(ingame))
         set_text(self.big_of, f" / {n}")
         if not n:
@@ -2835,13 +3053,15 @@ class LivePage(ttk.Frame):
         elif hung:
             dot, text = C["red"], f"{hung} not responding"
         elif loading:
-            dot, text = C["yellow"], f"{loading} still loading"
+            dot, text = C["yellow"], f"{loading} still joining"
+        elif other:
+            dot, text = C["muted"], f"{other} not opened by AltVault"
         else:
             dot, text = C["green"], "Every window is in a game"
         set_text(self.pill_dot, fg=dot)
         set_text(self.pill_text, text)
-        for key, value in (("ingame", ingame), ("loading", loading), ("hung", hung)):
-            set_text(self.values[key], str(value))
+        for key, value in (("ingame", ingame), ("loading", loading), ("hung", hung), ("other", other)):
+            set_value(self.values[key], str(value))
         set_text(self.summary, f"{n} window{'s' if n != 1 else ''} · {ingame} in a game · click a tile to "
                                  "bring it to the front" if n else "Roblox windows show up here while they're open")
 
@@ -2868,10 +3088,10 @@ class LivePage(ttk.Frame):
         usage = {pid: process_usage(pid) for pid in pids}
         cpu = self.cpu.percent({pid: u[0] for pid, u in usage.items() if u and u[0] is not None})
         rams = [u[1] if u else None for u in usage.values()]
-        set_text(self.values["cpu"], "…" if cpu is None and pids else f"{cpu or 0:.0f}%")
-        set_text(self.values["ram"], "—" if None in rams else f"{sum(rams) / 2 ** 30:.1f} GB")
+        set_value(self.values["cpu"], "…" if cpu is None and pids else f"{cpu or 0:.0f}%")
+        set_value(self.values["ram"], "—" if None in rams else f"{sum(rams) / 2 ** 30:.1f} GB")
         free, total = memory_status()
-        set_text(self.values["free"], f"{free / 2 ** 30:.1f} of {total / 2 ** 30:.0f} GB")
+        set_value(self.values["free"], f"{free / 2 ** 30:.1f} of {total / 2 ** 30:.0f} GB")
         self.ram_used = 1 - free / total if total else None
         self.draw_ram_bar()
         app = self.app
@@ -2879,10 +3099,11 @@ class LivePage(ttk.Frame):
         day = lambda f: h.total(f, 24)
         ingame, ok, failed = percent_of(day("ingame"), day("open")), day("launch_ok"), day("launch_fail")
         launch = percent_of(ok, ok + failed)
-        set_text(self.values["day_ingame"], "—" if ingame is None else f"{ingame:.1f}%")
-        set_text(self.values["day_launch"], "—" if launch is None else f"{launch:.1f}%")
-        set_text(self.values["day_pings"], short_number(day("pings")))
-        set_text(self.values["day_closed"], f"{day('closed'):g}")
+        set_value(self.values["day_ingame"], "—" if ingame is None else f"{ingame:.1f}%")
+        set_value(self.values["day_launch"], "—" if launch is None else f"{launch:.1f}%")
+        set_value(self.values["day_pings"], short_number(day("pings")))
+        set_value(self.values["day_closed"], f"{day('closed'):g}")
+        set_value(self.values["hatched"], short_number(day("eggs")))
         self.sample_job = self.after(1000 if cpu is None and pids else self.SAMPLE_MS, self.sample)
 
     # ------------------------------------------------------------ tiles
@@ -2890,6 +3111,7 @@ class LivePage(ttk.Frame):
         self.shown = True
         self.sync(roblox_windows())
         self.resume()
+        self.after_idle(self.fit_panel)
 
     def on_hide(self):
         self.shown = False
@@ -2954,10 +3176,7 @@ class LivePage(ttk.Frame):
         tiles = list(self.tiles.values())
         for i, tile in enumerate(tiles):
             row, col = divmod(i, cols)
-            in_row = min(cols, len(tiles) - row * cols)   # a short last row is centred
-            x0 = (width - in_row * tile_w - (in_row - 1) * gap) // 2
-            y0 = (height - rows * tile_h - (rows - 1) * gap) // 2
-            tile.place(x=x0 + col * (tile_w + gap), y=max(y0, 0) + row * (tile_h + gap), width=tile_w, height=tile_h)
+            tile.place(x=col * (tile_w + gap), y=row * (tile_h + gap), width=tile_w, height=tile_h)   # from the top left
         self.after_idle(lambda: self.place_thumbs(settle=True))
 
     def place_thumbs(self, settle=False):
@@ -3005,16 +3224,19 @@ class LiveTile(tk.Frame):
     """One Roblox window on the Live page: a header (status, name, show, close) over the body that
     its thumbnail is drawn on. Clicking anywhere on the tile brings that window to the front."""
 
-    COLORS = {"green": C["green"], "yellow": C["yellow"], "red": C["red"]}
+    COLORS = {"green": C["green"], "yellow": C["yellow"], "red": C["red"], "grey": C["dim"]}
 
     @staticmethod
     def header_px(scale):
-        return int(28 * scale)
+        return int(24 * scale)
 
     def __init__(self, page, hwnd, pid):
-        super().__init__(page.area, bg=C["panel"], cursor="hand2")
+        super().__init__(page.area, bg=C["panel"], cursor="hand2", highlightthickness=1,
+                         highlightbackground=C["line"], highlightcolor=C["line"])
         self.hwnd, self.pid, self.color = hwnd, pid, None
         s = page.app.scale
+        self.config(highlightbackground=C["accent"])   # a new window glows once, then settles
+        self.after(30, lambda: fade(self, "highlightbackground", C["line"], steps=18, ms=24))
         head = tk.Frame(self, bg=C["panel"], height=self.header_px(s))
         head.pack(fill="x")
         head.pack_propagate(False)
@@ -3025,18 +3247,18 @@ class LiveTile(tk.Frame):
             btn.bind("<Enter>", lambda _e, b=btn: b.config(fg=C["fg"], bg=C["sel"]))
             btn.bind("<Leave>", lambda _e, b=btn: b.config(fg=C["muted"], bg=C["panel"]))
             btn.bind("<Button-1>", lambda _e, a=action: a(hwnd) or "break")
-            btn.bind("<Enter>", lambda _e: self.config(bg=C["outline"]), add="+")
+            btn.bind("<Enter>", lambda _e: fade(self, "highlightbackground", C["line_hover"]), add="+")
             btn.bind("<Leave>", self.leave, add="+")
         self.dot = tk.Label(head, text="●", font=("Segoe UI", 9), bg=C["panel"], fg=C["muted"])
         self.dot.pack(side="left", padx=(int(8 * s), 0))
         self.label = tk.Label(head, text="", font=("Segoe UI Semibold", 9), bg=C["panel"], fg=C["fg"], anchor="w")
         self.label.pack(side="left", fill="x", expand=True, padx=(int(4 * s), 0))
         self.body = tk.Frame(self, bg=C["deep"])
-        self.body.pack(fill="both", expand=True, padx=int(3 * s), pady=(0, int(3 * s)))
+        self.body.pack(fill="both", expand=True, padx=int(2 * s), pady=(0, int(2 * s)))
         self.note = tk.Label(self.body, text="", bg=C["deep"], fg=C["muted"], font=FONT)
         for widget in (self, head, self.dot, self.label, self.body, self.note):
             widget.bind("<Button-1>", lambda _e: page.show_window(hwnd))
-            widget.bind("<Enter>", lambda _e: self.config(bg=C["outline"]), add="+")
+            widget.bind("<Enter>", lambda _e: fade(self, "highlightbackground", C["line_hover"]), add="+")
             widget.bind("<Leave>", self.leave, add="+")
 
     def leave(self, _event):
@@ -3045,7 +3267,7 @@ class LiveTile(tk.Frame):
         while under is not None and under is not self:
             under = under.master
         if under is None:
-            self.config(bg=C["panel"])
+            fade(self, "highlightbackground", C["line"])
 
     def update_state(self, color, name):
         if color != self.color:
@@ -3184,6 +3406,231 @@ def blend(c1, c2, t):
     return "#%02x%02x%02x" % tuple(round(x + (y - x) * t) for x, y in zip(a, b))
 
 
+FADE_STEPS, FADE_MS = 6, 18   # a hover fade is about a tenth of a second
+
+
+def fade(widget, option, target, steps=FADE_STEPS, ms=FADE_MS):
+    """Eases a widget's colour option to `target` over a few frames, instead of snapping. Only runs
+    while a change is happening (and a new change takes over a running one), so it costs nothing at rest."""
+    jobs = widget.__dict__.setdefault("_fade_jobs", {})
+    widget.__dict__.setdefault("_fade_final", {})[option] = target
+    if option in jobs:
+        widget.after_cancel(jobs.pop(option))
+    start = str(widget.cget(option))
+    if not start.startswith("#"):
+        r, g, b = (v >> 8 for v in widget.winfo_rgb(start))
+        start = "#%02x%02x%02x" % (r, g, b)
+    if start == target:
+        return
+
+    def step(i):
+        jobs.pop(option, None)
+        try:
+            widget.config(**{option: target if i == steps else blend(start, target, i / steps)})
+        except tk.TclError:   # the widget was destroyed mid-fade
+            return
+        if i < steps:
+            jobs[option] = widget.after(ms, step, i + 1)
+    step(1)
+
+
+def flash(widget, color=None, option="fg", steps=14):
+    """A brief highlight on something that just changed, easing back to its resting colour."""
+    rest = widget.__dict__.get("_fade_final", {}).get(option) or str(widget.cget(option))
+    if not rest.startswith("#"):
+        r, g, b = (v >> 8 for v in widget.winfo_rgb(rest))
+        rest = "#%02x%02x%02x" % (r, g, b)
+    color = color or ("#ffffff" if rest == C["accent_text"] else C["accent_text"])
+    try:
+        widget.config(**{option: color})
+    except tk.TclError:
+        return
+    fade(widget, option, rest, steps=steps, ms=22)
+    widget.__dict__["_fade_final"][option] = rest
+
+
+def set_value(widget, text):
+    """set_text for a number or status that should catch the eye when it changes (not when it first appears)."""
+    old = str(widget.cget("text"))
+    if old != str(text):
+        widget.config(text=text)
+        if old not in ("", "—", "…"):
+            flash(widget)
+
+
+class FlashLabel(tk.Label):
+    """A label that blinks when its text changes: the status line, so feedback never goes unnoticed."""
+
+    def configure(self, cnf=None, **kw):
+        new = kw.get("text")
+        changed = new is not None and new != "" and str(new) != str(self.cget("text"))
+        result = super().configure(cnf, **kw)
+        if changed:
+            flash(self, C["fg"], steps=16)
+        return result
+    config = configure
+
+
+class Rail(tk.Canvas):
+    """The sidebar, drawn as one canvas so its highlight can move like liquid: the selected page's
+    pill glides to the next item when you change page, a softer hover pill follows the mouse, and
+    icons and labels blend colour as a pill passes under them. Motion only runs while it's happening."""
+
+    ITEM_H, GLIDE_MS, HOVER_MS = 54, 230, 140
+    BOTTOM = ("settings",)
+
+    def __init__(self, parent, app, items, logo, scale):
+        s = self.s = scale
+        self.w = int(68 * s)   # wide enough for the longest label (Accounts) with room either side
+        super().__init__(parent, bg=C["panel"], width=self.w, highlightthickness=0, bd=0)
+        self.app, self.keys, self.logo = app, [k for k, _, _ in items], logo
+        self.h, self.pad = int(self.ITEM_H * s), int(7 * s)
+        pw, ph, r = self.w - 2 * self.pad, self.h - int(4 * s), int(8 * s)
+        mk = lambda fill, w, h, rad: tk.PhotoImage(master=parent, data=base64.b64encode(shape_image(w, h, rad, fill)))
+        rim = dict(border=C["line_hover"], border_w=max(s, 1.0), light=C["glass_light"], light_h=int(14 * s))
+        mk2 = lambda fill, w, h, rad, **kw: tk.PhotoImage(
+            master=parent, data=base64.b64encode(shape_image(w, h, rad, fill, **kw)))
+        self.img_hover = mk2(C["hover"], pw, ph, r, border=C["line"], border_w=max(s, 1.0), light=C["line_hover"],
+                             light_h=int(12 * s))
+        self.img_sel = mk2(C["sel"], pw, ph, r, **rim)
+        self.backdrop_id = self.create_image(0, 0, anchor="nw")   # the gradient, redrawn when the height changes
+        self.backdrop, self.backdrop_h = None, 0
+        self.edge_id = self.create_line(self.w - 1, 0, self.w - 1, 4000, fill=C["line"])
+        self.bar_h, bar_w = int(20 * s), max(int(3 * s), 3)
+        self.img_bar = mk(C["accent"], bar_w, self.bar_h, bar_w / 2)
+        self.create_image(self.w // 2, int(26 * s), image=logo)
+        self.hover_id = self.create_image(self.pad, 0, image=self.img_hover, anchor="nw", state="hidden")
+        self.sel_id = self.create_image(self.pad, 0, image=self.img_sel, anchor="nw", state="hidden")
+        self.bar_id = self.create_image(0, 0, image=self.img_bar, anchor="nw", state="hidden")
+        icons = app.icon_font
+        self.icon = {k: self.create_text(self.w // 2, 0, text=g, font=(icons, 13), fill=C["muted"]) for k, g, _ in items}
+        self.label = {k: self.create_text(self.w // 2, 0, text=t, font=("Segoe UI", 8), fill=C["muted"]) for k, _, t in items}
+        self.mark = self.create_text(self.w // 2, 0, text="HecticWins", font=("Segoe UI Semibold", 7), fill=C["dim"])
+        self.pos, self.sel_key, self.sel_y, self.hover_key, self.hover_y = {}, None, None, None, None
+        self.jobs, self.shades = {}, {}
+        self.tag_bind(self.mark, "<Enter>", lambda _e: self.itemconfigure(self.mark, fill=C["accent_text"]))
+        self.tag_bind(self.mark, "<Leave>", lambda _e: self.itemconfigure(self.mark, fill=C["dim"]))
+        self.tag_bind(self.mark, "<Button-1>", lambda _e: webbrowser.open(GITHUB_URL))
+        self.bind("<Configure>", lambda _e: self.layout())
+        self.bind("<Motion>", self.motion)
+        self.bind("<Leave>", lambda _e: self.leave())
+        self.bind("<Button-1>", self.click)
+
+    def layout(self):
+        """Items run down from the logo; Settings sits above the maker's mark at the bottom."""
+        height, s = self.winfo_height(), self.s
+        if height != self.backdrop_h and height > 1:
+            self.backdrop_h = height
+            rows = bytearray()
+            for y in range(height):   # a faint violet glow at the top, settling into the panel colour, darker at the foot
+                f = y / height
+                row = blend(C["panel"], "#2e2838", max(0.0, 1 - f / 0.45) * 0.9) if f < 0.45 else \
+                    blend(C["panel"], C["bg"], (f - 0.6) / 0.4 * 0.8) if f > 0.6 else C["panel"]
+                rows += bytes((*_rgb(row), 255)) * self.w
+            self.backdrop = tk.PhotoImage(master=self, data=base64.b64encode(_png(self.w, bytes(rows), height)))
+            self.itemconfigure(self.backdrop_id, image=self.backdrop)
+            self.tag_lower(self.backdrop_id)
+        top = int(54 * s)
+        for i, key in enumerate(k for k in self.keys if k not in self.BOTTOM):
+            self.pos[key] = top + i * self.h
+        for key in self.keys:
+            if key in self.BOTTOM:
+                self.pos[key] = max(height - int(30 * s) - self.h, top)
+        for key, y in self.pos.items():
+            self.coords(self.icon[key], self.w // 2, y + int(0.36 * self.h))
+            self.coords(self.label[key], self.w // 2, y + int(0.74 * self.h))
+        self.coords(self.mark, self.w // 2, height - int(14 * s))
+        if self.sel_key in self.pos:
+            self.sel_y = self.pos[self.sel_key]
+            self.apply()
+
+    def select(self, key):
+        self.sel_key = key
+        if key not in self.pos:   # not laid out yet; layout() places it
+            return
+        if self.sel_y is None or not self.winfo_ismapped():
+            job = self.jobs.pop("sel_y", None)   # a glide still running would drag the pill back
+            if job:
+                self.after_cancel(job)
+            self.sel_y = self.pos[key]
+            self.apply()
+        else:
+            self.glide("sel_y", self.pos[key], self.GLIDE_MS)
+
+    def glide(self, attr, target, ms):
+        """Eases self.<attr> to `target` (ease-out), redrawing each frame; a new glide takes over."""
+        job = self.jobs.pop(attr, None)
+        if job:
+            self.after_cancel(job)
+        start, t0 = getattr(self, attr), time.perf_counter()
+
+        def step():
+            p = min((time.perf_counter() - t0) * 1000 / ms, 1.0)
+            setattr(self, attr, start + (target - start) * (1 - (1 - p) ** 3))
+            self.apply()
+            self.jobs[attr] = self.after(15, step) if p < 1 else None
+            if p >= 1:
+                self.jobs.pop(attr, None)
+        step()
+
+    def apply(self):
+        s, pad = self.s, self.pad
+        if self.sel_y is not None:
+            self.coords(self.sel_id, pad, self.sel_y + int(2 * s))
+            self.coords(self.bar_id, 0, self.sel_y + (self.h - self.bar_h) // 2)
+            self.itemconfigure(self.sel_id, state="normal")
+            self.itemconfigure(self.bar_id, state="normal")
+        if self.hover_y is not None:
+            self.coords(self.hover_id, pad, self.hover_y + int(2 * s))
+            self.itemconfigure(self.hover_id, state="normal")
+        else:
+            self.itemconfigure(self.hover_id, state="hidden")
+        for key, y in self.pos.items():
+            lit = 0.0 if self.sel_y is None else max(0.0, 1 - abs(y - self.sel_y) / self.h)
+            near = 0.0 if self.hover_y is None else max(0.0, 1 - abs(y - self.hover_y) / self.h) * 0.85
+            rest = blend(C["muted"], C["fg"], near)
+            shades = {self.icon[key]: blend(rest, C["accent_text"], lit),
+                      self.label[key]: blend(rest, C["fg"], lit)}
+            for item, colour in shades.items():
+                if self.shades.get(item) != colour:
+                    self.shades[item] = colour
+                    self.itemconfigure(item, fill=colour)
+
+    def key_at(self, x, y):
+        return next((k for k, top in self.pos.items() if top <= y < top + self.h), None)
+
+    def motion(self, event):
+        key = self.key_at(event.x, event.y)
+        if key is None:
+            return self.leave()
+        self.configure(cursor="hand2")
+        if key == self.hover_key:
+            return
+        first = self.hover_key is None
+        self.hover_key = key
+        if first:   # appears in place, then follows the mouse
+            self.hover_y = self.pos[key]
+            self.apply()
+        else:
+            self.glide("hover_y", self.pos[key], self.HOVER_MS)
+
+    def leave(self):
+        self.configure(cursor="")
+        job = self.jobs.pop("hover_y", None)
+        if job:
+            self.after_cancel(job)
+        self.hover_key = self.hover_y = None
+        self.apply()
+
+    def click(self, event):
+        key = self.key_at(event.x, event.y)
+        if key:
+            self.app.show_page(key)
+
+
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
 def page_header(page, title, subtitle):
     """A page's title over a one-line explanation. Returns the header frame (for extra controls
     on the right) and the subtitle label."""
@@ -3222,24 +3669,38 @@ class Segmented(tk.Frame):
     def paint(self, hover=None):
         for key, lbl in self.labels.items():
             on = key == self.value
-            lbl.config(bg=C["sel"] if on else NAV_HOVER if key == hover else C["field"],
-                       fg=C["fg"] if on or key == hover else C["muted"])
+            fade(lbl, "bg", C["sel"] if on else NAV_HOVER if key == hover else C["field"])
+            fade(lbl, "fg", C["fg"] if on or key == hover else C["muted"])
 
 
-class StatCard(tk.Frame):
-    """A panel with a small title, one big number and a line under it."""
+class StatCard(ttk.Frame):
+    """A glass card with a small title, one big number and a line under it."""
 
     def __init__(self, parent, title, scale):
-        super().__init__(parent, bg=C["panel"], padx=int(16 * scale), pady=int(12 * scale))
-        tk.Label(self, text=title, bg=C["panel"], fg=C["muted"], font=("Segoe UI", 9)).pack(anchor="w")
+        super().__init__(parent, style="Glass.TFrame", padding=(int(16 * scale), int(12 * scale)))
+        self.title = tk.Label(self, text=title, bg=C["panel"], fg=C["muted"], font=("Segoe UI", 9), justify="left")
+        self.title.pack(anchor="w")
         self.value = tk.Label(self, text="—", bg=C["panel"], fg=C["fg"], font=("Segoe UI Semibold", 20))
         self.value.pack(anchor="w")
-        self.sub = tk.Label(self, text="", bg=C["panel"], fg=C["muted"], font=("Segoe UI", 9))
+        self.sub = tk.Label(self, text="", bg=C["panel"], fg=C["muted"], font=("Segoe UI", 9), justify="left")
         self.sub.pack(anchor="w")
+        # Wrap the caption to the card's width, so a narrow card shows all of it instead of cropping it.
+        self.bind("<Configure>", lambda e: [w.config(wraplength=max(e.width - 2 * int(16 * scale), 60))
+                                            for w in (self.title, self.sub)])
 
     def set(self, value, sub="", color=None):
-        set_text(self.value, value, fg=color or C["fg"])
+        set_text(self.value, fg=color or C["fg"])
+        set_value(self.value, value)
         set_text(self.sub, sub)
+
+    def add_link(self, text, command):
+        """A small accent-coloured action under the caption."""
+        link = tk.Label(self, text=text, bg=C["panel"], fg=C["accent_text"], font=("Segoe UI", 9), cursor="hand2")
+        link.pack(anchor="w", pady=(2, 0))
+        link.bind("<Button-1>", lambda _e: command())
+        link.bind("<Enter>", lambda _e: fade(link, "fg", C["fg"]))
+        link.bind("<Leave>", lambda _e: fade(link, "fg", C["accent_text"]))
+        return link
 
 
 class Chart(tk.Canvas):
@@ -3365,7 +3826,7 @@ class Chart(tk.Canvas):
 
 def chart_card(parent, title, chart_args, scale):
     """A panel holding a titled chart; returns (frame, chart)."""
-    card = tk.Frame(parent, bg=C["panel"], padx=int(16 * scale), pady=int(12 * scale))
+    card = ttk.Frame(parent, style="Glass.TFrame", padding=(int(16 * scale), int(12 * scale)))
     tk.Label(card, text=title, bg=C["panel"], fg=C["fg"], font=("Segoe UI Semibold", 10)).pack(anchor="w")
     chart = Chart(card, scale, **chart_args)
     chart.pack(fill="both", expand=True, pady=(int(4 * scale), 0))
@@ -3396,11 +3857,13 @@ class StatsPage(ttk.Frame):
         cards = ttk.Frame(self)
         cards.pack(fill="x", pady=(int(14 * s), 0))
         self.cards = {}
-        for i, (key, title) in enumerate((("ingame", "Time in a game"), ("launches", "Launches that worked"),
-                                          ("pings", "Anti-AFK pings"), ("closed", "Closed outside AltVault"))):
+        for i, (key, title) in enumerate((("ingame", "Time in a game"), ("eggs", "Eggs hatched (estimate)"),
+                                          ("launches", "Launches that worked"), ("pings", "Anti-AFK pings"),
+                                          ("closed", "Closed outside AltVault"))):
             self.cards[key] = StatCard(cards, title, s)
             self.cards[key].grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else int(10 * s), 0))
             cards.columnconfigure(i, weight=1, uniform="card")
+        self.cards["eggs"].add_link("Set total…", app.ask_eggs_total)
         charts = ttk.Frame(self)
         charts.pack(fill="both", expand=True, pady=(int(10 * s), 0))
         card, self.windows_chart = chart_card(charts, "Roblox windows", {"kind": "bars", "unit": ""}, s)
@@ -3428,6 +3891,7 @@ class StatsPage(ttk.Frame):
         self.cards["ingame"].set("—" if ingame is None else f"{ingame:.1f}%",
                                  f"of the time Roblox was open, last {span}",
                                  None if ingame is None else C["green"] if ingame >= 95 else C["yellow"] if ingame >= 80 else C["red"])
+        self.cards["eggs"].set(*self.app.egg_card(hours, span))
         ok, failed = total("launch_ok"), total("launch_fail")
         rate = percent_of(ok, ok + failed)
         self.cards["launches"].set("—" if rate is None else f"{rate:.1f}%",
@@ -3966,6 +4430,84 @@ def add_row_hover(tree):
     tree.bind("<<TreeviewSelect>>", lambda _e: clear(), add="+")
 
 
+# >>> keyed
+class ActivationWindow(tk.Toplevel):
+    """Shown at start when this PC has no valid key: the PC code to send to the key's maker, and a box
+    for the key. .activated is True once a good key has been saved; closing the window ends AltVault."""
+
+    def __init__(self, root, reason=""):
+        super().__init__(root, bg=C["bg"])
+        self.activated = False
+        scale = root.winfo_fpixels("1i") / 96
+        self.title(f"Activate {APP_TITLE}")
+        self.resizable(False, False)
+        frm = ttk.Frame(self, padding=(int(26 * scale), int(22 * scale)))
+        frm.pack(fill="both", expand=True)
+        wrap = int(440 * scale)
+        ttk.Label(frm, text=f"Activate {APP_TITLE}", style="Title.TLabel").pack(anchor="w")
+        ask = f"Message {LICENSE_CONTACT}" if LICENSE_CONTACT else "Message the person who made AltVault"
+        ttk.Label(frm, text=f"This copy needs a key, and a key works on one PC only. {ask} with the PC code "
+                  "below to ask for one. If they approve, they'll send you a key to paste here.",
+                  wraplength=wrap, justify="left").pack(anchor="w", pady=(8, 0))
+        ttk.Label(frm, text="Your PC code", style="Muted.TLabel").pack(anchor="w", pady=(16, 3))
+        row = ttk.Frame(frm)
+        row.pack(fill="x")
+        self.code_var = tk.StringVar(value=pc_code())
+        code = ttk.Entry(row, textvariable=self.code_var, state="readonly", font=("Consolas", 12), width=26)
+        code.pack(side="left", fill="x", expand=True)
+        self.copy_btn = ttk.Button(row, text="Copy", command=self.copy_code)
+        self.copy_btn.pack(side="left", padx=(6, 0))
+        self.request_btn = ttk.Button(row, text="Copy request message", command=self.copy_request)
+        self.request_btn.pack(side="left", padx=(6, 0))
+        ttk.Label(frm, text="Your key", style="Muted.TLabel").pack(anchor="w", pady=(14, 3))
+        self.key_var = tk.StringVar()
+        entry = ttk.Entry(frm, textvariable=self.key_var)
+        entry.pack(fill="x")
+        add_placeholder(entry, self.key_var, "Paste the whole key here")
+        entry.bind("<Return>", lambda _e: self.activate())
+        self.status = ttk.Label(frm, text=reason, style="Error.TLabel", wraplength=wrap, justify="left")
+        self.status.pack(anchor="w", pady=(10, 0))
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(14, 0))
+        ttk.Button(btns, text="Activate", style="Accent.TButton", command=self.activate).pack(side="right")
+        ttk.Button(btns, text="Quit", command=self.destroy).pack(side="right", padx=(0, 6))
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.update_idletasks()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        self.geometry(f"+{(self.winfo_screenwidth() - w) // 2}+{(self.winfo_screenheight() - h) // 3}")
+        dark_title_bar(self)
+        self.grab_set()
+        entry.focus_set()
+        self.wait_window()
+
+    def copy_code(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.code_var.get())
+        set_text(self.copy_btn, "Copied")
+        self.after(1500, lambda: self.winfo_exists() and set_text(self.copy_btn, "Copy"))
+
+    def copy_request(self):
+        self.clipboard_clear()
+        self.clipboard_append(f"Hi, could I have an {APP_TITLE} key? My PC code is {self.code_var.get()}")
+        set_text(self.request_btn, "Copied: paste it in a message")
+        self.after(2500, lambda: self.winfo_exists() and set_text(self.request_btn, "Copy request message"))
+
+    def activate(self):
+        state, why = check_key(self.key_var.get())
+        if state != "ok":
+            self.status.config(text=why)
+            return
+        try:
+            save_key(self.key_var.get())
+        except OSError as e:
+            self.status.config(text=f"Couldn't save the key: {e.strerror or e}")
+            return
+        self.activated = True
+        self.destroy()
+
+# <<< keyed
+
+
 class App:
     def __init__(self, root, accounts):
         self.root = root
@@ -3995,6 +4537,8 @@ class App:
         self.tray = None              # set by main(); without it, closing the window quits
         self.taskbar_busy = False     # a worker is moving Roblox windows on or off the taskbar
         self.history = History()      # hourly totals for Stats, Pulse and the Live panel
+        self.last_sample_at = None    # monotonic time of the previous minute reading
+        self.eggs_dirty = False       # the egg total changed since it was last written to settings.json
         self.recent = collections.deque(maxlen=60)   # (time, measure()) once a minute, for Pulse
         self.pc_meter, self.rbx_meter = PcMeter(), CpuMeter()
         self.next_sample = time.monotonic() + 5
@@ -4002,7 +4546,8 @@ class App:
         self.expected_close = set()   # Roblox pids AltVault was asked to close, so they aren't counted
         self.tick_job = None
 
-        apply_theme(root, self.scale)
+        if not hasattr(root, "altvault_images"):   # main() styles the window first when it asks for a key
+            apply_theme(root, self.scale)
         root.title(APP_TITLE)
         saved = self.settings.get("geometry")
         if self.settings.get("layout") != LAYOUT_VERSION:   # windows sized for the old layout start fresh
@@ -4045,20 +4590,10 @@ class App:
         self.hide_taskbar_var = tk.BooleanVar(value=self.settings.get("hide_taskbar", False))
 
         # Sidebar: the app icon, then one item per page; Settings sits at the bottom.
-        rail = tk.Frame(self.root, bg=C["panel"], width=int(72 * s))
-        rail.pack(side="left", fill="y")
-        rail.pack_propagate(False)
-        logo_px = int(30 * s)
+        logo_px = int(26 * s)
         self.logo = tk.PhotoImage(data=base64.b64encode(_png(logo_px, _render_icon(logo_px))))
-        tk.Label(rail, image=self.logo, bg=C["panel"]).pack(pady=(int(14 * s), int(10 * s)))
-        # The maker's mark, quietly at the foot of the sidebar; it lights up and links to GitHub.
-        mark = tk.Label(rail, text="HecticWins", bg=C["panel"], fg=C["dim"], font=("Segoe UI Semibold", 7),
-                        cursor="hand2")
-        mark.pack(side="bottom", pady=(0, int(10 * s)))
-        mark.bind("<Enter>", lambda _e: mark.config(fg=C["accent_text"]))
-        mark.bind("<Leave>", lambda _e: mark.config(fg=C["dim"]))
-        mark.bind("<Button-1>", lambda _e: webbrowser.open(GITHUB_URL))
-        self.nav = {key: self.nav_item(rail, key, glyph, label) for key, glyph, label in self.NAV}
+        self.rail = Rail(self.root, self, self.NAV, self.logo, s)
+        self.rail.pack(side="left", fill="y")
 
         main = ttk.Frame(self.root, padding=(16, 14, 16, 12))
         main.pack(side="left", fill="both", expand=True)
@@ -4067,7 +4602,7 @@ class App:
         footer.pack(side="bottom", fill="x", pady=(10, 0))
         ttk.Checkbutton(footer, text="Anti-AFK", variable=self.anti_afk_var,
                         command=self.toggle_anti_afk).pack(side="left")
-        self.status = ttk.Label(footer, text="", style="Muted.TLabel")
+        self.status = FlashLabel(footer, text="", bg=C["bg"], fg=C["muted"], font=FONT)
         self.status.pack(side="right")
 
         host = ttk.Frame(main)
@@ -4081,41 +4616,6 @@ class App:
             self.root.bind(f"<Control-Key-{i}>", lambda _e, k=key: self.show_page(k))
         self.root.bind("<Control-comma>", lambda _e: self.show_page("settings"))
 
-    def nav_item(self, rail, key, glyph, label):
-        """A sidebar entry: icon over a short label, with an accent bar while its page is open.
-        Returns the function that repaints it."""
-        s = self.scale
-        bottom = key == "settings"
-        item = tk.Frame(rail, bg=C["panel"], cursor="hand2")
-        item.pack(side="bottom" if bottom else "top", fill="x", padx=int(6 * s),
-                  pady=(int(2 * s), int(6 * s) if bottom else int(2 * s)))
-        bar = tk.Frame(item, bg=C["accent"], width=max(int(3 * s), 2))
-        icon = tk.Label(item, text=glyph, font=(self.icon_font, 15), bg=C["panel"], fg=C["muted"])
-        icon.pack(pady=(int(8 * s), 0))
-        text = tk.Label(item, text=label, font=("Segoe UI", 8), bg=C["panel"], fg=C["muted"])
-        text.pack(pady=(int(1 * s), int(8 * s)))
-        parts = (item, icon, text)
-
-        def paint(hover=False):
-            on = self.page == key
-            bg = C["sel"] if on else NAV_HOVER if hover else C["panel"]
-            for w in parts:
-                w.config(bg=bg)
-            for w in (icon, text):
-                w.config(fg=C["fg"] if on or hover else C["muted"])
-            if on:
-                bar.place(x=0, rely=0.22, relheight=0.56)
-            else:
-                bar.place_forget()
-
-        def leave(_e):   # moving onto the icon or label inside the item isn't leaving it
-            paint(self.root.winfo_containing(*self.root.winfo_pointerxy()) in parts)
-        for w in parts:
-            w.bind("<Button-1>", lambda _e: self.show_page(key))
-            w.bind("<Enter>", lambda _e: paint(True))
-            w.bind("<Leave>", leave)
-        return paint
-
     def show_page(self, key):
         if key == self.page:
             return
@@ -4125,8 +4625,7 @@ class App:
             old.pack_forget()
         self.page = key
         self.pages[key].pack(fill="both", expand=True)
-        for paint in self.nav.values():
-            paint()
+        self.rail.select(key)
         getattr(self.pages[key], "on_show", lambda: None)()
 
     def build_accounts(self, host):
@@ -4237,13 +4736,16 @@ class App:
         return WINDOW_PREFIX + self.who(acc).lstrip("@")
 
     def live_state(self, hwnd, pid, title):
-        """(colour, name) for a Live tile: red while the window is frozen, green once its account is
-        in a game, yellow before that (or for a window AltVault didn't launch)."""
+        """(colour, name) for a Live tile: red while the window is frozen, grey for a window AltVault
+        can't tie to an account (opened by hand, say), green once its account is in a game, and
+        yellow while it's still joining."""
         acc = self.account(self.running.get(pid))
         name = self.who(acc) if acc else "Roblox" if self.stream_var.get() else title
         if not responsive(hwnd):
             return "red", name
-        p = self.presence.get(acc["id"]) if acc else None
+        if not acc:
+            return "grey", name
+        p = self.presence.get(acc["id"])
         return ("green" if p and p.get("userPresenceType") == 2 else "yellow"), name
 
     def selected_accounts(self):
@@ -4548,7 +5050,7 @@ class App:
                         self.running[pid] = account_id   # window from before AltVault was reopened
                 acc = self.account(self.running.get(pid))
                 if acc and title != self.window_title(acc) and responsive(hwnd):
-                    _user32.SetWindowTextW(hwnd, self.window_title(acc))
+                    set_window_title(hwnd, self.window_title(acc))
             self.running = {pid: a for pid, a in self.running.items() if pid in alive}
             gone = set(before) - alive
             closed = len(gone - self.expected_close)
@@ -4576,9 +5078,16 @@ class App:
         """Once a minute, AltVault or not on screen: one reading for Stats and Pulse. A few cheap
         system calls; Roblox itself isn't touched."""
         reading = measure(windows, self.pc_meter, self.rbx_meter)
-        ingame = sum(1 for _, pid, _ in windows
+        # "In a game" is only knowable for windows tied to an account, so only those are counted as
+        # open; a window opened by hand would otherwise make a healthy session look half-broken.
+        linked = [w for w in windows if self.running.get(w[1])]
+        ingame = sum(1 for _, pid, _ in linked
                      if (self.presence.get(self.running.get(pid)) or {}).get("userPresenceType") == 2)
-        self.history.sample(open=len(windows), ingame=ingame if windows else None,
+        now = time.monotonic()   # real time since the last reading (capped, so a sleeping PC doesn't count)
+        minutes = 1.0 if self.last_sample_at is None else min(now - self.last_sample_at, 120) / 60
+        self.last_sample_at = now
+        self.count_eggs(ingame, minutes)
+        self.history.sample(open=len(linked), ingame=ingame if linked else None,
                             pc_cpu=reading["pc_cpu"], pc_ram=reading["pc_ram"],
                             rbx_cpu=reading["rbx_cpu"] if windows else None,
                             rbx_ram=reading["rbx_ram"] if windows else None)
@@ -4586,11 +5095,73 @@ class App:
         if self.page == "pulse":
             self.pages["pulse"].draw_charts()
 
+    def hatch_rate(self):
+        """One alt's hatch speed in eggs per minute, as typed on the Live page; None if not set."""
+        h = self.settings.get("hatch")
+        if isinstance(h, dict) and isinstance(h.get("value"), (int, float)) and h["value"] > 0 \
+                and h.get("unit") in ("min", "hour", "sec"):
+            return per_minute(h["value"], h["unit"])
+        return None
+
+    def count_eggs(self, alts_in_game, minutes):
+        """Adds the eggs `alts_in_game` accounts would have hatched in `minutes` at the typed speed.
+        An estimate: the game's own counter is out of AltVault's reach."""
+        rate = self.hatch_rate()
+        if not rate or alts_in_game <= 0 or minutes <= 0:
+            return 0.0
+        eggs = rate * alts_in_game * minutes
+        self.history.add(eggs=eggs)
+        self.settings["eggs_total"] = float(self.settings.get("eggs_total") or 0) + eggs
+        self.settings.setdefault("eggs_since", time.time())
+        self.eggs_dirty = True
+        return eggs
+
+    def egg_card(self, hours, span):
+        """(value, caption) for the Stats card: eggs over the chosen range, and the running total."""
+        rate = self.hatch_rate()
+        eggs = self.history.total("eggs", hours)
+        total = float(self.settings.get("eggs_total") or 0)
+        if rate is None and not total:
+            return "—", "Type one alt's hatch speed on the Live page to start counting."
+        since = self.settings.get("eggs_since")
+        when = f" since {time.strftime('%d %b', time.localtime(since))}" if since else ""
+        return short_number(eggs), f"last {span}" + "\n" + f"Total{when}: {short_number(total)}"
+
+    def set_eggs_total(self, value):
+        """Makes the running total match the game's own counter (the estimate carries on from there)."""
+        self.settings["eggs_total"] = max(float(value), 0.0)
+        self.settings["eggs_since"] = time.time()
+        self.eggs_dirty = True
+        self.save_history()
+
+    def ask_eggs_total(self):
+        def check(text):
+            try:
+                n = float(text.replace(",", "").strip())
+            except ValueError:
+                return "Type a number, such as 12500."
+            return None if 0 <= n < 1e15 else "That number is out of range."
+        text = Dialog(self.root, "Set eggs hatched", "Type the eggs hatched total your game shows right now. "
+                      "AltVault will carry on counting from it. Use 0 to start over.", "question",
+                      (("Cancel", None), ("Set total", True)),
+                      entry=f"{float(self.settings.get('eggs_total') or 0):.0f}", validate=check).result
+        if text is not None:
+            self.set_eggs_total(float(text.replace(",", "").strip()))
+            if self.page == "stats":
+                self.pages["stats"].refresh()
+            self.status.config(text=f"Eggs hatched total set to {short_number(self.settings['eggs_total'])}.")
+
     def save_history(self):
         try:
             self.history.save()
         except OSError as e:
             log.warning("Couldn't save history: %s", e)
+        if self.eggs_dirty:   # the running total lives in settings.json; written with the history, not every minute
+            self.eggs_dirty = False
+            try:
+                save_settings(self.settings)
+            except OSError as e:
+                log.warning("Couldn't save the egg total: %s", e)
 
     def close_windows(self, pids):
         """Closes Roblox processes on purpose, so they don't count as unexpected closes."""
@@ -5338,7 +5909,8 @@ class App:
             return
         self.save_settings()
         self.joining = True
-        self.join_btn.config(state="disabled", text="Joining...")
+        self.join_btn.config(state="disabled", text=f"{SPINNER[0]}  Joining...")
+        self.spin(1)
         # Everyone joining through a private server link ends up in that private server anyway.
         same_server = self.same_server_var.get() and len(sel) > 1 and not private
         if private and self.job_var.get().strip():
@@ -5463,6 +6035,12 @@ class App:
         name = get_place_name(cookie, place_id)
         self.ui(self.add_recent, place_id, name)
 
+    def spin(self, i):
+        """Animates the Join button while a join runs. It stops by itself when the join ends."""
+        if self.joining:
+            set_text(self.join_btn, f"{SPINNER[i % len(SPINNER)]}  Joining...")
+            self.root.after(90, self.spin, i + 1)
+
     def join_finished(self, problems):
         self.joining = False
         self.join_btn.config(state="normal")
@@ -5482,6 +6060,7 @@ class App:
         self.settings["geometry"] = self.root.geometry()
         self.save_settings()
         if not self.tray:
+            self.save_history()
             self.root.destroy()
             return
         self.root.withdraw()
@@ -5560,6 +6139,18 @@ def main():
         show_error(APP_TITLE, f"Couldn't read saved accounts:\n{e}\n\nFile: {DATA_FILE}")
         root.destroy()
         return
+    # >>> keyed
+    state, why = license_state()
+    if state != "ok":   # no valid key on this PC: ask for one, or end here
+        apply_theme(root, root.winfo_fpixels("1i") / 96)
+        root.withdraw()
+        if not ActivationWindow(root, "" if state == "none" else why).activated:
+            log.info("Not activated; exiting")
+            root.destroy()
+            return
+        root.deiconify()
+        log.info("Activated")
+    # <<< keyed
     threading.Thread(target=remove_stale_login_profiles, daemon=True).start()
     if os.path.exists(DATA_FILE):
         threading.Thread(target=restrict_to_owner, args=(DATA_FILE,), daemon=True).start()

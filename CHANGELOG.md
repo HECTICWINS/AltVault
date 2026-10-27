@@ -16,6 +16,10 @@ Every release on the [Releases](../../releases) page is built by GitHub from the
 - **Hide Roblox from the taskbar:** also keeps them out of Alt+Tab. The taskbar buttons come back when you turn it off or quit.
 - **Export and import accounts** as a password-protected `.altvault` file (scrypt + AES-256-GCM), with groups, notes and per-account settings.
 - Settings is now a page instead of a separate window.
+<!-- >>> keyed -->
+- **Access key:** this build asks for a key, which works on one PC only and is requested from the maker. The key is saved in AltVault's data folder, so updates keep it. Earlier versions need no key.
+<!-- <<< keyed -->
+- **Eggs hatched (estimate):** type one alt's hatch speed once and AltVault keeps a running count: speed x accounts in a game x time, kept across restarts. See it on Stats (24 hours or 7 days, plus a total) and in the Live panel. It's an estimate, since the game's own counter can't be read; **Set total…** on Stats lines it up with the game's number and carries on from there.
 - **Purple night theme:** near-black with a faint violet tint, and a dark violet accent on the selected page, main buttons, ticks and charts. New purple app icon.
 - **Dark dialogs everywhere:** confirmations, warnings and text prompts match the app instead of flashing a bright Windows box. Destructive actions (Remove, Close all, Delete) use a red button.
 - **Light on power:** pages only redraw what actually changed, so the Live page idles at about 0.2% of one CPU core (it was over 20% in testing). Roblox memory now matches Task Manager (the private working set).

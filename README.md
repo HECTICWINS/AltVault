@@ -99,11 +99,24 @@ Double-clicking `altvault.py` only works if `.py` files open with Python on your
 
 **Upgrading from PyRAM?** Close PyRAM, then start AltVault. Your saved accounts, settings and avatars move over automatically.
 
+<!-- >>> keyed -->
+## Access key
+
+This build needs a key, and a key works on one PC only.
+
+1. Start AltVault. It shows your **PC code**, which is a short code made from your Windows install (it doesn't reveal anything about you).
+2. Click **Copy request message** and send it to **hecticxww on Discord**. They decide whether to approve you.
+3. If they approve, they send back a key. Paste it into the window and click **Activate**.
+
+The key is saved in AltVault's data folder, so updating AltVault keeps it. You only need a new one if you reinstall Windows or move to another PC. Earlier versions (2.6.0 and before) don't need a key.
+<!-- <<< keyed -->
+
 ## Finding your way around
 
 - **Sidebar:** **Accounts**, **Profiles**, **Games**, **Live**, **Stats** and **Pulse** (Ctrl+1 to Ctrl+6), and **Settings** at the bottom (Ctrl+,).
 - **Profiles page:** saved setups, a name plus some accounts and a game. **Launch** selects those accounts and joins them.
 - **Games page:** your favourite and recent games with their icons. **Pick for joining**, **Servers...**, star or remove them, or paste a link to add one.
+- **Eggs hatched (estimate):** on the Live page, type how fast one alt hatches. AltVault multiplies it by the accounts in a game, over time, and keeps a running total (Stats page; **Set total…** matches it to your game's own counter). AltVault can't read the game, so treat it as an estimate.
 - **Stats page:** how the last 24 hours or 7 days went: time in a game, launches that worked, Anti-AFK pings and misses, and windows that closed without AltVault closing them (crashes, kicks or closed by hand). AltVault keeps only these numbers, per hour, for a week, in `history.json`.
 - **Pulse page:** your PC's and Roblox's CPU and memory, live every 2 seconds while the page is open, and charted over the last hour, day or week from a reading AltVault takes once a minute.
 - **Accounts page, top:** search the list.

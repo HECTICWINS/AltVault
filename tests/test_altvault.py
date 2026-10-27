@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 import urllib.error
@@ -1027,6 +1028,113 @@ class TestWindow(unittest.TestCase):
             self.app.settings.pop(key, None)
         self.app.refresh()
 
+    def pump(self, ms):
+        end = time.perf_counter() + ms / 1000
+        while time.perf_counter() < end:
+            self.root.update()
+            time.sleep(0.005)
+
+    def test_sidebar_pill_glides_and_comes_to_rest(self):
+        rail = self.app.rail
+        self.root.deiconify()
+        try:
+            self.app.show_page("accounts"); self.pump(400)
+            rail.update_idletasks()
+            top, target = rail.pos["accounts"], rail.pos["stats"]
+            self.assertEqual(rail.sel_y, top)
+            self.app.show_page("stats")
+            self.pump(60)
+            self.assertTrue(top < rail.sel_y < target, "mid-glide the pill is between the two items")
+            self.pump(400)
+            self.assertEqual(rail.sel_y, target)
+            self.assertEqual(rail.jobs, {}, "no animation timer may be left running at rest")
+            self.assertEqual(rail.shades[rail.icon["stats"]], av.C["accent_text"], "the lit icon takes the accent colour")
+        finally:
+            self.root.withdraw()
+            self.app.show_page("accounts"); self.pump(300)
+
+    def test_sidebar_hover_pill_follows_the_mouse_and_leaves(self):
+        rail = self.app.rail
+        self.root.deiconify()
+        try:
+            self.pump(100); rail.update_idletasks()
+            y = lambda k: rail.pos[k] + rail.h // 2
+            rail.motion(types.SimpleNamespace(x=20, y=y("games")))
+            self.assertEqual(rail.hover_y, rail.pos["games"])
+            rail.motion(types.SimpleNamespace(x=20, y=y("pulse")))
+            self.pump(300)
+            self.assertEqual(rail.hover_y, rail.pos["pulse"])
+            self.assertEqual(rail.click(types.SimpleNamespace(x=20, y=y("pulse"))), None)
+            self.assertEqual(self.app.page, "pulse")
+            rail.leave()
+            self.assertIsNone(rail.hover_y)
+            self.assertEqual(rail.itemcget(rail.hover_id, "state"), "hidden")
+        finally:
+            self.root.withdraw()
+            self.app.show_page("accounts"); self.pump(300)
+
+    def test_changed_values_flash_then_settle(self):
+        import tkinter
+        label = tkinter.Label(self.root, text="3", fg="#ebe8f0")
+        av.set_value(label, "4")
+        self.assertNotEqual(label.cget("fg"), "#ebe8f0", "a changed value blinks")
+        self.pump(500)
+        self.assertEqual(label.cget("fg"), "#ebe8f0")
+        av.set_value(label, "—"); self.pump(500)
+        av.set_value(label, "5")
+        self.assertEqual(label.cget("fg"), "#ebe8f0", "the first real value doesn't blink")
+        label.destroy()
+
+    def test_fade_reaches_its_target_and_can_be_interrupted(self):
+        import tkinter
+        label = tkinter.Label(self.root, bg="#000000")
+        av.fade(label, "bg", "#ffffff")
+        av.fade(label, "bg", "#ff0000")          # a new fade takes over the running one
+        for _ in range(av.FADE_STEPS + 2):
+            self.root.update()
+            self.root.after(av.FADE_MS + 4)
+            self.root.update()
+        self.assertEqual(label.cget("bg"), "#ff0000")
+        self.assertEqual(label.__dict__["_fade_jobs"], {}, "no timer may be left running at rest")
+        av.fade(label, "bg", "#00ff00")
+        label.destroy()                           # destroyed mid-fade: must not raise
+        self.root.update()
+
+    def test_join_spinner_runs_only_while_joining(self):
+        self.app.joining = True
+        self.app.spin(3)
+        self.assertIn("Joining", self.app.join_btn.cget("text"))
+        self.app.joining = False
+        before = self.app.join_btn.cget("text")
+        self.app.spin(4)
+        self.assertEqual(self.app.join_btn.cget("text"), before)
+        self.app.update_join_label()
+
+    def test_stress_pages_windows_and_stream_mode(self):
+        """Many rapid page switches, windows coming and going and stream-mode flips: no errors, and
+        every thumbnail is released when Live is left."""
+        live = self.app.pages["live"]
+        registered, released = set(), []
+        windows = [(200 + i, 300 + i, "Roblox") for i in range(12)]
+        with mock.patch.object(av, "roblox_windows", lambda: list(windows)),                 mock.patch.object(av, "register_thumbnail", lambda d, h: registered.add(h) or h),                 mock.patch.object(av, "unregister_thumbnail", released.append),                 mock.patch.object(av, "place_thumbnail", lambda t, r: True),                 mock.patch.object(av, "client_size", lambda h: (800, 600)),                 mock.patch.object(av, "save_settings", lambda s: None),                 mock.patch.object(av._user32, "IsIconic", lambda h: False):
+            for i in range(30):
+                self.app.show_page(self.app.NAV[i % len(self.app.NAV)][0])
+                if i % 3 == 0:
+                    if len(windows) > 4:
+                        del windows[:2]
+                    else:
+                        windows.extend([(500 + i, 600 + i, "Roblox"), (700 + i, 800 + i, "Roblox")])
+                if i % 5 == 0:
+                    self.app.stream_var.set(not self.app.stream_var.get())
+                    self.app.refresh()
+                self.root.update()
+            self.app.stream_var.set(False)
+            self.app.show_page("live")
+            self.root.update()
+            self.app.show_page("accounts")
+        self.assertEqual(live.thumbs, {}, "thumbnails must all be released")
+        self.assertIsNone(live.sample_job)
+
     def test_group_chevron_follows_open_and_closed(self):
         tree, row = self.app.tree, "group:Mains"
         chevron = lambda: str(tree.item(row, "image")[0])
@@ -1099,6 +1207,93 @@ class TestWindow(unittest.TestCase):
             self.assertEqual(page.cards["closed"].value.cget("text"), "1")
         finally:
             self.app.history = saved
+
+    def egg_setup(self, hatch):
+        saved = (self.app.history, dict(self.app.settings), self.app.last_sample_at)
+        self.app.history = av.History(os.path.join(av.APP_DIR, "history-eggs.json"))
+        for key in ("eggs_total", "eggs_since", "hatch"):
+            self.app.settings.pop(key, None)
+        if hatch:
+            self.app.settings["hatch"] = hatch
+        self.app.last_sample_at = None
+        return saved
+
+    def egg_restore(self, saved):
+        self.app.history, settings, self.app.last_sample_at = saved
+        self.app.settings.clear()
+        self.app.settings.update(settings)
+        self.app.eggs_dirty = False
+
+    def test_eggs_are_estimated_from_speed_alts_and_time(self):
+        saved = self.egg_setup({"value": 30, "unit": "min"})
+        try:
+            self.assertEqual(self.app.count_eggs(4, 1.0), 120)      # 4 alts x 30/min x 1 min
+            self.assertEqual(self.app.count_eggs(2, 0.5), 30)
+            self.assertEqual(self.app.count_eggs(0, 1.0), 0)         # nobody in a game: nothing counted
+            self.assertEqual(self.app.settings["eggs_total"], 150)
+            self.assertEqual(self.app.history.total("eggs", 1), 150)
+            self.app.settings["hatch"] = {"value": 2, "unit": "sec"}  # 2 s per egg = 30 per minute
+            self.assertEqual(self.app.hatch_rate(), 30)
+            self.app.settings["hatch"] = {"value": 0, "unit": "min"}
+            self.assertIsNone(self.app.hatch_rate())
+            self.assertEqual(self.app.count_eggs(5, 1.0), 0, "no speed set: no guessing")
+        finally:
+            self.egg_restore(saved)
+
+    def test_minute_sample_counts_real_elapsed_time_but_not_a_sleeping_pc(self):
+        saved = self.egg_setup({"value": 60, "unit": "min"})
+        windows = [(1, 4001, "Roblox - alt4")]
+        self.app.running[4001] = 4
+        self.app.presence[4] = {"userPresenceType": 2}
+        reading = {"pc_cpu": 1.0, "pc_ram": 1.0, "rbx_cpu": 1.0, "rbx_ram": 1.0, "windows": 1}
+        try:
+            with mock.patch.object(av, "measure", lambda w, a, b: reading):
+                self.app.sample_minute(windows)                        # first reading counts one minute
+                self.assertEqual(self.app.settings["eggs_total"], 60)
+                self.app.last_sample_at -= 600                         # ten minutes pass (PC slept)
+                self.app.sample_minute(windows)
+            self.assertEqual(self.app.settings["eggs_total"], 60 + 120, "capped at two minutes")
+        finally:
+            self.app.running.pop(4001, None)
+            self.app.presence.pop(4, None)
+            self.egg_restore(saved)
+
+    def test_setting_the_total_continues_from_the_games_number_and_is_saved(self):
+        saved = self.egg_setup({"value": 30, "unit": "min"})
+        written = []
+        try:
+            with mock.patch.object(av, "save_settings", lambda st: written.append(dict(st))):
+                self.app.set_eggs_total(12500)
+                self.assertEqual(written[-1]["eggs_total"], 12500)
+                self.app.count_eggs(1, 1.0)
+                self.assertTrue(self.app.eggs_dirty)
+                self.app.save_history()
+            self.assertEqual(written[-1]["eggs_total"], 12530)
+            self.assertFalse(self.app.eggs_dirty)
+            value, caption = self.app.egg_card(24, "24 hours")
+            self.assertEqual(value, "30")
+            self.assertIn("12.5K", caption)
+            self.app.settings.pop("hatch")
+            self.app.settings.pop("eggs_total")
+            self.assertEqual(self.app.egg_card(24, "24 hours")[0], "—")
+        finally:
+            self.egg_restore(saved)
+
+    def test_windows_not_from_altvault_do_not_skew_time_in_game(self):
+        saved, self.app.history = self.app.history, av.History(os.path.join(av.APP_DIR, "history-linked.json"))
+        windows = [(1, 4001, "Roblox - alt4"), (2, 4002, "Roblox")]   # the second was opened by hand
+        self.app.running[4001] = 4
+        self.app.presence[4] = {"userPresenceType": 2}
+        try:
+            with mock.patch.object(av, "measure", lambda w, a, b: {"pc_cpu": 10.0, "pc_ram": 50.0, "rbx_cpu": 5.0,
+                                                                   "rbx_ram": 20.0, "windows": len(w)}):
+                self.app.sample_minute(windows)
+            bucket = self.app.history.hours[self.app.history.hour()]
+            self.assertEqual((bucket["open"], bucket["ingame"]), (1, 1))
+        finally:
+            self.app.history = saved
+            self.app.running.pop(4001, None)
+            self.app.presence.pop(4, None)
 
     def test_only_unexpected_closes_are_counted(self):
         counted = []
@@ -1245,6 +1440,110 @@ class TestHistory(unittest.TestCase):
             self.assertFalse(img.transparency_get(10, 3))
         finally:
             root.destroy()
+
+
+# >>> keyed
+class TestAccessKey(unittest.TestCase):
+    """Keys are ECDSA signatures over a PC's code: valid only on that PC, impossible to alter or invent."""
+
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location("license_tool", os.path.join(ROOT, "tools", "license_tool.py"))
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+        cls.private, public = cls.tool.new_keypair()
+        cls.public = public.hex()
+        cls.pc = bytes(range(10))
+        cls.code = av.group(av.b32(cls.pc), 4)
+
+    def key(self, days=None, today=None):
+        return self.tool.make_key(self.private, self.code, days, today, app=av)
+
+    def check(self, text, pc=None, today=None):
+        return av.check_key(text, pc or self.pc, self.public, today)[0]
+
+    def test_a_key_works_on_its_own_pc_however_it_is_pasted(self):
+        key = self.key()
+        self.assertTrue(key.startswith("AVK-"))
+        self.assertEqual(self.check(key), "ok")
+        self.assertEqual(self.check(key.lower().replace("-", " ")), "ok", "case and separators don't matter")
+        self.assertEqual(self.check("  " + chr(10) + key + chr(10)), "ok")
+
+    def test_a_key_does_not_work_on_another_pc(self):
+        self.assertEqual(self.check(self.key(), pc=bytes(10)), "invalid")
+        self.assertEqual(self.check(self.key(), pc=bytes(range(1, 11))), "invalid")
+
+    def test_altered_or_invented_keys_are_refused(self):
+        key = self.key()
+        compact = key.replace("-", "")
+        flip = lambda i: compact[:i] + ("A" if compact[i] != "A" else "B") + compact[i + 1:]
+        for bad in (flip(len(compact) - 3),   # a character near the end changed (the very last one only holds padding)
+                    flip(10), flip(60),
+                    compact[:-6], "", "AVK", "hello", "AVK-" + "A" * 110):
+            self.assertEqual(self.check(bad), "invalid", bad)
+        other_private, _ = self.tool.new_keypair()   # signed by a different maker's key
+        forged = self.tool.make_key(other_private, self.code, None, None, app=av)
+        self.assertEqual(self.check(forged), "invalid")
+
+    def test_expiry_is_part_of_the_signature(self):
+        import datetime
+        key = self.key(days=30, today=datetime.date(2026, 1, 1))
+        self.assertEqual(self.check(key, today="20260131"), "ok")
+        self.assertEqual(self.check(key, today="20260202"), "expired")
+        self.assertEqual(self.check(self.key(), today="20990101"), "ok", "no days given means never expires")
+        # the expiry sits in the key's first bytes: editing it must break the signature
+        payload = bytearray(av.unb32(key.replace("-", "")[len(av.KEY_PREFIX):]))
+        payload[3] ^= 0x7F
+        edited = "AVK" + av.b32(bytes(payload))
+        self.assertEqual(self.check(edited), "invalid")
+
+    def test_the_saved_key_decides_whether_the_app_starts(self):
+        with mock.patch.object(av, "LICENSE_FILE", os.path.join(av.APP_DIR, "license-test.key")),                 mock.patch.object(av, "LICENSE_PUBLIC_KEY", self.public), mock.patch.object(av, "pc_raw", lambda: self.pc):
+            if os.path.exists(av.LICENSE_FILE):
+                os.remove(av.LICENSE_FILE)
+            self.assertEqual(av.license_state()[0], "none")
+            av.save_key(self.key())
+            self.assertEqual(av.license_state()[0], "ok")
+            av.save_key("AVK-NOTAREALKEY")
+            self.assertEqual(av.license_state()[0], "invalid")
+            with mock.patch.object(av, "LICENSE_REQUIRED", False):
+                self.assertEqual(av.license_state()[0], "ok", "the one switch that makes the app free")
+
+    def test_activation_window_accepts_only_a_good_key(self):
+        import tkinter
+        try:
+            root = tkinter.Tk()
+        except tkinter.TclError as e:
+            self.skipTest(f"no display: {e}")
+        root.withdraw()
+        av.apply_theme(root, 1.0)
+        try:
+            with mock.patch.object(av, "LICENSE_FILE", os.path.join(av.APP_DIR, "license-win.key")),                     mock.patch.object(av, "LICENSE_PUBLIC_KEY", self.public),                     mock.patch.object(av, "pc_raw", lambda: self.pc),                     mock.patch.object(tkinter.Toplevel, "wait_window", lambda self, *a: None):
+                window = av.ActivationWindow(root)
+                self.assertEqual(window.code_var.get(), self.code)
+                window.key_var.set("AVK-WRONG")
+                window.activate()
+                self.assertFalse(window.activated)
+                self.assertTrue(window.status.cget("text"))
+                window.key_var.set(self.key())
+                window.activate()
+                self.assertTrue(window.activated)
+                self.assertEqual(av.license_state()[0], "ok")
+        finally:
+            root.destroy()
+
+    def test_no_signing_key_can_end_up_in_the_repository(self):
+        found = [f for base, _, files in os.walk(ROOT) if ".git" not in base.split(os.sep) and "dev" not in base.split(os.sep)
+                 for f in files if f.endswith(".blob") or f.startswith("signing-key") or f == "license.key"]
+        self.assertEqual(found, [])
+        with open(os.path.join(ROOT, ".gitignore"), encoding="utf-8") as f:
+            ignored = f.read()
+        for pattern in ("*.blob", "signing-key*", "license.key"):
+            self.assertIn(pattern, ignored)
+        with open(SOURCE, encoding="utf-8") as f:
+            self.assertNotIn("ECCPRIVATEBLOB", f.read().replace('"ECCPRIVATEBLOB"', "", 0).split("# ---- access key")[0])
+
+# <<< keyed
 
 
 class TestRepoHygiene(unittest.TestCase):

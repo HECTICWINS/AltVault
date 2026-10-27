@@ -19,3 +19,11 @@ altvault-*.ico
 
 # Local dev helpers (prototypes, screenshot harnesses, old backups)
 dev/
+
+# >>> keyed
+# Key-making: the private signing key and any saved key must never be committed.
+*.blob
+signing-key*
+license.key
+my-pc-key.txt
+# <<< keyed
