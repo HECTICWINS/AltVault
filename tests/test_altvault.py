@@ -534,7 +534,7 @@ class TestAntiAfkTiming(unittest.TestCase):
         last = {h: 0.0 for h in windows}
         worst = {h: 0.0 for h in windows}
 
-        def fake_pass(hwnds, vk):
+        def fake_pass(hwnds, vk, strong=False):
             pinged, missed, reasons = [], [], {}
             for h in hwnds:
                 if h == 103 and rnd.random() < flaky:
@@ -596,6 +596,43 @@ class TestAntiAfkTiming(unittest.TestCase):
     def test_calm_conditions_ping_on_schedule(self):
         worst = self.simulate(1, flaky=0, busy_user=0)
         self.assertLess(max(worst.values()) / 60, 9.5)
+
+
+class TestStayConnected(unittest.TestCase):
+    def fake(self):
+        app = types.SimpleNamespace(presence={}, last_ingame={}, first_seen={}, afk_skipped=lambda acc: False)
+        app.seconds_out_of_game = lambda acc, pid, now=None: av.App.seconds_out_of_game(app, acc, pid, now)
+        return app
+
+    def test_a_normal_rejoin_is_never_flagged(self):
+        app, acc = self.fake(), {"id": "a"}
+        app.last_ingame["a"] = 1000.0
+        self.assertFalse(av.App.is_lost(app, acc, 1) and app.seconds_out_of_game(acc, 1, 1060.0) > av.LOST_AFTER)
+        self.assertLess(app.seconds_out_of_game(acc, 1, 1060.0), av.LOST_AFTER)
+
+    def test_long_outside_a_game_counts_and_in_game_does_not(self):
+        app, acc = self.fake(), {"id": "a"}
+        app.last_ingame["a"] = 1000.0
+        app.first_seen[1] = 0.0
+        self.assertGreater(app.seconds_out_of_game(acc, 1, 1000.0 + av.LOST_AFTER + 5), av.LOST_AFTER)
+        app.presence["a"] = {"userPresenceType": 2}
+        self.assertEqual(app.seconds_out_of_game(acc, 1, 99999.0), 0.0)
+
+    def test_accounts_with_anti_afk_off_are_not_flagged(self):
+        app, acc = self.fake(), {"id": "a"}
+        app.afk_skipped = lambda a: True
+        app.first_seen[1] = 0.0
+        self.assertFalse(av.App.is_lost(app, acc, 1))
+
+    def test_strong_press_taps_twice_and_only_while_in_front(self):
+        taps = []
+        with mock.patch.object(av.time, "sleep"), mock.patch.object(av, "tap_key", lambda vk, hold=0: taps.append(hold)),                 mock.patch.object(av._user32, "GetForegroundWindow", lambda: 7):
+            self.assertTrue(av.press_when_ready(7, 0x20, strong=True))
+            self.assertEqual(taps, [av.AFK_HOLD_SLOW] * 2)
+            taps.clear()
+            self.assertTrue(av.press_when_ready(7, 0x20))
+            self.assertEqual(taps, [av.AFK_HOLD])
+            self.assertFalse(av.press_when_ready(8, 0x20))
 
 
 class TestAntiAfkBlocked(unittest.TestCase):

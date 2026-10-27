@@ -67,6 +67,13 @@ AFK_SETTLE = 0.35                # after focusing: Roblox runs slowly while hidd
 AFK_HOLD = 0.2                   # key hold; a short tap can fall between a slowed client's frames
 AFK_STUCK = 90                   # seconds after which a still-running pass is treated as stuck
 AFK_ALERT_AFTER = 4              # misses in a row (about 2 minutes) before a tray alert
+AFK_PRESSURE = 0.85              # memory this full makes Roblox clients stall: use slower, doubled key taps
+AFK_SETTLE_SLOW = 1.2            # ...wait this long after focusing a window
+AFK_HOLD_SLOW = 0.5              # ...hold each tap this long
+AFK_GAP_SLOW = 0.4               # ...and tap again after this pause
+LOST_AFTER = 300                 # seconds a window may sit out of its game before it counts as disconnected
+HIDDEN_PRESENCE_EVERY = 6        # while hidden in the tray, check presence every 6th time (3 min) if windows are open
+MEMORY_ALERT = 0.92              # memory this full for 3 readings in a row, with several Roblox windows: warn
 AFK_KEYS = {"space": 0x20, "f13": 0x7C, **{c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"}}
 
 log = logging.getLogger("altvault")
@@ -444,7 +451,29 @@ def _step(name):
     afk_step["step"], afk_step["since"] = name, time.monotonic()
 
 
-def anti_afk_pass(hwnds, vk):
+def press_when_ready(hwnd, vk, strong=False):
+    """For a window that's now in front: lets it catch up, then taps the key, but only while it is
+    still in front. With `strong` (memory nearly full, so clients stall) it waits longer, holds each tap
+    longer and taps twice, so a tap can't fall into one stalled moment. Returns True if the key was sent."""
+    settle, hold = (AFK_SETTLE_SLOW, AFK_HOLD_SLOW) if strong else (AFK_SETTLE, AFK_HOLD)
+    time.sleep(settle)
+    if _user32.GetForegroundWindow() != hwnd:
+        return False
+    _step("pressing the key")
+    tap_key(vk, hold)
+    if strong:
+        time.sleep(AFK_GAP_SLOW)
+        if _user32.GetForegroundWindow() == hwnd:
+            tap_key(vk, hold)
+    return True
+
+
+def memory_used_fraction():
+    free, total = memory_status()
+    return 1 - free / total if total else 0.0
+
+
+def anti_afk_pass(hwnds, vk, strong=False):
     """Roblox ignores input sent to background windows, so briefly focus each window, tap the key,
     then give focus back. The key is only sent once Roblox is confirmed in front, so it can never
     land in another app.
@@ -491,10 +520,7 @@ def anti_afk_pass(hwnds, vk):
                 if blocker is None:
                     blocker = describe_foreground()
             else:
-                time.sleep(AFK_SETTLE)
-                if _user32.GetForegroundWindow() == hwnd:
-                    _step("pressing the key")
-                    tap_key(vk)
+                if press_when_ready(hwnd, vk, strong):
                     pinged.append(hwnd)
                     continue
                 reasons[hwnd] = "lost focus before the key press"
@@ -2905,6 +2931,7 @@ class LivePage(ttk.Frame):
         section("Windows")
         stat("ingame", "In a game", C["green"])
         stat("loading", "Joining", C["yellow"])
+        stat("lost", "Disconnected", C["red"])
         stat("hung", "Not responding", C["red"])
         stat("other", "Not from AltVault", C["dim"])
 
@@ -3049,13 +3076,15 @@ class LivePage(ttk.Frame):
 
     def update_headline(self):
         n, ingame, loading, hung = len(self.tiles), self.count("green"), self.count("yellow"), self.count("red")
-        other = self.count("grey")
+        other, lost = self.count("grey"), self.count("lost")
         set_text(self.big, str(ingame))
         set_text(self.big_of, f" / {n}")
         if not n:
             dot, text = C["muted"], "No Roblox windows"
         elif hung:
             dot, text = C["red"], f"{hung} not responding"
+        elif lost:
+            dot, text = C["red"], f"{lost} disconnected"
         elif loading:
             dot, text = C["yellow"], f"{loading} still joining"
         elif other:
@@ -3064,7 +3093,7 @@ class LivePage(ttk.Frame):
             dot, text = C["green"], "Every window is in a game"
         set_text(self.pill_dot, fg=dot)
         set_text(self.pill_text, text)
-        for key, value in (("ingame", ingame), ("loading", loading), ("hung", hung), ("other", other)):
+        for key, value in (("ingame", ingame), ("loading", loading), ("lost", lost), ("hung", hung), ("other", other)):
             set_value(self.values[key], str(value))
         set_text(self.summary, f"{n} window{'s' if n != 1 else ''} · {ingame} in a game · click a tile to "
                                  "bring it to the front" if n else "Roblox windows show up here while they're open")
@@ -3228,7 +3257,7 @@ class LiveTile(tk.Frame):
     """One Roblox window on the Live page: a header (status, name, show, close) over the body that
     its thumbnail is drawn on. Clicking anywhere on the tile brings that window to the front."""
 
-    COLORS = {"green": C["green"], "yellow": C["yellow"], "red": C["red"], "grey": C["dim"]}
+    COLORS = {"green": C["green"], "yellow": C["yellow"], "red": C["red"], "lost": C["red"], "grey": C["dim"]}
 
     @staticmethod
     def header_px(scale):
@@ -3277,8 +3306,7 @@ class LiveTile(tk.Frame):
         if color != self.color:
             self.color = color
             self.dot.config(fg=self.COLORS[color])
-        if self.label.cget("text") != name:
-            self.label.config(text=name)
+        set_text(self.label, name, fg=C["red"] if color in ("lost", "red") else C["fg"])
 
     def set_note(self, text):
         if text:
@@ -3904,8 +3932,9 @@ class StatsPage(ttk.Frame):
                                    f"{ok + failed:g} launch{'es' if ok + failed != 1 else ''}, {failed:g} failed")
         pings, missed = total("pings"), total("missed")
         self.cards["pings"].set(short_number(pings), f"{missed:g} missed and retried")
-        closed = total("closed")
-        self.cards["closed"].set(f"{closed:g}", "crashes, kicks or closed by hand",
+        closed, lost, moved = total("closed"), total("lost"), total("moved")
+        extra = f"{chr(10)}{lost:g} dropped out of a game · {moved:g} moved server" if lost or moved else ""
+        self.cards["closed"].set(f"{closed:g}", "crashes, kicks or closed by hand" + extra,
                                  C["red"] if closed else None)
         labels = hour_labels(hours)
         ends = (f"{span} ago", "now")
@@ -4545,6 +4574,14 @@ class App:
         self.taskbar_busy = False     # a worker is moving Roblox windows on or off the taskbar
         self.history = History()      # hourly totals for Stats, Pulse and the Live panel
         self.last_sample_at = None    # monotonic time of the previous minute reading
+        self.first_seen = {}          # Roblox pid -> when its window was first seen
+        self.last_ingame = {}         # account id -> when presence last said "in a game"
+        self.server_of = {}           # Roblox pid -> (server it is in now, times it has been moved to another)
+        self.lost_flagged = set()     # account ids currently flagged as disconnected
+        self.expired_told = set()     # account ids whose expired login has been announced
+        self.memory_hot = 0           # minute readings in a row with memory nearly full
+        self.memory_alerted = False
+        self.presence_ticks = 0       # counts presence checks made while hidden
         self.eggs_dirty = False       # the egg total changed since it was last written to settings.json
         self.recent = collections.deque(maxlen=60)   # (time, measure()) once a minute, for Pulse
         self.pc_meter, self.rbx_meter = PcMeter(), CpuMeter()
@@ -4752,8 +4789,13 @@ class App:
             return "red", name
         if not acc:
             return "grey", name
+        moves = self.server_of.get(pid, (None, 0))[1]
+        if moves:
+            name += f"  ·  moved ×{moves}"
         p = self.presence.get(acc["id"])
-        return ("green" if p and p.get("userPresenceType") == 2 else "yellow"), name
+        if p and p.get("userPresenceType") == 2:
+            return "green", name
+        return ("lost" if acc["id"] in self.lost_flagged else "yellow"), name
 
     def selected_accounts(self):
         """Selected accounts; selecting a group header selects everyone in it."""
@@ -5024,21 +5066,105 @@ class App:
             self.root.after(PRESENCE_INTERVAL, self.refresh_presence)
         if self.root.state() in ("iconic", "withdrawn"):   # minimised, or hidden in the tray
             self.presence_stale = True
-            return
+            self.presence_ticks += 1
+            # With nothing open there's nothing to watch. With Roblox windows open, look every few minutes
+            # so a dropped or moved account is noticed even while nobody is looking at AltVault.
+            if not self.running or self.presence_ticks % HIDDEN_PRESENCE_EVERY:
+                return
         accounts = list(self.accounts)
 
         def work():
             for acc in accounts:
                 try:
-                    self.presence[acc["id"]] = get_presence(acc["cookie"], acc["id"])
+                    self.note_presence(acc["id"], get_presence(acc["cookie"], acc["id"]))
                     self.expired.discard(acc["id"])
+                    self.expired_told.discard(acc["id"])
                 except CookieExpired:
+                    if acc["id"] not in self.expired_told:
+                        self.ui(self.note_expired, acc["id"])
                     self.expired.add(acc["id"])
                 except (RobloxError, ValueError, KeyError, IndexError) as e:
                     log.warning("Presence for %s failed: %s", acc["name"], e)
             self.ui(self.refresh)
 
         threading.Thread(target=work, daemon=True).start()
+
+    # ------------------------------------------------------------ watching the accounts
+    def note_presence(self, account_id, presence):
+        self.presence[account_id] = presence
+        if presence.get("userPresenceType") == 2:
+            self.last_ingame[account_id] = time.monotonic()
+
+    def seconds_out_of_game(self, acc, pid, now=None):
+        """How long this window's account has been out of a game while the window stayed open (0 if it's
+        in one). A window that was just opened counts from when it appeared."""
+        now = time.monotonic() if now is None else now
+        if (self.presence.get(acc["id"]) or {}).get("userPresenceType") == 2:
+            return 0.0
+        return now - max(self.first_seen.get(pid, now), self.last_ingame.get(acc["id"], 0.0))
+
+    def is_lost(self, acc, pid):
+        """A window whose account has sat outside any game for LOST_AFTER seconds. The game re-joining
+        a client takes seconds and presence is polled every 30 s, so a normal re-join never counts; and
+        accounts with Anti-AFK turned off (ones you play yourself) are never flagged."""
+        return (not self.afk_skipped(acc)) and self.seconds_out_of_game(acc, pid) > LOST_AFTER
+
+    def watch_windows(self, windows):
+        """Called every tick: notices accounts that dropped out of their game, or were moved to another
+        server, and says so (log, tray alert, Stats counts)."""
+        now = time.monotonic()
+        alive = {pid for _, pid, _ in windows}
+        self.first_seen = {pid: t for pid, t in self.first_seen.items() if pid in alive}
+        self.server_of = {pid: v for pid, v in self.server_of.items() if pid in alive}
+        dropped, moved, still = [], [], set()
+        for hwnd, pid, _ in windows:
+            self.first_seen.setdefault(pid, now)
+            acc = self.account(self.running.get(pid))
+            if not acc:
+                continue
+            p = self.presence.get(acc["id"]) or {}
+            server = p.get("gameId") if p.get("userPresenceType") == 2 else None
+            if server:
+                home, moves = self.server_of.get(pid, (None, 0))
+                if home is None:
+                    self.server_of[pid] = (server, 0)
+                elif server != home:
+                    self.server_of[pid] = (server, moves + 1)
+                    self.history.add(moved=1)
+                    moved.append(self.who(acc))
+                    log.warning("%s was moved to a different server (the %s time since this window opened)",
+                                self.who(acc), moves + 1)
+            if self.is_lost(acc, pid) and responsive(hwnd):
+                still.add(acc["id"])
+                if acc["id"] not in self.lost_flagged:
+                    self.lost_flagged.add(acc["id"])
+                    self.history.add(lost=1)
+                    dropped.append(self.who(acc))
+                    log.warning("%s has had a Roblox window open but hasn't been in a game for %d min",
+                                self.who(acc), self.seconds_out_of_game(acc, pid, now) // 60)
+        for acc_id in self.lost_flagged - still:
+            self.lost_flagged.discard(acc_id)
+            acc = self.account(acc_id)
+            log.info("%s is back in a game (or its window closed)", self.who(acc) if acc else acc_id)
+        if self.tray:
+            if dropped:
+                self.tray.notify("Roblox window out of its game",
+                                 f"{', '.join(dropped[:3])}{' and more' if len(dropped) > 3 else ''}: open for over "
+                                 f"{LOST_AFTER // 60} min but not in a game. Check the Live page.", warning=True)
+            if moved:
+                self.tray.notify("Moved to a different server",
+                                 f"{', '.join(moved[:3])}{' and more' if len(moved) > 3 else ''}: the game moved "
+                                 "the account to another server.", warning=True)
+
+    def note_expired(self, account_id):
+        acc = self.account(account_id)
+        if not acc or account_id in self.expired_told:
+            return
+        self.expired_told.add(account_id)
+        log.warning("The login for %s has expired", self.who(acc))
+        if self.tray:
+            self.tray.notify("A login has expired", f"{self.who(acc)} needs to log in again: right-click it, "
+                             "Account, Log in again. Its Roblox window can't stay connected without it.", warning=True)
 
     def tick(self):
         """Keeps track of which Roblox window belongs to which account and labels each window."""
@@ -5066,6 +5192,7 @@ class App:
             self.expected_close -= gone
             if self.running != before:
                 self.refresh()
+            self.watch_windows(windows)
             now = time.monotonic()
             if now >= self.next_sample:
                 self.next_sample = now + 60
@@ -5094,6 +5221,18 @@ class App:
         minutes = 1.0 if self.last_sample_at is None else min(now - self.last_sample_at, 120) / 60
         self.last_sample_at = now
         self.count_eggs(ingame, minutes)
+        used = memory_used_fraction()
+        self.memory_hot = self.memory_hot + 1 if (len(linked) >= 2 and used >= MEMORY_ALERT) else 0
+        if used < AFK_PRESSURE:
+            self.memory_alerted = False
+        if self.memory_hot >= 3 and not self.memory_alerted:
+            self.memory_alerted = True
+            log.warning("Memory is %.0f%% full with %d Roblox windows open", used * 100, len(linked))
+            if self.tray:
+                self.tray.notify("Your PC is out of memory",
+                                 f"Memory is {used:.0%} full with {len(linked)} Roblox windows. Clients slow to a crawl "
+                                 "and Anti-AFK can miss, so accounts get re-joined or kicked. Close some windows or apps.",
+                                 warning=True)
         self.history.sample(open=len(linked), ingame=ingame if linked else None,
                             pc_cpu=reading["pc_cpu"], pc_ram=reading["pc_ram"],
                             rbx_cpu=reading["rbx_cpu"] if windows else None,
@@ -5777,9 +5916,14 @@ class App:
         self.afk_pass_id += 1
         pass_id = self.afk_pass_id
 
+        used = memory_used_fraction()
+        strong = used >= AFK_PRESSURE
+        if strong:
+            log.info("Anti-AFK: memory is %.0f%% full, so Roblox windows are slow; using slower, doubled key taps", used * 100)
+
         def work():
             try:
-                result = anti_afk_pass(hwnds, vk)
+                result = anti_afk_pass(hwnds, vk, strong)
             except Exception:
                 log.exception("Anti-AFK pass failed")
                 result = ([], [], list(targets), {h: "pass failed" for h in targets}, None)
@@ -6032,7 +6176,7 @@ class App:
                 p = get_presence(acc["cookie"], acc["id"])
             except (RobloxError, ValueError, KeyError, IndexError):
                 continue
-            self.presence[acc["id"]] = p
+            self.note_presence(acc["id"], p)
             places = {str(p.get("placeId")), str(p.get("rootPlaceId"))}
             if p.get("userPresenceType") == 2 and p.get("gameId") and place_id in places:
                 return p["gameId"]
