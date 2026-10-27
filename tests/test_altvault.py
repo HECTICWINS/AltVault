@@ -1029,23 +1029,38 @@ class TestWindow(unittest.TestCase):
         self.app.refresh()
 
     def pump(self, ms):
-        end = time.perf_counter() + ms / 1000
-        while time.perf_counter() < end:
+        """Runs the window's events for about `ms` milliseconds."""
+        end = time.monotonic() + ms / 1000
+        while time.monotonic() < end:
+            self.root.update()
+            time.sleep(0.005)
+
+    def wait_until(self, condition, timeout=5.0):
+        """Runs events until `condition()` is true. Animations take as long as they take on a slow
+        machine, so tests wait for the result instead of guessing how many milliseconds it needs."""
+        end = time.monotonic() + timeout
+        while not condition():
+            self.assertLess(time.monotonic(), end, "gave up waiting")
             self.root.update()
             time.sleep(0.005)
 
     def test_sidebar_pill_glides_and_comes_to_rest(self):
         rail = self.app.rail
         self.root.deiconify()
+        self.wait_until(rail.winfo_ismapped)       # the glide only runs once the window is really on screen
+        clock = [1000.0]
         try:
-            self.app.show_page("accounts"); self.pump(400)
+            self.app.show_page("accounts"); self.wait_until(lambda: not rail.jobs)
             rail.update_idletasks()
             top, target = rail.pos["accounts"], rail.pos["stats"]
             self.assertEqual(rail.sel_y, top)
-            self.app.show_page("stats")
-            self.pump(60)
-            self.assertTrue(top < rail.sel_y < target, "mid-glide the pill is between the two items")
-            self.pump(400)
+            with mock.patch.object(av.time, "perf_counter", lambda: clock[0]):   # a clock the test controls
+                self.app.show_page("stats")        # the glide starts at clock 1000.0
+                clock[0] += 0.115                  # half way through its 230 ms
+                self.pump(40)
+                self.assertTrue(top < rail.sel_y < target, "mid-glide the pill is between the two items")
+                clock[0] += 5                      # long past the end
+                self.wait_until(lambda: not rail.jobs)
             self.assertEqual(rail.sel_y, target)
             self.assertEqual(rail.jobs, {}, "no animation timer may be left running at rest")
             self.assertEqual(rail.shades[rail.icon["stats"]], av.C["accent_text"], "the lit icon takes the accent colour")
@@ -1056,13 +1071,14 @@ class TestWindow(unittest.TestCase):
     def test_sidebar_hover_pill_follows_the_mouse_and_leaves(self):
         rail = self.app.rail
         self.root.deiconify()
+        self.wait_until(rail.winfo_ismapped)
         try:
             self.pump(100); rail.update_idletasks()
             y = lambda k: rail.pos[k] + rail.h // 2
             rail.motion(types.SimpleNamespace(x=20, y=y("games")))
             self.assertEqual(rail.hover_y, rail.pos["games"])
             rail.motion(types.SimpleNamespace(x=20, y=y("pulse")))
-            self.pump(300)
+            self.wait_until(lambda: rail.hover_y == rail.pos["pulse"])
             self.assertEqual(rail.hover_y, rail.pos["pulse"])
             self.assertEqual(rail.click(types.SimpleNamespace(x=20, y=y("pulse"))), None)
             self.assertEqual(self.app.page, "pulse")
@@ -1078,9 +1094,10 @@ class TestWindow(unittest.TestCase):
         label = tkinter.Label(self.root, text="3", fg="#ebe8f0")
         av.set_value(label, "4")
         self.assertNotEqual(label.cget("fg"), "#ebe8f0", "a changed value blinks")
-        self.pump(500)
-        self.assertEqual(label.cget("fg"), "#ebe8f0")
-        av.set_value(label, "—"); self.pump(500)
+        settled = lambda: not label.__dict__.get("_fade_jobs") and label.cget("fg") == "#ebe8f0"
+        self.wait_until(settled)
+        av.set_value(label, "—")
+        self.wait_until(settled)
         av.set_value(label, "5")
         self.assertEqual(label.cget("fg"), "#ebe8f0", "the first real value doesn't blink")
         label.destroy()
@@ -1090,10 +1107,7 @@ class TestWindow(unittest.TestCase):
         label = tkinter.Label(self.root, bg="#000000")
         av.fade(label, "bg", "#ffffff")
         av.fade(label, "bg", "#ff0000")          # a new fade takes over the running one
-        for _ in range(av.FADE_STEPS + 2):
-            self.root.update()
-            self.root.after(av.FADE_MS + 4)
-            self.root.update()
+        self.wait_until(lambda: not label.__dict__["_fade_jobs"])
         self.assertEqual(label.cget("bg"), "#ff0000")
         self.assertEqual(label.__dict__["_fade_jobs"], {}, "no timer may be left running at rest")
         av.fade(label, "bg", "#00ff00")
