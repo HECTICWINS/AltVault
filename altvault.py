@@ -34,7 +34,7 @@ import zlib
 from tkinter import filedialog, font as tkfont, ttk
 
 APP_TITLE = "AltVault"
-APP_VERSION = "2.7.1"
+APP_VERSION = "2.8.0"
 GITHUB_URL = "https://github.com/HECTICWINS/AltVault"
 APP_DIR = os.path.join(os.environ["LOCALAPPDATA"], "AltVault")
 DATA_FILE = os.path.join(APP_DIR, "accounts.dat")

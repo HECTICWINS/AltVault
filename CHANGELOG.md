@@ -2,7 +2,7 @@
 
 Every release on the [Releases](../../releases) page is built by GitHub from the tagged commit, comes with a build attestation, and is scanned by VirusTotal. See [Verify your download](README.md#verify-your-download).
 
-## Unreleased
+## 2.8.0
 
 - **Anti-AFK presses F13 by default,** so characters stay where they are instead of jumping. Settings still offers Space or a letter.
 - **Doctor:** when an account drops, AltVault reads Roblox's own logs and tells you what happened, why and what to do, with a button for the fix. Idle kicks, rejected logins, game kicks, lost connections, crashes and server moves, kept for a week.
