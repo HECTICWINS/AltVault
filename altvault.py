@@ -77,6 +77,7 @@ AFK_SETTLE_SLOW = 1.2            # ...by waiting this long after focusing a wind
 LOST_AFTER = 300                 # seconds a window may sit out of its game before it counts as disconnected
 HIDDEN_PRESENCE_EVERY = 6        # while hidden in the tray, check presence every 6th time (3 min) if windows are open
 MEMORY_ALERT = 0.92              # memory this full for 3 readings in a row, with several Roblox windows: warn
+AFK_DEFAULT_KEY = "f13"          # a key no game uses: a jump can bump a character away from what it's doing
 AFK_KEYS = {"space": 0x20, "f13": 0x7C, **{c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"}}
 
 log = logging.getLogger("altvault")
@@ -1553,6 +1554,9 @@ def explain(item):
         elif item.get("anti_afk") == "skipped":
             why, fix = why + " Anti-AFK is turned off for this account.", \
                 "Tick Anti-AFK under Performance on its right-click menu, then rejoin it."
+        elif item.get("afk_key") == "f13":
+            why += " Anti-AFK was pressing F13, so this game may not count that key as activity."
+            fix, action = "In Settings, under Anti-AFK, pick a letter this game doesn't use, then rejoin it.", None
         elif item.get("memory"):
             why += " Memory was critically low, so the client may have been too stalled to register Anti-AFK's key press."
             fix, action = "Close other apps or run fewer clients, then rejoin it.", "pulse"
@@ -3063,13 +3067,13 @@ class SettingsPage(ttk.Frame):
         section(tab, "Key it presses")
         row = ttk.Frame(tab)
         row.pack(anchor="w", pady=(8, 2))
-        self.key_var = tk.StringVar(value=str(app.settings.get("afk_key", "space")).lower())
+        self.key_var = tk.StringVar(value=str(app.settings.get("afk_key", AFK_DEFAULT_KEY)).lower())
         keys = ttk.Combobox(row, textvariable=self.key_var, state="readonly", width=8,
-                            values=["space", "f13"] + list("abcdefghijklmnopqrstuvwxyz"))
+                            values=["f13", "space"] + list("abcdefghijklmnopqrstuvwxyz"))
         keys.pack(side="left")
         keys.bind("<<ComboboxSelected>>", lambda _e: self.set_key())
-        detail(tab, "Space makes your character jump. F13 is a key no game uses, for games where jumping gets "
-               "in the way.", indent=0)
+        detail(tab, "F13 is a key no game uses, so your character stays exactly where it is. Space makes it "
+               "jump, which can bump it away from an egg or anything else it's standing at.", indent=0)
 
         tab = self.tabs["privacy"]
         section(tab, "Privacy", first=True)
@@ -5374,6 +5378,8 @@ class App:
                     details["anti_afk"] = "off"
                 elif acc and self.afk_skipped(acc):
                     details["anti_afk"] = "skipped"
+                else:
+                    details["afk_key"] = str(self.settings.get("afk_key", AFK_DEFAULT_KEY)).lower()
             item = self.doctor.add(e["kind"], user, e["t"], **details)
             if item:
                 fresh.append(item)
@@ -6739,7 +6745,7 @@ class App:
         self.afk_waiting_for = None
 
         hwnds = targets + [h for h in windows if _user32.IsIconic(h)]   # minimised ones are only reported
-        vk = AFK_KEYS.get(str(self.settings.get("afk_key", "space")).lower(), AFK_KEYS["space"])
+        vk = AFK_KEYS.get(str(self.settings.get("afk_key", AFK_DEFAULT_KEY)).lower(), AFK_KEYS[AFK_DEFAULT_KEY])
         self.afk_busy, self.afk_busy_since = True, now
         self.afk_pass_id += 1
         pass_id = self.afk_pass_id

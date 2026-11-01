@@ -4,6 +4,7 @@ Every release on the [Releases](../../releases) page is built by GitHub from the
 
 ## Unreleased
 
+- **Anti-AFK presses F13 by default,** so characters stay where they are instead of jumping. Settings still offers Space or a letter.
 - **Doctor:** when an account drops, AltVault reads Roblox's own logs and tells you what happened, why and what to do, with a button for the fix. Idle kicks, rejected logins, game kicks, lost connections, crashes and server moves, kept for a week.
 - **Home page:** status cards, quick actions, what needs attention, recent activity and a first-run checklist.
 - **New sidebar:** page names in groups, collapsible to icons (Ctrl+B).

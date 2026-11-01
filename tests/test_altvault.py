@@ -776,6 +776,15 @@ class TestDoctorLogs(unittest.TestCase):
             self.assertIn(color, ("red", "yellow"))
             self.assertTrue(action is None or action in av.DoctorPage.ACTIONS, item)
 
+    def test_the_default_key_cannot_move_a_character(self):
+        self.assertEqual(av.AFK_DEFAULT_KEY, "f13")
+        self.assertEqual(av.AFK_KEYS[av.AFK_DEFAULT_KEY], 0x7C)
+
+    def test_an_idle_kick_on_f13_says_to_change_the_key(self):
+        title, why, fix, action, _ = av.explain({"kind": "exit", "code": 278, "afk_key": "f13"})
+        self.assertIn("F13", why)
+        self.assertIn("letter", fix)
+
     def test_an_idle_kick_blames_the_real_cause(self):
         explain = lambda **k: av.explain({"kind": "exit", "code": 278, **k})
         self.assertEqual(explain(anti_afk="off")[3], "afk")

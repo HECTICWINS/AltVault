@@ -215,7 +215,7 @@ It works with RAM's normal encrypted file on the same PC and Windows account. If
 Tick **Anti-AFK** at the bottom of the window. Every 6–9 minutes while you're away (every 12–14 minutes while you're using your PC) AltVault:
 
 1. waits until you've stopped using your mouse and keyboard for 4 seconds,
-2. gives each Roblox window focus for a split second and holds Space (a jump),
+2. gives each Roblox window focus for a split second and taps F13, a key no game uses, so your character doesn't move,
 3. returns focus to the app you were using.
 
 If you touch the mouse or keyboard part-way through, it stops and gives focus straight back; the remaining windows follow later.
@@ -236,7 +236,7 @@ The key is only pressed once a Roblox window is confirmed to be in focus, so it 
 
 - To exclude accounts, select them, right-click and untick **Performance** > **Anti-AFK**.
 - Don't minimise Roblox windows; Windows can't send them input. Leave them behind other windows instead.
-- To change the key it presses, open **Settings** and pick a letter, Space or F13.
+- To change the key it presses, open **Settings** and pick F13, Space or a letter. Space makes your character jump, which can bump it away from an egg.
 
 ## Security and privacy
 
