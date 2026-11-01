@@ -43,7 +43,7 @@ A secure, lightweight Roblox account manager for Windows. Download, unzip, doubl
 - **Auto-tile:** arrange any number of Roblox windows in an even grid.
 - **Live status:** see who's online or in game, with avatars.
 - **Anti-AFK:** stops Roblox's 20-minute idle kick for every open client, while you keep using your PC.
-- **Live view:** every Roblox window as a live tile, with who's in a game, Roblox's CPU and RAM, and an egg hatch calculator.
+- **Live view:** every Roblox window as a live tile, with who's in a game and Roblox's CPU and RAM.
 - **Stream mode:** hides usernames and avatars, in AltVault and in Roblox's window titles, for screen sharing.
 - **Hide from taskbar:** keeps a dozen Roblox windows out of the taskbar and Alt+Tab.
 - **Export and import:** move your accounts to another PC in a password-protected file.
@@ -112,9 +112,10 @@ The key is saved in AltVault's data folder, so updating AltVault keeps it. You o
 ## Finding your way around
 
 - **Sidebar:** **Accounts**, **Profiles**, **Games**, **Live**, **Stats** and **Pulse** (Ctrl+1 to Ctrl+6), and **Settings** at the bottom (Ctrl+,).
+- **Doctor page:** when an account drops, the reason and the fix in plain English, worked out from Roblox's own logs on your PC. Only times and error codes are kept, for a week.
+- **Home page:** what's running, what needs you, quick actions and recent activity at a glance.
 - **Profiles page:** saved setups, a name plus some accounts and a game. **Launch** selects those accounts and joins them.
 - **Games page:** your favourite and recent games with their icons. **Pick for joining**, **Servers...**, star or remove them, or paste a link to add one.
-- **Eggs hatched (estimate):** on the Live page, type how fast one alt hatches. AltVault multiplies it by the accounts in a game, over time, and keeps a running total (Stats page; **Set total…** matches it to your game's own counter). AltVault can't read the game, so treat it as an estimate.
 - **Stats page:** how the last 24 hours or 7 days went: time in a game, launches that worked, Anti-AFK pings and misses, and windows that closed without AltVault closing them (crashes, kicks or closed by hand). AltVault keeps only these numbers, per hour, for a week, in `history.json`.
 - **Pulse page:** your PC's and Roblox's CPU and memory, live every 2 seconds while the page is open, and charted over the last hour, day or week from a reading AltVault takes once a minute.
 - **Accounts page, top:** search the list.
@@ -167,7 +168,9 @@ Paste the private server link into the **Game** box, select the accounts and cli
 
 Every selected account joins that private server, so the **Server** box and the same-server setting are ignored.
 Each account must be allowed in: for a friends-only private server, every alt needs to be friends with the owner.
-A private server link works like an invite, so AltVault never saves it to `settings.json` or the log.
+AltVault remembers the last link you used, so it's still in the **Game** box (and its list) after a restart.
+A private server link works like an invite, so it's stored encrypted to your Windows user, like your logins, and never in
+`settings.json` or the log. Stream mode keeps it off screen. **Settings > Forget private link** deletes it.
 
 ## Servers and joining a player
 
@@ -209,11 +212,13 @@ It works with RAM's normal encrypted file on the same PC and Windows account. If
 
 ## Anti-AFK
 
-Tick **Anti-AFK** at the bottom of the window. Every 6–9 minutes AltVault:
+Tick **Anti-AFK** at the bottom of the window. Every 6–9 minutes while you're away (every 12–14 minutes while you're using your PC) AltVault:
 
-1. waits until you've stopped using your mouse and keyboard for 2 seconds,
+1. waits until you've stopped using your mouse and keyboard for 4 seconds,
 2. gives each Roblox window focus for a split second and holds Space (a jump),
 3. returns focus to the app you were using.
+
+If you touch the mouse or keyboard part-way through, it stops and gives focus straight back; the remaining windows follow later.
 
 Each window is tracked on its own. If one can't be pinged (for example while it's teleporting), only that window is retried, every 30 seconds.
 If a window reaches 15 minutes without a ping, it's pinged straight away instead of waiting for you to pause, so no client gets near Roblox's 20-minute limit.

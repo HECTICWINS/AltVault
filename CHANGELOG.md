@@ -2,6 +2,19 @@
 
 Every release on the [Releases](../../releases) page is built by GitHub from the tagged commit, comes with a build attestation, and is scanned by VirusTotal. See [Verify your download](README.md#verify-your-download).
 
+## Unreleased
+
+- **Doctor:** when an account drops, AltVault reads Roblox's own logs and tells you what happened, why and what to do, with a button for the fix. Idle kicks, rejected logins, game kicks, lost connections, crashes and server moves, kept for a week.
+- **Home page:** status cards, quick actions, what needs attention, recent activity and a first-run checklist.
+- **New sidebar:** page names in groups, collapsible to icons (Ctrl+B).
+- **Settings in tabs:** General, Anti-AFK, Privacy, Appearance and Data, with a choice of accent colour and a settings backup that never holds logins or links.
+- **Notes in the corner** instead of only the tray, tooltips, and keyboard shortcuts (F1 lists them).
+- **Private server links are remembered:** the last link stays in the Game box and its list after a restart, encrypted to your Windows user. **Settings > Forget private link** deletes it.
+- **Anti-AFK disturbs you less:** every 12–14 minutes instead of 6–9 while you're using your PC, and it stops and hands focus back as soon as you touch the mouse or keyboard.
+- **Stays connected:** alerts when an account drops out of its game, is moved to another server, or its login expires, plus a low-memory warning. Waits longer before the key press when memory is nearly full, and never presses more than once.
+- A login that still works is no longer reported as expired when Roblox refuses a launch ticket.
+- **Removed:** the egg hatch calculator and the eggs hatched estimate.
+
 ## 2.7.1
 
 - **New look with a sidebar:** **Accounts**, **Profiles**, **Games**, **Live**, **Stats**, **Pulse** and **Settings**, a bigger window, and the Anti-AFK switch on every page. Buttons, boxes, checkboxes and scrollbars are redrawn with rounded corners and hover, pressed and focus looks; lists highlight the row under the pointer.

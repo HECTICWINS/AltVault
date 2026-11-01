@@ -5,6 +5,7 @@ Everything lives in %LOCALAPPDATA%\\AltVault. Account cookies are encrypted with
 DPAPI (only your Windows user on this PC can decrypt them) and are never written to the log.
 """
 import base64
+import calendar
 import collections
 import ctypes
 import ctypes.wintypes as wt
@@ -38,6 +39,7 @@ GITHUB_URL = "https://github.com/HECTICWINS/AltVault"
 APP_DIR = os.path.join(os.environ["LOCALAPPDATA"], "AltVault")
 DATA_FILE = os.path.join(APP_DIR, "accounts.dat")
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
+PRIVATE_FILE = os.path.join(APP_DIR, "private-link.dat")
 AVATAR_DIR = os.path.join(APP_DIR, "avatars")
 ICON_DIR = os.path.join(APP_DIR, "game-icons")
 LOG_FILE = os.path.join(APP_DIR, "altvault.log")
@@ -56,7 +58,9 @@ GROUP_PREFIX = "group:"            # tree row ids of group headers
 # server shortly before that. Every window's own last ping is tracked, and a window that reaches
 # AFK_URGENT is pinged without waiting for the user to pause, so none can go past ~15 minutes.
 AFK_INTERVAL = (360, 540)        # seconds between pings, randomised so it isn't a fixed rhythm
-AFK_IDLE = 2                     # seconds of no mouse/keyboard use before stealing focus
+AFK_BUSY_INTERVAL = (720, 840)   # while the PC is in use, wait this long instead: each ping borrows focus
+AFK_AWAY = 120                   # seconds without mouse/keyboard use before the PC counts as not in use
+AFK_IDLE = 4                     # seconds of no mouse/keyboard use before borrowing focus
 AFK_MAX_WAIT = 300               # if the user never pauses that long, ping anyway
 AFK_URGENT = 900                 # a window this long without a ping is pinged right away
 AFK_MIN_GAP = 240                # a pass leaves out windows pinged more recently than this
@@ -65,18 +69,32 @@ AFK_RETRY_SLOW = 60              # retry delay once a window has missed AFK_SLOW
 AFK_SLOW_AFTER = 5
 AFK_SETTLE = 0.35                # after focusing: Roblox runs slowly while hidden, let it catch up
 AFK_HOLD = 0.2                   # key hold; a short tap can fall between a slowed client's frames
+AFK_WATCH = 0.25                 # after each window, listen this long for the user coming back
 AFK_STUCK = 90                   # seconds after which a still-running pass is treated as stuck
 AFK_ALERT_AFTER = 4              # misses in a row (about 2 minutes) before a tray alert
-AFK_PRESSURE = 0.85              # memory this full makes Roblox clients stall: use slower, doubled key taps
-AFK_SETTLE_SLOW = 1.2            # ...wait this long after focusing a window
-AFK_HOLD_SLOW = 0.5              # ...hold each tap this long
-AFK_GAP_SLOW = 0.4               # ...and tap again after this pause
+AFK_PRESSURE = 0.85              # memory this full makes Roblox clients stall: give them longer to catch up
+AFK_SETTLE_SLOW = 1.2            # ...by waiting this long after focusing a window
 LOST_AFTER = 300                 # seconds a window may sit out of its game before it counts as disconnected
 HIDDEN_PRESENCE_EVERY = 6        # while hidden in the tray, check presence every 6th time (3 min) if windows are open
 MEMORY_ALERT = 0.92              # memory this full for 3 readings in a row, with several Roblox windows: warn
 AFK_KEYS = {"space": 0x20, "f13": 0x7C, **{c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"}}
 
 log = logging.getLogger("altvault")
+
+
+class ActivityFeed(logging.Handler):
+    """Keeps the latest log lines for the Home page. Log lines never hold logins, links or window titles."""
+
+    def __init__(self):
+        super().__init__(logging.INFO)
+        self.items = collections.deque(maxlen=40)
+
+    def emit(self, record):
+        self.items.appendleft((record.created, record.levelno, record.getMessage()))
+
+
+ACTIVITY = ActivityFeed()
+log.addHandler(ACTIVITY)
 
 # ---------------------------------------------------------------- Windows APIs
 
@@ -327,6 +345,12 @@ def idle_seconds():
     return ((_kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000
 
 
+def last_input_tick():
+    info = LASTINPUTINFO(ctypes.sizeof(LASTINPUTINFO))
+    _user32.GetLastInputInfo(ctypes.byref(info))
+    return info.dwTime
+
+
 def _nudge_input():
     """A zero-distance mouse move: makes this process the source of the latest input, which lifts
     Windows' foreground lock, without the side effects of a key press (an Alt tap opens menus)."""
@@ -452,20 +476,25 @@ def _step(name):
 
 
 def press_when_ready(hwnd, vk, strong=False):
-    """For a window that's now in front: lets it catch up, then taps the key, but only while it is
-    still in front. With `strong` (memory nearly full, so clients stall) it waits longer, holds each tap
-    longer and taps twice, so a tap can't fall into one stalled moment. Returns True if the key was sent."""
-    settle, hold = (AFK_SETTLE_SLOW, AFK_HOLD_SLOW) if strong else (AFK_SETTLE, AFK_HOLD)
-    time.sleep(settle)
+    """For a window that's now in front: lets it catch up, then taps the key once, but only while it is
+    still in front. With `strong` (memory nearly full, so clients stall) it waits longer first. Never more
+    than one short tap: a second tap or a long hold is a double jump, which pulls a character off whatever
+    it's standing at in the game. Returns True if the key was sent."""
+    time.sleep(AFK_SETTLE_SLOW if strong else AFK_SETTLE)
     if _user32.GetForegroundWindow() != hwnd:
         return False
     _step("pressing the key")
-    tap_key(vk, hold)
-    if strong:
-        time.sleep(AFK_GAP_SLOW)
-        if _user32.GetForegroundWindow() == hwnd:
-            tap_key(vk, hold)
+    tap_key(vk)
     return True
+
+
+def user_came_back():
+    """Waits a moment after a key tap and says if the mouse or keyboard was used in that moment. AltVault
+    makes no input during the wait, so any input is the user's."""
+    time.sleep(0.03)   # our own key-up must land first
+    mark = last_input_tick()
+    time.sleep(AFK_WATCH)
+    return last_input_tick() != mark
 
 
 def memory_used_fraction():
@@ -482,6 +511,8 @@ def anti_afk_pass(hwnds, vk, strong=False):
     doing. So any Roblox window that's covered is first moved off-screen, pinged there, and put
     back in its old place and stacking order afterwards; it is never seen. A window that's fully
     visible already is pinged where it is, since raising it changes nothing on screen.
+    If the user touches the mouse or keyboard mid-pass, the pass stops and hands focus straight back;
+    the windows it didn't reach are picked up by the next pass.
     Returns (pinged, minimised, missed) lists of hwnds, {hwnd: why it was missed}, and what was in
     front when a window refused focus (None if none did)."""
     _step("starting")
@@ -522,6 +553,9 @@ def anti_afk_pass(hwnds, vk, strong=False):
             else:
                 if press_when_ready(hwnd, vk, strong):
                     pinged.append(hwnd)
+                    if hwnd != hwnds[-1] and user_came_back():
+                        log.info("Anti-AFK: stopped early so you can use your PC; the rest follow shortly")
+                        break
                     continue
                 reasons[hwnd] = "lost focus before the key press"
             missed.append(hwnd)
@@ -843,22 +877,11 @@ def short_number(n):
     return f"{n:,.0f}" if n == int(n) else f"{n:,.1f}"
 
 
-def per_minute(value, unit):
-    """One alt's hatch speed typed as eggs/min, eggs/hour or seconds per egg, as eggs per minute."""
-    return {"min": value, "hour": value / 60, "sec": 60 / value}[unit]
-
-
-def hatch_totals(per_minute, alts):
-    """Eggs per (minute, hour, day) for `alts` alts that each hatch `per_minute`."""
-    rate = max(per_minute, 0) * max(alts, 0)
-    return rate, rate * 60, rate * 1440
-
-
 SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 76, 77, 78, 79
-DEFAULT_GEOMETRY = "1200x740"
+DEFAULT_GEOMETRY = "1320x800"
 
 
-LAYOUT_VERSION = 2   # 2.7: sidebar pages and the Live grid
+LAYOUT_VERSION = 3   # 2.8: wider sidebar and the Home page
 
 
 def work_area():
@@ -869,7 +892,7 @@ def work_area():
 
 def min_size(scale):
     w, h = work_area()
-    return min(int(900 * scale), w), min(int(640 * scale), h)
+    return min(int(1020 * scale), w), min(int(660 * scale), h)
 
 
 def fit_to_screen(geometry):
@@ -1362,6 +1385,53 @@ def restrict_to_owner(path):
         log.warning("Couldn't restrict access to %s", path)
 
 
+def load_private_link():
+    """The saved private server link, or None. A file that can't be read (made on another PC or
+    Windows user, or damaged) just means no saved link; it never stops AltVault starting."""
+    try:
+        with open(PRIVATE_FILE, "rb") as f:
+            link = unprotect(f.read()).decode("utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        log.warning("Couldn't read the saved private server link (%s)", type(e).__name__)
+        return None
+    return link if parse_private_server(link) else None
+
+
+def save_private_link(link):
+    """A private server link is an invite, so like a login it's only stored encrypted to this Windows
+    user, never in settings.json or the log. The file is replaced in one step so a crash mid-save
+    can't lose the link already saved."""
+    os.makedirs(APP_DIR, exist_ok=True)
+    tmp = PRIVATE_FILE + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(protect(link.encode("utf-8")))
+    os.replace(tmp, PRIVATE_FILE)
+    restrict_to_owner(PRIVATE_FILE)
+
+
+# What a settings backup may hold, and each value's type. Logins and private server links are not here.
+BACKUP_KEYS = {"multi": bool, "same_server": bool, "auto_tile": bool, "anti_afk": bool, "stream_mode": bool,
+               "hide_taskbar": bool, "sidebar_wide": bool, "afk_key": str, "accent": str, "favorites": list,
+               "recents": list, "profiles": list, "fps_caps": dict, "low_graphics": list, "muted": list,
+               "afk_skip": list}
+
+
+def settings_backup(settings):
+    return {"altvault_settings": 1, **{k: settings[k] for k in BACKUP_KEYS if k in settings}}
+
+
+def restore_backup(settings, data):
+    """Copies the valid values of a backup into settings. Returns how many were restored; raises
+    ValueError if it isn't a settings backup. Unknown keys and wrong types are ignored."""
+    if not isinstance(data, dict) or data.get("altvault_settings") != 1:
+        raise ValueError("not an AltVault settings backup")
+    good = {k: v for k, v in data.items() if isinstance(v, BACKUP_KEYS.get(k, ()))}
+    settings.update(good)
+    return len(good)
+
+
 def load_settings():
     try:
         with open(SETTINGS_FILE, encoding="utf-8") as f:
@@ -1375,6 +1445,204 @@ def save_settings(settings):
     os.makedirs(APP_DIR, exist_ok=True)
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(settings, f)
+
+
+# ---------------------------------------------------------------- Doctor
+# Works out why an account dropped, from what Roblox itself writes to its log files. Each log names
+# its account (userid), so evidence is tied to the right one. Only new bytes are read, once a minute
+# while Roblox is open. Findings hold numbers and times only: no log text, names or server IDs.
+DOCTOR_FILE = os.path.join(APP_DIR, "doctor.json")
+DOCTOR_DAYS, DOCTOR_MAX = 7, 300
+DOCTOR_FIRST_LOOK = 24 * 3600     # how far back the very first scan looks
+DOCTOR_MEMORY_NEAR = 120          # critical memory this close to a drop counts as evidence
+DOCTOR_FRESH = 300                # a finding this recent describes what's true right now
+CLIENT_LEFT = 285                 # the client left by itself: closed, or teleporting. Not a problem.
+LOG_FILE_RE = re.compile(r".*_Player_[0-9A-Fa-f]+_last\.log")
+LOG_EVENT = re.compile(rb"Sending disconnect with reason: (\d+)|Joining game '([0-9a-fA-F-]{36})' place (\d+)"
+                       rb"|clienttime:[\d.]+, userid:(\d+)|memoryPrioritizationCallback \(level:3\)")
+
+
+def log_time(text):
+    """A log line's UTC 'YYYY-MM-DDTHH:MM:SS' as Unix time, or None if it isn't one."""
+    try:
+        return calendar.timegm(time.strptime(text.decode("ascii"), "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def parse_client_log(state, data):
+    """Reads whole lines of one client's log into events, carrying `state` (a dict) between calls.
+    Returns [{'t', 'user', 'kind': 'exit'|'moved', 'code', 'memory'}]."""
+    stamp = lambda pos: data[data.rfind(b"\n", 0, pos) + 1:][:19]
+    events, memory_at = [], None
+
+    def memory_near(t):
+        last = log_time(stamp(memory_at)) if memory_at is not None else state.get("memory")
+        return last is not None and 0 <= t - last <= DOCTOR_MEMORY_NEAR
+
+    for m in LOG_EVENT.finditer(data):
+        code, job, place, user = m.group(1), m.group(2), m.group(3), m.group(4)
+        if user:
+            state["user"] = int(user)
+        elif job:
+            if state.get("job") not in (None, job) and state.get("place") == place:
+                t = log_time(stamp(m.start()))
+                if t is not None:
+                    events.append({"t": t, "user": state.get("user"), "kind": "moved", "code": None, "memory": memory_near(t)})
+            state["job"], state["place"] = job, place
+        elif code:
+            t = log_time(stamp(m.start()))
+            if t is not None and (t, int(code)) != state.get("last_exit"):   # Roblox writes each one twice
+                state["last_exit"] = (t, int(code))
+                events.append({"t": t, "user": state.get("user"), "kind": "exit", "code": int(code), "memory": memory_near(t)})
+        else:
+            memory_at = m.start()
+    if memory_at is not None:
+        state["memory"] = log_time(stamp(memory_at))
+    return events
+
+
+# What Roblox's disconnect codes mean: (title, why, what to do, button, colour key).
+DOCTOR_CODES = {
+    264: ("Signed in somewhere else", "This account joined from another device or session, so Roblox ended this one.",
+          "Make sure the account isn't open anywhere else, such as a phone or another PC, then rejoin it.", None, "red"),
+    266: ("Connection timed out", "Roblox stopped hearing from this client. A stalled client or a network drop both do this.",
+          "Check your internet, then rejoin it.", "live", "yellow"),
+    267: ("Kicked by the game", "The game removed this player itself. That's the game's own rule, not Roblox or AltVault.",
+          "Check the message in the Roblox window for the game's reason.", "live", "red"),
+    268: ("Kicked for unexpected behaviour", "Roblox's client check ended this session.",
+          "Rejoin it once. If it keeps happening, stop running other tools alongside this client.", "live", "red"),
+    273: ("Signed in somewhere else", "Roblox ended this session because the account joined from somewhere else.",
+          "Make sure the account isn't open anywhere else, such as a phone or another PC, then rejoin it.", None, "red"),
+    277: ("Lost connection", "The connection to the game server dropped.",
+          "Check your internet. If only this account dropped, rejoin it.", "live", "yellow"),
+    279: ("Couldn't connect to the server", "The client never finished connecting to the game server.",
+          "Try joining again. If every account fails, the game or Roblox may be having problems.", "live", "yellow"),
+    286: ("Out of memory", "Roblox said this PC didn't have enough memory to keep running the game.",
+          "Close other apps or run fewer clients.", "pulse", "red"),
+}
+DOCTOR_EVENTS = {
+    "login": ("Login rejected", "Roblox no longer accepts this account's saved login, so it can't launch or stay connected.",
+              "Right-click the account and choose Log in again.", "login", "red"),
+    "lost": ("Out of the game", "Its window stayed open, but the account has been outside any game for over 5 minutes, "
+             "and Roblox gave no disconnect reason.", "Check the window on the Live page, then rejoin it.", "live", "red"),
+    "crash": ("Client closed unexpectedly", "The Roblox window disappeared and Roblox wrote no reason to its log, "
+              "which usually means it crashed.", "Rejoin it. If it keeps happening, check how full your memory is.", "pulse", "red"),
+    "moved": ("Moved to another server", "The account left its server and rejoined a different one of the same game. "
+              "Roblox's log doesn't say what started the move.", "Nothing, unless you need it to stay in one server.", None, "yellow"),
+    "memory": ("Memory nearly full", "Roblox clients stall when memory runs out, and stalled clients can miss Anti-AFK's key press.",
+               "Close other apps or run fewer clients.", "pulse", "yellow"),
+}
+
+
+def explain(item):
+    """(title, why, what to do, button, colour key) for a finding."""
+    code = item.get("code")
+    if item["kind"] != "exit":
+        title, why, fix, action, color = DOCTOR_EVENTS[item["kind"]]
+        if item.get("lasted"):
+            why += f" It stopped working {item['lasted']} after it was saved."
+        if item.get("memory"):
+            why += " Memory was critically low at the time."
+        return title, why, fix, action, color
+    if code == 278:
+        title, why, fix, action = "Idle-kicked by Roblox", "Roblox saw no input from this client for 20 minutes.", \
+            "Rejoin it. Keep its window open, not minimised, so Anti-AFK can reach it.", "live"
+        if item.get("anti_afk") == "off":
+            why, fix, action = why + " Anti-AFK was off.", "Turn on Anti-AFK, then rejoin it.", "afk"
+        elif item.get("anti_afk") == "skipped":
+            why, fix = why + " Anti-AFK is turned off for this account.", \
+                "Tick Anti-AFK under Performance on its right-click menu, then rejoin it."
+        elif item.get("memory"):
+            why += " Memory was critically low, so the client may have been too stalled to register Anti-AFK's key press."
+            fix, action = "Close other apps or run fewer clients, then rejoin it.", "pulse"
+        return title, why, fix, action, "red"
+    if code in DOCTOR_CODES:
+        title, why, fix, action, color = DOCTOR_CODES[code]
+        if item.get("memory"):
+            why += " Memory was critically low at the time."
+    else:
+        title, why, fix, action, color = "Disconnected", "Roblox ended this session with a code AltVault doesn't know.", \
+            "Rejoin it. If it keeps happening, look the code up on Roblox's support pages.", "live", "yellow"
+    return f"{title} (error {code})" if code else title, why, fix, action, color
+
+
+class Doctor:
+    """Findings, newest first, kept in doctor.json. scan() runs on a worker thread and touches only the
+    log bookkeeping; everything else is used from the Tk thread."""
+
+    def __init__(self, path=None, folder=None):
+        self.path = path or DOCTOR_FILE
+        self.folder = folder or os.path.join(os.environ.get("LOCALAPPDATA", ""), "Roblox", "logs")
+        self.items, self.logs, self.exits, self.dirty = [], {}, {}, False
+        self.since = time.time() - DOCTOR_FIRST_LOOK
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                data = json.load(f)
+            self.since = max(float(data["since"]), self.since - DOCTOR_DAYS * 86400)
+            self.items = [i for i in data["items"] if isinstance(i, dict) and isinstance(i.get("t"), (int, float))
+                          and (i.get("kind") in DOCTOR_EVENTS or i.get("kind") == "exit")]
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            pass
+
+    def add(self, kind, account_id, t=None, **details):
+        """Records a finding. Returns it, or None if the same one is already there."""
+        item = {"t": int(time.time() if t is None else t), "kind": kind, "id": account_id, **details}
+        if any((i["t"], i["kind"], i.get("id")) == (item["t"], kind, account_id) for i in self.items):
+            return None
+        self.items.append(item)
+        cutoff = time.time() - DOCTOR_DAYS * 86400
+        self.items = sorted((i for i in self.items if i["t"] >= cutoff), key=lambda i: i["t"], reverse=True)[:DOCTOR_MAX]
+        self.dirty = True
+        return item if item in self.items else None
+
+    def count(self, kinds, hours=24):
+        cutoff = time.time() - hours * 3600
+        return sum(1 for i in self.items if i["t"] >= cutoff and i["kind"] in kinds)
+
+    def scan(self):
+        """New events from Roblox's logs since the last call."""
+        events = []
+        try:
+            names = [n for n in os.listdir(self.folder) if LOG_FILE_RE.fullmatch(n) and "CrashHandler" not in n]
+        except OSError:
+            return events
+        seen = set()
+        for name in names:
+            path = os.path.join(self.folder, name)
+            seen.add(path)
+            try:
+                info = os.stat(path)
+                state = self.logs.get(path)
+                if state is None:
+                    if info.st_mtime < self.since:
+                        continue
+                    state = self.logs[path] = {"offset": 0}
+                if info.st_size <= state["offset"]:
+                    continue
+                with open(path, "rb") as f:
+                    f.seek(state["offset"])
+                    data = f.read()
+            except OSError:   # Roblox can delete old logs at any moment
+                continue
+            end = data.rfind(b"\n") + 1   # the last line may be half written; it's read next time
+            state["offset"] += end
+            for event in parse_client_log(state, data[:end]):
+                if event["kind"] == "exit" and event["user"]:
+                    self.exits[event["user"]] = event["t"]
+                if event["t"] > self.since:
+                    events.append(event)
+        self.logs = {p: st for p, st in self.logs.items() if p in seen}
+        return sorted(events, key=lambda e: e["t"])
+
+    def save(self):
+        self.since = max(self.since, time.time() - DOCTOR_FRESH)
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"since": self.since, "items": self.items}, f)
+        os.replace(tmp, self.path)
+        self.dirty = False
 
 
 # ---------------------------------------------------------------- transfer file
@@ -1636,8 +1904,9 @@ def _request(url, cookie=None, method="GET", headers=None, data=None):
         raise RobloxError(f"Network error: {getattr(e, 'reason', None) or type(e).__name__}") from None
 
 
-def _post(url, cookie, payload=None, extra_headers=None):
-    """POST with Roblox's CSRF handshake: the first attempt returns the token to retry with."""
+def _post(url, cookie, payload=None, extra_headers=None, expire=True):
+    """POST with Roblox's CSRF handshake: the first attempt returns the token to retry with. A 401
+    raises CookieExpired unless expire=False, which hands it back so the caller can look closer."""
     headers = {"Referer": "https://www.roblox.com/", "Origin": "https://www.roblox.com",
                "Content-Type": "application/json", **(extra_headers or {})}
     body = json.dumps(payload).encode() if payload is not None else b""
@@ -1645,7 +1914,7 @@ def _post(url, cookie, payload=None, extra_headers=None):
     if status == 403 and hdrs.get("x-csrf-token"):
         headers["X-CSRF-TOKEN"] = hdrs["x-csrf-token"]
         status, hdrs, data = _request(url, cookie, "POST", headers, body)
-    if status == 401:
+    if status == 401 and expire:
         raise CookieExpired()
     return status, hdrs, data
 
@@ -1775,9 +2044,24 @@ def get_headshots(user_ids, size):
     return result
 
 
+def _ticket_request(cookie):
+    return _post("https://auth.roblox.com/v1/authentication-ticket", cookie,
+                 extra_headers={"RBXAuthenticationNegotiation": "1"}, expire=False)
+
+
 def get_auth_ticket(cookie):
-    status, hdrs, _ = _post("https://auth.roblox.com/v1/authentication-ticket", cookie,
-                            extra_headers={"RBXAuthenticationNegotiation": "1"})
+    status, hdrs, body = _ticket_request(cookie)
+    if status == 401:
+        # The ticket call says 401 for a login that is really dead, but Roblox also refuses it for a
+        # login that still works on the website. Only a failing profile check proves expiry.
+        get_user(cookie)   # raises CookieExpired if the login is genuinely gone
+        said = re.sub(r"[^ -~]", "", body.decode("utf-8", "replace"))[:160]
+        log.warning("Roblox refused a launch ticket (HTTP 401: %s) although the login still works; retrying", said)
+        time.sleep(2)
+        status, hdrs, body = _ticket_request(cookie)
+        if status == 401:
+            raise RobloxError("Roblox refused to start this account even though its login still works. "
+                              "Wait a minute and try again, or launch fewer accounts at once.")
     ticket = hdrs.get("rbx-authentication-ticket")
     if status != 200 or not ticket:
         raise RobloxError(f"Couldn't get a login ticket (HTTP {status}).")
@@ -2153,6 +2437,28 @@ PANEL_BUTTON = {"normal": (C["bg"], C["line"]), "active": (C["hover"], C["line_h
                 "pressed": (C["sel"], C["line_hover"]), "disabled": (C["bg"], C["line"])}
 
 
+# The accent colours you can pick. Everything else in the palette stays the same.
+ACCENTS = {
+    "Violet": {"accent": "#7446e0", "accent_hover": "#6438c9", "accent_pressed": "#552fae",
+               "accent_light": "#8a5ff0", "accent_text": "#b49cff"},
+    "Blue": {"accent": "#3b76e8", "accent_hover": "#2f65cf", "accent_pressed": "#2755ae",
+             "accent_light": "#5b92f5", "accent_text": "#9cc4ff"},
+    "Teal": {"accent": "#14a08f", "accent_hover": "#118a7c", "accent_pressed": "#0e7367",
+             "accent_light": "#2cc0ae", "accent_text": "#7fe3d6"},
+    "Rose": {"accent": "#d9437a", "accent_hover": "#c0386a", "accent_pressed": "#a22f59",
+             "accent_light": "#ec6491", "accent_text": "#ffa3c0"},
+}
+
+
+def apply_accent(name):
+    """Switches the palette to a saved accent. Must run before apply_theme, which bakes the colours in."""
+    colors = ACCENTS.get(name) or ACCENTS["Violet"]
+    swap = {C[key]: value for key, value in colors.items()}
+    for state, value in ACCENT.items():
+        ACCENT[state] = tuple(swap.get(v, v) for v in value)
+    C.update(colors)
+
+
 def apply_theme(root, scale):
     """Discord-like dark theme. Buttons, boxes, checkboxes and scrollbars are drawn as rounded
     images with their own hover, pressed and focus looks; Tk's stock widgets are square and flat."""
@@ -2293,10 +2599,22 @@ def apply_theme(root, scale):
     # Glass cards: rounded, a hair of tint, and a rim that glows along the top edge. The fill is flat,
     # so text labels drawn on a card (with the card's colour behind them) sit cleanly on it.
     gr = max(round(7 * scale), 4)
-    glass = image("glass", 2 * (gr + 1) + round(56 * scale), 2 * (gr + 1) + round(56 * scale), gr, C["panel"],
-                  C["line"], border_w=hair, light=C["glass_light"], light_h=round(18 * scale))
-    s.element_create("AVGlass.bg", "image", glass, border=gr + 1, width=2 * gr, height=2 * gr, sticky="nsew")
+    glow = round(18 * scale)
+    # Tk repeats whatever is outside the border, so the whole glow must sit inside it. Otherwise the
+    # glow's gradient repeats down both sides and the rim looks like a dashed line.
+    top = root.altvault_glass_top = glow + 1
+    side, middle = gr + 1, round(56 * scale)
+
+    def glass_card(name, fill, rim):
+        picture = image(name, 2 * side + middle, top + side + middle, gr, fill, rim, border_w=hair,
+                        light=C["glass_light"], light_h=glow)
+        s.element_create(f"{name}.bg", "image", picture, border=(side, top, side, side),
+                         width=2 * side, height=top + side, sticky="nsew")
+
+    glass_card("AVGlass", C["panel"], C["line"])
     s.layout("Glass.TFrame", [("AVGlass.bg", {"sticky": "nsew"})])
+    glass_card("AVGlassHover", C["hover"], C["line_hover"])
+    s.layout("GlassHover.TFrame", [("AVGlassHover.bg", {"sticky": "nsew"})])
 
 
 def add_placeholder(entry, var, text):
@@ -2687,85 +3005,118 @@ def check_and_add(app, entries, report, favorites=None):
 
 
 class SettingsPage(ttk.Frame):
-    """Options you set once, in two columns. Everyday controls (Join, Anti-AFK) stay elsewhere."""
+    """Options you set once, grouped into tabs. Everyday controls (Join, Anti-AFK) stay elsewhere."""
+
+    TABS = (("general", "General"), ("afk", "Anti-AFK"), ("privacy", "Privacy"),
+            ("look", "Appearance"), ("data", "Data"))
 
     def __init__(self, app, parent):
         super().__init__(parent)
         self.app = app
-        wrap = int(300 * app.scale)
-        page_header(self, "Settings", "Things you set once. Changes are saved straight away.")
-        cols = ttk.Frame(self)
-        cols.pack(fill="both", expand=True, pady=(int(4 * app.scale), 0))
-        left, right = ttk.Frame(cols), ttk.Frame(cols)
-        left.grid(row=0, column=0, sticky="nwe", padx=(0, int(32 * app.scale)))
-        right.grid(row=0, column=1, sticky="nwe")
-        cols.columnconfigure((0, 1), weight=1, uniform="col")
-        self.wrapped = []   # labels that rewrap when the page is resized
+        s = app.scale
+        wrap = int(560 * s)
+        header, _ = page_header(self, "Settings", "Changes are saved straight away.")
+        self.tab = Segmented(header, self.TABS, "general", lambda key: self.show_tab(key), s)
+        self.tab.pack(side="right", anchor="s")
+        self.body = ttk.Frame(self)
+        self.body.pack(fill="both", expand=True, pady=(int(8 * s), 0))
+        self.tabs = {key: ttk.Frame(self.body) for key, _ in self.TABS}
+        self.tabs["general"].pack(fill="both", expand=True)
 
         def section(frm, title, first=False):
-            ttk.Label(frm, text=title, style="Section.TLabel").pack(anchor="w", pady=(10 if first else 18, 0))
+            ttk.Label(frm, text=title, style="Section.TLabel").pack(anchor="w", pady=(6 if first else 18, 0))
 
         def detail(frm, text, indent=24):
             label = ttk.Label(frm, text=text, style="Small.TLabel", wraplength=wrap, justify="left")
             label.pack(anchor="w", fill="x", padx=(indent, 0))
-            self.wrapped.append((label, indent))
 
         def option(frm, var, title, text, command):
             ttk.Checkbutton(frm, text=title, variable=var, command=command).pack(anchor="w", pady=(8, 0))
             detail(frm, text)
 
-        section(left, "Joining", first=True)
-        option(left, app.multi_var, "Multi-Roblox", "Run several Roblox windows at once. Turn off only if you "
+        def buttons(frm, *items):
+            row = ttk.Frame(frm)
+            row.pack(anchor="w", pady=(8, 0))
+            for i, (text, command) in enumerate(items):
+                ttk.Button(row, text=text, command=command).pack(side="left", padx=(6 if i else 0, 0))
+
+        tab = self.tabs["general"]
+        section(tab, "Joining", first=True)
+        option(tab, app.multi_var, "Multi-Roblox", "Run several Roblox windows at once. Turn off only if you "
                "want each launch to replace the previous window.", app.toggle_multi)
-        option(left, app.same_server_var, "Put accounts in the same server",
+        option(tab, app.same_server_var, "Put accounts in the same server",
                "When joining several accounts with no server chosen, they all follow the first one.",
                app.save_settings)
-        option(left, app.auto_tile_var, "Arrange windows after joining",
+        option(tab, app.auto_tile_var, "Arrange windows after joining",
                "Splits the screen evenly between every Roblox window, like the Tile button.", app.save_settings)
+        section(tab, "Private servers")
+        detail(tab, "The last private server link you used is kept, encrypted to your Windows user, and comes "
+               "back in the Game box when you reopen AltVault.", indent=0)
+        buttons(tab, ("Forget private link", app.forget_private_link))
 
-        section(left, "Anti-AFK")
-        row = ttk.Frame(left)
+        tab = self.tabs["afk"]
+        section(tab, "How it works", first=True)
+        detail(tab, "Roblox only reads input from the window in front, so Anti-AFK borrows focus for a moment and "
+               "gives it straight back. It waits for you to pause, pings less often while you're using your PC, "
+               "and stops as soon as you touch the mouse or keyboard. Switch it on or off at the bottom of any page.",
+               indent=0)
+        section(tab, "Key it presses")
+        row = ttk.Frame(tab)
         row.pack(anchor="w", pady=(8, 2))
-        ttk.Label(row, text="Key it presses").pack(side="left")
         self.key_var = tk.StringVar(value=str(app.settings.get("afk_key", "space")).lower())
         keys = ttk.Combobox(row, textvariable=self.key_var, state="readonly", width=8,
                             values=["space", "f13"] + list("abcdefghijklmnopqrstuvwxyz"))
-        keys.pack(side="left", padx=(8, 0))
+        keys.pack(side="left")
         keys.bind("<<ComboboxSelected>>", lambda _e: self.set_key())
-        detail(left, "Space makes your character jump. F13 is a key no game uses, for games where "
-               "jumping gets in the way.", indent=0)
+        detail(tab, "Space makes your character jump. F13 is a key no game uses, for games where jumping gets "
+               "in the way.", indent=0)
 
-        section(right, "Privacy", first=True)
-        option(right, app.stream_var, "Stream mode", "Hides usernames and avatars in AltVault and in Roblox "
-               "window titles, so you can share your screen.", app.toggle_stream)
-        option(right, app.hide_taskbar_var, "Hide Roblox from the taskbar", "Keeps the taskbar and Alt+Tab "
+        tab = self.tabs["privacy"]
+        section(tab, "Privacy", first=True)
+        option(tab, app.stream_var, "Stream mode", "Hides usernames, avatars and your saved private server link "
+               "in AltVault, and usernames in Roblox window titles, so you can share your screen.", app.toggle_stream)
+        option(tab, app.hide_taskbar_var, "Hide Roblox from the taskbar", "Keeps the taskbar and Alt+Tab "
                "clear. Open a window from the Live page instead.", app.toggle_taskbar)
 
-        section(right, "Your accounts")
-        detail(right, "Updates keep your accounts by themselves. To move them to another PC or Windows "
+        tab = self.tabs["look"]
+        section(tab, "Accent colour", first=True)
+        current = app.settings.get("accent") if app.settings.get("accent") in ACCENTS else "Violet"
+        self.accent = Segmented(tab, [(name, name) for name in ACCENTS], current, self.set_accent, s)
+        self.accent.pack(anchor="w", pady=(8, 0))
+        detail(tab, "Used on the selected page, main buttons, ticks and charts. A new colour applies the next "
+               "time you open AltVault.", indent=0)
+        section(tab, "Sidebar")
+        self.wide_var = tk.BooleanVar(value=app.settings.get("sidebar_wide", True))
+        option(tab, self.wide_var, "Show page names", "Turn off for a slim, icons-only sidebar. Ctrl+B does the same.",
+               lambda: app.set_sidebar(self.wide_var.get()))
+
+        tab = self.tabs["data"]
+        section(tab, "Your accounts", first=True)
+        detail(tab, "Updates keep your accounts by themselves. To move them to another PC or Windows "
                "user, export them to a file locked with a password.", indent=0)
-        row = ttk.Frame(right)
-        row.pack(anchor="w", pady=(8, 0))
-        ttk.Button(row, text="Export...", command=app.export_accounts).pack(side="left")
-        ttk.Button(row, text="Import...", command=app.import_accounts).pack(side="left", padx=(6, 0))
+        buttons(tab, ("Export accounts...", app.export_accounts), ("Import accounts...", app.import_accounts))
+        section(tab, "Your settings")
+        detail(tab, "Back up your options, games, profiles and per-account settings. Logins and private server "
+               "links are never included.", indent=0)
+        buttons(tab, ("Back up settings...", app.export_settings), ("Restore settings...", app.import_settings))
+        section(tab, "About")
+        ttk.Label(tab, text=f"AltVault {APP_VERSION}  ·  Made by HecticWins").pack(anchor="w", pady=(6, 0))
+        buttons(tab, ("Open on GitHub", lambda: webbrowser.open(GITHUB_URL)),
+                ("Open log folder", lambda: os.startfile(APP_DIR)), ("Keyboard shortcuts", app.show_shortcuts))
 
-        section(right, "About")
-        ttk.Label(right, text=f"AltVault {APP_VERSION}  ·  Made by HecticWins").pack(anchor="w", pady=(6, 0))
-        links = ttk.Frame(right)
-        links.pack(anchor="w", pady=(6, 0))
-        ttk.Button(links, text="Open on GitHub",
-                   command=lambda: webbrowser.open(GITHUB_URL)).pack(side="left")
-        ttk.Button(links, text="Open log folder", command=lambda: os.startfile(APP_DIR)).pack(side="left", padx=(6, 0))
-        left.bind("<Configure>", self.rewrap)
-
-    def rewrap(self, event):
-        for label, indent in self.wrapped:
-            label.config(wraplength=max(event.width - indent - 4, 120))
+    def show_tab(self, key):
+        for name, frame in self.tabs.items():
+            frame.pack_forget() if name != key else frame.pack(fill="both", expand=True)
 
     def set_key(self):
         self.app.settings["afk_key"] = self.key_var.get()
         save_settings(self.app.settings)
         self.app.status.config(text=f"Anti-AFK will press {self.key_var.get().upper()}.")
+
+    def set_accent(self, name):
+        self.app.settings["accent"] = name
+        save_settings(self.app.settings)
+        self.app.toast("Accent colour saved", f"{name} applies the next time you open AltVault.")
 
 
 class PasswordDialog(tk.Toplevel):
@@ -2838,7 +3189,6 @@ class LivePage(ttk.Frame):
 
     SAMPLE_MS = 3000
     GAP = 6
-    UNITS = (("min", "eggs/min"), ("hour", "eggs/hour"), ("sec", "sec/egg"))
 
     def __init__(self, app, parent):
         super().__init__(parent)
@@ -2943,36 +3293,6 @@ class LivePage(ttk.Frame):
         self.ram_bar.pack(fill="x", padx=pad, pady=(int(5 * s), 0))
         self.ram_bar.bind("<Configure>", lambda _e: self.draw_ram_bar())
 
-        section("Egg hatch")
-        saved = self.app.settings.get("hatch")
-        saved = saved if isinstance(saved, dict) else {}
-        value, unit = saved.get("value"), saved.get("unit")
-        self.unit = unit if unit in dict(self.UNITS) else "min"
-        self.eggs_var = tk.StringVar(value=f"{value:g}" if isinstance(value, (int, float)) and value > 0 else "")
-        eggs = ttk.Entry(self.panel, textvariable=self.eggs_var)
-        eggs.pack(fill="x", padx=pad, pady=(int(2 * s), 0))
-        add_placeholder(eggs, self.eggs_var, "e.g. 58  (one alt's hatch speed)")
-        self.eggs_var.trace_add("write", lambda *_: self.eggs_changed())
-        seg = tk.Frame(self.panel, bg=C["field"])
-        seg.pack(fill="x", padx=pad, pady=(int(6 * s), int(2 * s)))
-        self.unit_btns = {}
-        for key, text in self.UNITS:
-            btn = tk.Label(seg, text=text, bg=C["field"], fg=C["muted"], font=small, cursor="hand2", pady=int(3 * s))
-            btn.pack(side="left", fill="x", expand=True, padx=1, pady=1)
-            btn.bind("<Button-1>", lambda _e, k=key: self.set_unit(k))
-            self.unit_btns[key] = btn
-        stat("per_min", "Per minute")
-        stat("per_hour", "Per hour")
-        stat("per_day", "Per day")
-        stat("hatched", "Hatched, 24 h (est.)")
-        self.values["per_hour"].config(fg=C["accent_text"])
-        self.hint_box = tk.Frame(self.panel, bg=P)   # holds the hint so it keeps its place when hidden
-        self.hint_box.pack(fill="x")
-        self.hint_shown = True
-        self.hatch_hint = label(self.hint_box, "", fg=C["muted"], font=small, justify="left", wraplength=int(205 * s))
-        self.hatch_hint.pack(anchor="w", padx=pad, pady=(int(3 * s), 0))
-        self.paint_units()
-
         # Lowest priority: dropped when the window is too short to show it without cutting off.
         self.day_box = tk.Frame(self.panel, bg=P)
         self.day_shown = False
@@ -2989,87 +3309,18 @@ class LivePage(ttk.Frame):
         self.panel.bind("<Configure>", lambda _e: self.fit_panel())
 
     def fit_panel(self):
-        """Keeps the stats column from being cut off: the 24-hour block is dropped first if the window
-        is too short, then the explanatory hint under the hatch totals."""
-        wrap = max(self.panel.winfo_width() - 2 * int(16 * self.app.scale), 80)
-        self.hatch_hint.config(wraplength=wrap)
+        """Keeps the stats column from being cut off: the 24-hour block is dropped if the window is
+        too short for it."""
         self.panel.update_idletasks()
-        optional = (self.day_box, self.hint_box)
         # Where the last always-shown row really ends on screen (no guessing at padding).
         fixed_bottom = max(w.winfo_y() + w.winfo_height() for w in self.panel.winfo_children()
-                           if w not in optional and w.winfo_manager())
+                           if w is not self.day_box and w.winfo_manager())
         day_h = self.day_box.winfo_reqheight() + int(10 * self.app.scale)
-        hint_h = self.hatch_hint.winfo_reqheight() + int(8 * self.app.scale)
-        room = self.panel.winfo_height() - fixed_bottom - int(8 * self.app.scale)
-        show_day = room >= day_h
-        room -= day_h if show_day else 0
-        show_hint = room >= hint_h
-        if (show_day, show_hint) != (self.day_shown, self.hint_shown):
-            self.after_idle(self.fit_panel)   # layout moved; measure again until it settles
+        show_day = self.panel.winfo_height() - fixed_bottom - int(8 * self.app.scale) >= day_h
         if show_day != self.day_shown:
             self.day_shown = show_day
+            self.after_idle(self.fit_panel)   # layout moved; measure again until it settles
             self.day_box.pack(fill="x") if show_day else self.day_box.pack_forget()
-        if show_hint != self.hint_shown:
-            self.hint_shown = show_hint
-            if show_hint:
-                self.hatch_hint.pack(anchor="w", padx=int(16 * self.app.scale), pady=(int(3 * self.app.scale), 0))
-            else:   # an emptied frame keeps its old height unless told otherwise
-                self.hatch_hint.pack_forget()
-                self.hint_box.config(height=1)
-
-    def set_unit(self, unit):
-        self.unit = unit
-        self.paint_units()
-        self.eggs_changed()
-
-    def paint_units(self):
-        for key, btn in self.unit_btns.items():
-            on = key == self.unit
-            btn.config(bg=C["sel"] if on else C["field"], fg=C["fg"] if on else C["muted"])
-
-    def eggs_value(self):
-        try:
-            value = float(self.eggs_var.get().replace(",", "."))
-        except ValueError:
-            return None
-        return value if 0 < value < 1e9 and math.isfinite(value) else None
-
-    def eggs_rate(self):
-        """Eggs per minute for one alt, whichever unit it was typed in."""
-        value = self.eggs_value()
-        return None if value is None else per_minute(value, self.unit)
-
-    def eggs_changed(self):
-        value = self.eggs_value()
-        if value is None:
-            self.app.settings.pop("hatch", None)
-        else:
-            self.app.settings["hatch"] = {"value": value, "unit": self.unit}
-        save_settings(self.app.settings)
-        self.update_hatch()
-
-    def update_hatch(self):
-        before = str(self.hatch_hint.cget("text"))
-        self._update_hatch()
-        if str(self.hatch_hint.cget("text")) != before:   # the hint's height changed: refit the column
-            self.after_idle(self.fit_panel)
-
-    def _update_hatch(self):
-        rate, alts = self.eggs_rate(), self.count("green")
-        if rate is None:
-            for key in ("per_min", "per_hour", "per_day"):
-                set_value(self.values[key], "—")
-            set_text(self.hatch_hint, "Type how fast ONE alt hatches (you read it in the game), then pick its "
-                                      "unit. AltVault multiplies it by the accounts in a game.")
-            return
-        for key, total in zip(("per_min", "per_hour", "per_day"), hatch_totals(rate, alts)):
-            set_value(self.values[key], short_number(total))
-        if alts:
-            set_text(self.hatch_hint, f"{alts} alt{'s' if alts != 1 else ''} in a game · "
-                                      f"{short_number(rate * 60)} per hour each")
-        else:
-            set_text(self.hatch_hint, "No account is in a game yet, so the totals are 0. They count up "
-                                      "as accounts join.")
 
     def count(self, color):
         return sum(1 for t in self.tiles.values() if t.color == color)
@@ -3136,7 +3387,6 @@ class LivePage(ttk.Frame):
         set_value(self.values["day_launch"], "—" if launch is None else f"{launch:.1f}%")
         set_value(self.values["day_pings"], short_number(day("pings")))
         set_value(self.values["day_closed"], f"{day('closed'):g}")
-        set_value(self.values["hatched"], short_number(day("eggs")))
         self.sample_job = self.after(1000 if cpu is None and pids else self.SAMPLE_MS, self.sample)
 
     # ------------------------------------------------------------ tiles
@@ -3188,7 +3438,6 @@ class LivePage(ttk.Frame):
             self.place_thumbs()
         self.update_headline()
         self.update_toolbar()
-        self.update_hatch()
 
     def layout(self):
         if not self.shown:
@@ -3503,40 +3752,86 @@ class FlashLabel(tk.Label):
     config = configure
 
 
+_tip_window = None
+
+
+def show_tip(owner, x, y, text):
+    hide_tip()
+    global _tip_window
+    _tip_window = tk.Toplevel(owner)
+    _tip_window.overrideredirect(True)
+    _tip_window.attributes("-topmost", True)
+    tk.Label(_tip_window, text=text, bg=C["field"], fg=C["fg"], font=FONT, padx=8, pady=4, justify="left",
+             wraplength=320, highlightthickness=1, highlightbackground=C["line_hover"]).pack()
+    _tip_window.geometry(f"+{x}+{y}")
+
+
+def hide_tip():
+    global _tip_window
+    if _tip_window is not None:
+        try:
+            _tip_window.destroy()
+        except tk.TclError:
+            pass
+        _tip_window = None
+
+
+def tip(widget, text):
+    """Explains a control after the mouse has rested on it for a moment."""
+    job = [None]
+
+    def enter(_e):
+        job[0] = widget.after(500, lambda: show_tip(widget, widget.winfo_rootx(),
+                                                    widget.winfo_rooty() + widget.winfo_height() + 4, text))
+
+    def leave(_e):
+        if job[0]:
+            widget.after_cancel(job[0])
+            job[0] = None
+        hide_tip()
+    widget.bind("<Enter>", enter, add="+")
+    widget.bind("<Leave>", leave, add="+")
+    widget.bind("<Button-1>", leave, add="+")
+
+
 class Rail(tk.Canvas):
     """The sidebar, drawn as one canvas so its highlight can move like liquid: the selected page's
     pill glides to the next item when you change page, a softer hover pill follows the mouse, and
-    icons and labels blend colour as a pill passes under them. Motion only runs while it's happening."""
+    icons and labels blend colour as a pill passes under them. Motion only runs while it's happening.
+    Wide, it shows page names in groups; slim, just icons, with the name as a tooltip."""
 
-    ITEM_H, GLIDE_MS, HOVER_MS = 54, 230, 140
+    ITEM_H, GLIDE_MS, HOVER_MS = 42, 230, 140
+    WIDE, SLIM = 196, 64
     BOTTOM = ("settings",)
 
-    def __init__(self, parent, app, items, logo, scale):
+    def __init__(self, parent, app, items, logo, scale, groups=(), wide=True):
         s = self.s = scale
-        self.w = int(68 * s)   # wide enough for the longest label (Accounts) with room either side
+        self.wide = wide
+        self.w = int((self.WIDE if wide else self.SLIM) * s)
         super().__init__(parent, bg=C["panel"], width=self.w, highlightthickness=0, bd=0)
-        self.app, self.keys, self.logo = app, [k for k, _, _ in items], logo
-        self.h, self.pad = int(self.ITEM_H * s), int(7 * s)
-        pw, ph, r = self.w - 2 * self.pad, self.h - int(4 * s), int(8 * s)
-        mk = lambda fill, w, h, rad: tk.PhotoImage(master=parent, data=base64.b64encode(shape_image(w, h, rad, fill)))
-        rim = dict(border=C["line_hover"], border_w=max(s, 1.0), light=C["glass_light"], light_h=int(14 * s))
-        mk2 = lambda fill, w, h, rad, **kw: tk.PhotoImage(
-            master=parent, data=base64.b64encode(shape_image(w, h, rad, fill, **kw)))
-        self.img_hover = mk2(C["hover"], pw, ph, r, border=C["line"], border_w=max(s, 1.0), light=C["line_hover"],
-                             light_h=int(12 * s))
-        self.img_sel = mk2(C["sel"], pw, ph, r, **rim)
-        self.backdrop_id = self.create_image(0, 0, anchor="nw")   # the gradient, redrawn when the height changes
-        self.backdrop, self.backdrop_h = None, 0
+        self.app, self.keys, self.logo, self.groups = app, [k for k, _, _ in items], logo, groups
+        self.names = {k: t for k, _, t in items}
+        self.h, self.pad = int(self.ITEM_H * s), int(8 * s)
+        self.backdrop_id = self.create_image(0, 0, anchor="nw")   # the gradient, redrawn when the size changes
+        self.backdrop, self.backdrop_size = None, None
         self.edge_id = self.create_line(self.w - 1, 0, self.w - 1, 4000, fill=C["line"])
         self.bar_h, bar_w = int(20 * s), max(int(3 * s), 3)
-        self.img_bar = mk(C["accent"], bar_w, self.bar_h, bar_w / 2)
-        self.create_image(self.w // 2, int(26 * s), image=logo)
-        self.hover_id = self.create_image(self.pad, 0, image=self.img_hover, anchor="nw", state="hidden")
-        self.sel_id = self.create_image(self.pad, 0, image=self.img_sel, anchor="nw", state="hidden")
-        self.bar_id = self.create_image(0, 0, image=self.img_bar, anchor="nw", state="hidden")
+        self.img_bar = tk.PhotoImage(master=parent, data=base64.b64encode(
+            shape_image(bar_w, self.bar_h, bar_w / 2, C["accent"])))
+        self.logo_id = self.create_image(0, int(28 * s), image=logo)
+        self.brand = self.create_text(0, int(28 * s), text="AltVault", anchor="w", fill=C["fg"],
+                                      font=("Segoe UI Semibold", 11))
         icons = app.icon_font
-        self.icon = {k: self.create_text(self.w // 2, 0, text=g, font=(icons, 13), fill=C["muted"]) for k, g, _ in items}
-        self.label = {k: self.create_text(self.w // 2, 0, text=t, font=("Segoe UI", 8), fill=C["muted"]) for k, _, t in items}
+        self.fold = self.create_text(0, int(28 * s), text="\uE76B", font=(icons, 9), fill=C["dim"])
+        self.heads = [self.create_text(0, 0, text=title.upper(), anchor="w", fill=C["dim"], font=("Segoe UI Semibold", 7))
+                      if title else None for title, _ in groups]
+        self.hover_id = self.create_image(self.pad, 0, anchor="nw", state="hidden")
+        self.sel_id = self.create_image(self.pad, 0, anchor="nw", state="hidden")
+        self.bar_id = self.create_image(0, 0, image=self.img_bar, anchor="nw", state="hidden")
+        self.make_pills()
+        self.icon = {k: self.create_text(0, 0, text=g, font=(icons, 12), fill=C["muted"]) for k, g, _ in items}
+        self.label = {k: self.create_text(0, 0, text=t, anchor="w", font=("Segoe UI", 10), fill=C["muted"])
+                      for k, _, t in items}
         self.mark = self.create_text(self.w // 2, 0, text="HecticWins", font=("Segoe UI Semibold", 7), fill=C["dim"])
         self.pos, self.sel_key, self.sel_y, self.hover_key, self.hover_y = {}, None, None, None, None
         self.jobs, self.shades = {}, {}
@@ -3548,30 +3843,68 @@ class Rail(tk.Canvas):
         self.bind("<Leave>", lambda _e: self.leave())
         self.bind("<Button-1>", self.click)
 
+    def make_pills(self):
+        s = self.s
+        width, height, radius = self.w - 2 * self.pad, self.h - int(4 * s), int(8 * s)
+        mk = lambda fill, **kw: tk.PhotoImage(master=self, data=base64.b64encode(
+            shape_image(width, height, radius, fill, border_w=max(s, 1.0), **kw)))
+        self.img_hover = mk(C["hover"], border=C["line"], light=C["line_hover"], light_h=int(12 * s))
+        self.img_sel = mk(C["sel"], border=C["line_hover"], light=C["glass_light"], light_h=int(14 * s))
+        self.itemconfigure(self.hover_id, image=self.img_hover)
+        self.itemconfigure(self.sel_id, image=self.img_sel)
+
+    def set_wide(self, wide):
+        if wide != self.wide:
+            hide_tip()
+            self.wide, self.w = wide, int((self.WIDE if wide else self.SLIM) * self.s)
+            self.configure(width=self.w)
+            self.make_pills()
+            self.layout()
+
     def layout(self):
-        """Items run down from the logo; Settings sits above the maker's mark at the bottom."""
-        height, s = self.winfo_height(), self.s
-        if height != self.backdrop_h and height > 1:
-            self.backdrop_h = height
+        """Groups run down from the logo; Settings sits above the maker's mark at the bottom."""
+        height, s, wide = self.winfo_height(), self.s, self.wide
+        if (self.w, height) != self.backdrop_size and height > 1:
+            self.backdrop_size = (self.w, height)
+            glow = blend(C["panel"], C["accent"], 0.13)
             rows = bytearray()
-            for y in range(height):   # a faint violet glow at the top, settling into the panel colour, darker at the foot
+            for y in range(height):   # a faint accent glow at the top, settling into the panel colour, darker at the foot
                 f = y / height
-                row = blend(C["panel"], "#2e2838", max(0.0, 1 - f / 0.45) * 0.9) if f < 0.45 else \
+                row = blend(C["panel"], glow, max(0.0, 1 - f / 0.45) * 0.9) if f < 0.45 else \
                     blend(C["panel"], C["bg"], (f - 0.6) / 0.4 * 0.8) if f > 0.6 else C["panel"]
                 rows += bytes((*_rgb(row), 255)) * self.w
             self.backdrop = tk.PhotoImage(master=self, data=base64.b64encode(_png(self.w, bytes(rows), height)))
             self.itemconfigure(self.backdrop_id, image=self.backdrop)
             self.tag_lower(self.backdrop_id)
-        top = int(54 * s)
-        for i, key in enumerate(k for k in self.keys if k not in self.BOTTOM):
-            self.pos[key] = top + i * self.h
-        for key in self.keys:
-            if key in self.BOTTOM:
-                self.pos[key] = max(height - int(30 * s) - self.h, top)
-        for key, y in self.pos.items():
-            self.coords(self.icon[key], self.w // 2, y + int(0.36 * self.h))
-            self.coords(self.label[key], self.w // 2, y + int(0.74 * self.h))
+        self.coords(self.edge_id, self.w - 1, 0, self.w - 1, 4000)
+        word = "normal" if wide else "hidden"
+        self.coords(self.logo_id, self.pad + int(20 * s) if wide else self.w // 2, int(28 * s))
+        self.coords(self.brand, self.pad + int(40 * s), int(28 * s))
+        self.coords(self.fold, self.w - int(20 * s), int(28 * s))
+        self.itemconfigure(self.brand, state=word)
+        self.itemconfigure(self.fold, state=word)
+        y = int(58 * s)
+        for head, (title, keys) in zip(self.heads, self.groups):
+            if head is not None:
+                self.itemconfigure(head, state=word)
+                if wide:
+                    self.coords(head, self.pad + int(10 * s), y + int(10 * s))
+                    y += int(22 * s)
+                else:
+                    y += int(8 * s)
+            for key in keys:
+                self.pos[key] = y
+                y += self.h
+            y += int(6 * s)
+        for key in self.BOTTOM:
+            self.pos[key] = max(height - int(30 * s) - self.h, y)
+        icon_x = self.pad + int(20 * s) if wide else self.w // 2
+        for key, top in self.pos.items():
+            self.coords(self.icon[key], icon_x, top + self.h // 2)
+            self.coords(self.label[key], self.pad + int(40 * s), top + self.h // 2)
+            self.itemconfigure(self.label[key], state=word)
         self.coords(self.mark, self.w // 2, height - int(14 * s))
+        self.itemconfigure(self.mark, text="HecticWins" if wide else "HW")
         if self.sel_key in self.pos:
             self.sel_y = self.pos[self.sel_key]
             self.apply()
@@ -3640,6 +3973,9 @@ class Rail(tk.Canvas):
             return
         first = self.hover_key is None
         self.hover_key = key
+        if not self.wide:   # the names are hidden, so say which page this is
+            show_tip(self, self.winfo_rootx() + self.w + 6, self.winfo_rooty() + self.pos[key] + int(10 * self.s),
+                     self.names[key])
         if first:   # appears in place, then follows the mouse
             self.hover_y = self.pos[key]
             self.apply()
@@ -3647,6 +3983,7 @@ class Rail(tk.Canvas):
             self.glide("hover_y", self.pos[key], self.HOVER_MS)
 
     def leave(self):
+        hide_tip()
         self.configure(cursor="")
         job = self.jobs.pop("hover_y", None)
         if job:
@@ -3655,6 +3992,8 @@ class Rail(tk.Canvas):
         self.apply()
 
     def click(self, event):
+        if event.y < int(52 * self.s) and (not self.wide or event.x > self.w - int(40 * self.s)):
+            return self.app.set_sidebar(not self.wide)
         key = self.key_at(event.x, event.y)
         if key:
             self.app.show_page(key)
@@ -3726,15 +4065,6 @@ class StatCard(ttk.Frame):
         set_text(self.value, fg=color or C["fg"])
         (set_value if self.blink else set_text)(self.value, value)
         set_text(self.sub, sub)
-
-    def add_link(self, text, command):
-        """A small accent-coloured action under the caption."""
-        link = tk.Label(self, text=text, bg=C["panel"], fg=C["accent_text"], font=("Segoe UI", 9), cursor="hand2")
-        link.pack(anchor="w", pady=(2, 0))
-        link.bind("<Button-1>", lambda _e: command())
-        link.bind("<Enter>", lambda _e: fade(link, "fg", C["fg"]))
-        link.bind("<Leave>", lambda _e: fade(link, "fg", C["accent_text"]))
-        return link
 
 
 class Chart(tk.Canvas):
@@ -3891,13 +4221,12 @@ class StatsPage(ttk.Frame):
         cards = ttk.Frame(self)
         cards.pack(fill="x", pady=(int(14 * s), 0))
         self.cards = {}
-        for i, (key, title) in enumerate((("ingame", "Time in a game"), ("eggs", "Eggs hatched (estimate)"),
+        for i, (key, title) in enumerate((("ingame", "Time in a game"),
                                           ("launches", "Launches that worked"), ("pings", "Anti-AFK pings"),
                                           ("closed", "Closed outside AltVault"))):
             self.cards[key] = StatCard(cards, title, s)
             self.cards[key].grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else int(10 * s), 0))
             cards.columnconfigure(i, weight=1, uniform="card")
-        self.cards["eggs"].add_link("Set total…", app.ask_eggs_total)
         charts = ttk.Frame(self)
         charts.pack(fill="both", expand=True, pady=(int(10 * s), 0))
         card, self.windows_chart = chart_card(charts, "Roblox windows", {"kind": "bars", "unit": ""}, s)
@@ -3925,7 +4254,6 @@ class StatsPage(ttk.Frame):
         self.cards["ingame"].set("—" if ingame is None else f"{ingame:.1f}%",
                                  f"of the time Roblox was open, last {span}",
                                  None if ingame is None else C["green"] if ingame >= 95 else C["yellow"] if ingame >= 80 else C["red"])
-        self.cards["eggs"].set(*self.app.egg_card(hours, span))
         ok, failed = total("launch_ok"), total("launch_fail")
         rate = percent_of(ok, ok + failed)
         self.cards["launches"].set("—" if rate is None else f"{rate:.1f}%",
@@ -4059,6 +4387,344 @@ def get_game_icons(place_ids):
             if img_status == 200:
                 result[str(item["targetId"])] = png
     return result
+
+
+class ActionTile(ttk.Frame):
+    """A quick action on a rounded card: an icon, a name and a short line, with a hover and a click."""
+
+    def __init__(self, parent, app, icon, title, text, command):
+        s = app.scale
+        super().__init__(parent, style="Glass.TFrame", cursor="hand2", padding=(int(14 * s), int(11 * s)))
+        glyph = tk.Label(self, text=icon, bg=C["panel"], fg=C["accent_text"], font=(app.icon_font, 14))
+        glyph.pack(side="left", padx=(0, int(12 * s)))
+        words = tk.Frame(self, bg=C["panel"])
+        words.pack(side="left", fill="x")
+        name = tk.Label(words, text=title, bg=C["panel"], fg=C["fg"], font=("Segoe UI Semibold", 10), anchor="w")
+        name.pack(anchor="w")
+        line = tk.Label(words, text=text, bg=C["panel"], fg=C["muted"], font=FONT, anchor="w")
+        line.pack(anchor="w")
+        parts = (glyph, words, name, line)
+
+        def paint(lit):
+            self.configure(style="GlassHover.TFrame" if lit else "Glass.TFrame")
+            for part in parts:
+                part.configure(bg=C["hover"] if lit else C["panel"])
+        for part in (self, *parts):
+            part.bind("<Enter>", lambda _e: paint(True))
+            part.bind("<Leave>", lambda _e: paint(False))
+            part.bind("<Button-1>", lambda _e: command())
+
+
+class HomePage(ttk.Frame):
+    """The overview: what's running, what needs you, the common actions and what happened lately.
+    It reads numbers AltVault already has, and only while the page is on screen."""
+
+    REFRESH_MS, ROWS, FEED = 3000, 5, 12
+
+    def __init__(self, app, parent):
+        super().__init__(parent)
+        self.app, self.job = app, None
+        s = app.scale
+        header, self.sub = page_header(self, "Home", "")
+        self.title_label = header.winfo_children()[0].winfo_children()[0]
+        ttk.Button(header, text="Join accounts", style="Accent.TButton",
+                   command=lambda: app.show_page("accounts")).pack(side="right", anchor="s")
+        cards = ttk.Frame(self)
+        cards.pack(fill="x", pady=(int(14 * s), 0))
+        self.cards = {}
+        for i, (key, title) in enumerate((("accounts", "Accounts"), ("ingame", "In a game"), ("afk", "Anti-AFK"),
+                                          ("memory", "Memory"))):
+            self.cards[key] = StatCard(cards, title, s)
+            self.cards[key].grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else int(10 * s), 0))
+            cards.columnconfigure(i, weight=1, uniform="card")
+        self.cards["memory"].blink = False
+        actions = ttk.Frame(self)
+        actions.pack(fill="x", pady=(int(10 * s), 0))
+        for i, (icon, title, text, command) in enumerate((
+                ("\uE710", "Add account", "Log in by browser", lambda: AddAccountDialog(app)),
+                ("\uE7FC", "Pick a game", "Your saved games", lambda: app.show_page("games")),
+                ("\uE7F4", "Watch windows", "See every client", lambda: app.show_page("live")),
+                ("\uE7C4", "Arrange windows", "Tile on screen", app.tile))):
+            ActionTile(actions, app, icon, title, text, command).grid(
+                row=0, column=i, sticky="nsew", padx=(0 if i == 0 else int(10 * s), 0))
+            actions.columnconfigure(i, weight=1, uniform="action")
+        lower = ttk.Frame(self)
+        lower.pack(fill="both", expand=True, pady=(int(10 * s), 0))
+        lower.columnconfigure(0, weight=2, uniform="lower")
+        lower.columnconfigure(1, weight=3, uniform="lower")
+        lower.rowconfigure(0, weight=1)
+        pad = (int(16 * s), int(12 * s))
+        left = ttk.Frame(lower, style="Glass.TFrame", padding=pad)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, int(10 * s)))
+        right = ttk.Frame(lower, style="Glass.TFrame", padding=pad)
+        right.grid(row=0, column=1, sticky="nsew")
+        self.left_title = tk.Label(left, text="Needs attention", bg=C["panel"], fg=C["fg"],
+                                   font=("Segoe UI Semibold", 10))
+        self.left_title.pack(anchor="w", pady=(0, int(6 * s)))
+        self.rows = []
+        for _ in range(self.ROWS):
+            row = tk.Frame(left, bg=C["panel"])
+            row.pack(fill="x", pady=int(3 * s))
+            dot = tk.Label(row, text="●", bg=C["panel"], fg=C["dim"], font=("Segoe UI", 7))
+            dot.pack(side="left", anchor="n", padx=(0, int(8 * s)), pady=(int(3 * s), 0))
+            text = tk.Label(row, text="", bg=C["panel"], fg=C["fg"], font=FONT, justify="left", anchor="w")
+            text.pack(side="left", fill="x", expand=True)
+            for part in (row, dot, text):
+                part.bind("<Button-1>", lambda _e, r=row: self.open_row(r))
+            row.target = None
+            self.rows.append((row, dot, text))
+        left.bind("<Configure>", lambda e: [t.config(wraplength=max(e.width - int(56 * s), 80)) for _, _, t in self.rows])
+        tk.Label(right, text="Recent activity", bg=C["panel"], fg=C["fg"],
+                 font=("Segoe UI Semibold", 10)).pack(anchor="w", pady=(0, int(6 * s)))
+        self.feed = []
+        for _ in range(self.FEED):
+            row = tk.Frame(right, bg=C["panel"])
+            row.pack(fill="x", pady=int(2 * s))
+            when = tk.Label(row, text="", bg=C["panel"], fg=C["dim"], font=FONT, width=6, anchor="w")
+            when.pack(side="left")
+            text = tk.Label(row, text="", bg=C["panel"], fg=C["muted"], font=FONT, anchor="w")
+            text.pack(side="left", fill="x", expand=True)
+            self.feed.append((when, text))
+        self.feed_chars = 60
+        right.bind("<Configure>", self.fit_feed)
+
+    def fit_feed(self, event):
+        """Fits the feed to its card: as much text as the width allows, and only whole rows, so a short
+        window never shows half a line."""
+        s = self.app.scale
+        self.feed_chars = max((event.width - int(80 * s)) // max(int(6 * s), 1), 24)
+        row_h = max(row.winfo_reqheight() for row in (w.master for w, _ in self.feed)) + 2 * int(2 * s)
+        rows = max((event.height - int(52 * s)) // row_h, 1)
+        for i, (when, _) in enumerate(self.feed):
+            when.master.pack(fill="x", pady=int(2 * s)) if i < rows else when.master.pack_forget()
+
+    def attention(self):
+        """[(colour, text, page)], most serious first; one reassuring line when all is well."""
+        app, items = self.app, []
+        windows = len(app.running)
+        if app.expired:
+            n = len(app.expired)
+            items.append((C["red"], f"{n} login{'s' if n != 1 else ''} expired. Right-click, Account, Log in again.", "accounts"))
+        if app.lost_flagged:
+            n = len(app.lost_flagged)
+            items.append((C["red"], f"{n} account{'s' if n != 1 else ''} disconnected from the game.", "live"))
+        recent = [i for i in app.doctor.items if i["t"] >= time.time() - 3600 and explain(i)[4] == "red"
+                  and i["kind"] not in ("login", "lost")]
+        if recent:
+            page = app.pages["doctor"]
+            items.append((C["red"], f"{page.who(recent[0])}: {explain(recent[0])[0]}.", "doctor"))
+        used = memory_used_fraction()
+        if windows >= 2 and used >= AFK_PRESSURE:
+            items.append((C["red"] if used >= MEMORY_ALERT else C["yellow"],
+                          f"Memory is {used:.0%} full. Clients slow down; close some windows or apps.", "pulse"))
+        if windows and not app.anti_afk_var.get():
+            items.append((C["yellow"], "Anti-AFK is off while Roblox is open.", None))
+        return items or [(C["green"], "Everything looks good.", None)]
+
+    def steps(self):
+        """The first-run checklist: [(done, text, page)], or None once it's finished with."""
+        app = self.app
+        if app.settings.get("onboarded"):
+            return None
+        added, picked, joined = bool(app.accounts), bool(app.place_var.get().strip()), bool(app.running)
+        if added and joined:
+            app.settings["onboarded"] = True
+            save_settings(app.settings)
+            return None
+        return [(added, "Add your first account", "accounts"), (picked, "Pick a game or paste a link", "games"),
+                (joined, "Select accounts and click Join", "accounts")]
+
+    def open_row(self, row):
+        if row.target:
+            self.app.show_page(row.target)
+
+    def refresh(self):
+        app = self.app
+        hour = time.localtime().tm_hour
+        set_text(self.title_label, "Good morning" if 5 <= hour < 12 else "Good afternoon" if hour < 18 else "Good evening")
+        saved, open_now = len(app.accounts), len(app.running)
+        ingame = sum(1 for acc_id in app.running.values()
+                     if (app.presence.get(acc_id) or {}).get("userPresenceType") == 2)
+        set_text(self.sub, f"{saved} account{'s' if saved != 1 else ''} saved · {open_now} open · {ingame} in a game")
+        bad = len(app.expired)
+        self.cards["accounts"].set(str(saved), f"{bad} need{'s' if bad == 1 else ''} logging in" if bad else "all logged in",
+                                   C["red"] if bad else None)
+        self.cards["ingame"].set(f"{ingame} / {open_now}", "windows in a game", C["green"] if open_now and ingame == open_now else None)
+        on = app.anti_afk_var.get()
+        self.cards["afk"].set("On" if on else "Off", f"keeping {len(app.afk_last)} window{'s' if len(app.afk_last) != 1 else ''} active"
+                              if on else "accounts can be idle-kicked", C["green"] if on else C["yellow"] if open_now else None)
+        free, total = memory_status()
+        used = 1 - free / total if total else 0.0
+        self.cards["memory"].set(f"{used:.0%}", f"{free / 2 ** 30:.1f} of {total / 2 ** 30:.0f} GB free",
+                                 C["red"] if used >= MEMORY_ALERT else C["yellow"] if used >= AFK_PRESSURE else None)
+        steps = self.steps()
+        set_text(self.left_title, "Get started" if steps else "Needs attention")
+        items = [(C["green"] if done else C["dim"], text, page) for done, text, page in steps] if steps else self.attention()
+        for i, (row, dot, text) in enumerate(self.rows):
+            color, words, page = items[i] if i < len(items) else (C["panel"], "", None)
+            row.target = page
+            set_text(dot, fg=color)
+            set_text(text, words, cursor="hand2" if page else "")
+        lines = list(ACTIVITY.items)[:self.FEED]
+        for i, (when, text) in enumerate(self.feed):
+            if i < len(lines):
+                created, level, message = lines[i]
+                message = message.removeprefix("Anti-AFK: ").strip() if level < logging.WARNING else message
+                short = message if len(message) <= self.feed_chars else message[:self.feed_chars - 1].rstrip() + "…"
+                set_text(when, time.strftime("%H:%M", time.localtime(created)))
+                set_text(text, short, fg=C["yellow"] if level >= logging.WARNING else C["muted"])
+            else:
+                set_text(when, "")
+                set_text(text, "Nothing yet." if i == 0 and not lines else "", fg=C["muted"])
+
+    def on_show(self):
+        self.update_idletasks()
+        self.tick()
+
+    def tick(self):
+        self.refresh()
+        self.job = self.after(self.REFRESH_MS, self.tick)
+
+    def on_hide(self):
+        if self.job:
+            self.after_cancel(self.job)
+            self.job = None
+
+
+class DoctorPage(ttk.Frame):
+    """Every drop AltVault could explain: what happened, why, and what to do."""
+
+    ACTIONS = {"login": "Log in again", "afk": "Turn on Anti-AFK", "live": "Open Live", "pulse": "Open Pulse"}
+
+    def __init__(self, app, parent):
+        super().__init__(parent)
+        self.app, self.shown = app, {}
+        s = app.scale
+        header, _ = page_header(self, "Doctor", "Why accounts dropped and what to do, worked out from Roblox's own logs.")
+        ttk.Button(header, text="Clear", command=self.clear).pack(side="right", anchor="s")
+        cards = ttk.Frame(self)
+        cards.pack(fill="x", pady=(int(14 * s), 0))
+        self.cards = {}
+        for i, (key, title) in enumerate((("dropped", "Dropped, 24 hours"), ("idle", "Idle kicks"),
+                                          ("login", "Login problems"), ("moved", "Server moves"))):
+            self.cards[key] = StatCard(cards, title, s)
+            self.cards[key].grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else int(10 * s), 0))
+            cards.columnconfigure(i, weight=1, uniform="card")
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, pady=(int(10 * s), 0))
+        body.columnconfigure(0, weight=3, uniform="doctor")
+        body.columnconfigure(1, weight=2, uniform="doctor")
+        body.rowconfigure(0, weight=1)
+        table = ttk.Frame(body)
+        table.grid(row=0, column=0, sticky="nsew", padx=(0, int(10 * s)))
+        self.tree = ttk.Treeview(table, columns=("when", "who", "what"), show="headings", selectmode="browse",
+                                 style="Rows.Treeview")
+        for col, title, width in (("when", "When", 95), ("who", "Account", 150), ("what", "What happened", 180)):
+            self.tree.heading(col, text="   " + title, anchor="w")
+            self.tree.column(col, width=int(width * s), minwidth=int(70 * s), anchor="w", stretch=col == "what")
+        self.tree.pack(side="left", fill="both", expand=True)
+        auto_scrollbar(self.tree, ttk.Scrollbar(table, orient="vertical", command=self.tree.yview))
+        add_row_hover(self.tree)
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self.show_detail())
+        self.empty = ttk.Label(table, text="Nothing to report. If an account drops, the reason appears here.",
+                               style="PanelMuted.TLabel", justify="center")
+        card = ttk.Frame(body, style="Glass.TFrame", padding=(int(16 * s), int(12 * s)))
+        card.grid(row=0, column=1, sticky="nsew")
+        make = lambda fg, font: tk.Label(card, text="", bg=C["panel"], fg=fg, font=font, justify="left", anchor="w")
+        self.title = make(C["fg"], ("Segoe UI Semibold", 11))
+        self.when = make(C["muted"], FONT)
+        self.why_head = make(C["muted"], ("Segoe UI Semibold", 9))
+        self.why = make(C["fg"], FONT)
+        self.fix_head = make(C["muted"], ("Segoe UI Semibold", 9))
+        self.fix = make(C["fg"], FONT)
+        self.action = ttk.Button(card, command=self.act)
+        self.title.pack(fill="x")
+        self.when.pack(fill="x")
+        self.why_head.pack(fill="x", pady=(int(12 * s), 0))
+        self.why.pack(fill="x")
+        self.fix_head.pack(fill="x", pady=(int(12 * s), 0))
+        self.fix.pack(fill="x")
+        self.texts = (self.title, self.when, self.why, self.fix)
+        card.bind("<Configure>", lambda e: [t.config(wraplength=max(e.width - int(36 * s), 100)) for t in self.texts])
+
+    def who(self, item):
+        if not item.get("id"):
+            return "This PC" if item["kind"] == "memory" else "Unknown account"
+        acc = self.app.account(item["id"])
+        return self.app.who(acc) if acc else "Not in AltVault"
+
+    def refresh(self):
+        items, doctor = self.app.doctor.items, self.app.doctor
+        dropped = doctor.count(("exit", "login", "lost", "crash"))
+        idle = sum(1 for i in items if i.get("code") == 278 and i["t"] >= time.time() - 86400)
+        self.cards["dropped"].set(str(dropped), "all clear" if not dropped else "see the list below", C["red"] if dropped else C["green"])
+        self.cards["idle"].set(str(idle), "last 24 hours", C["red"] if idle else None)
+        logins = doctor.count(("login",))
+        self.cards["login"].set(str(logins), "last 24 hours", C["red"] if logins else None)
+        moved = doctor.count(("moved",))
+        self.cards["moved"].set(str(moved), "last 24 hours", C["yellow"] if moved else None)
+        chosen = self.tree.selection()
+        self.tree.delete(*self.tree.get_children())
+        self.shown = {}
+        for n, item in enumerate(items):
+            iid = f"{item['t']}-{item['kind']}-{item.get('id')}-{n}"
+            self.shown[iid] = item
+            when = time.strftime("%d %b %H:%M", time.localtime(item["t"]))
+            self.tree.insert("", "end", iid=iid, values=("   " + when, "   " + self.who(item), "   " + explain(item)[0].split(" (error")[0]))
+        if items:
+            self.empty.place_forget()
+            self.tree.selection_set(chosen[0] if chosen and self.tree.exists(chosen[0]) else next(iter(self.shown)))
+        else:
+            self.empty.place(relx=0.5, rely=0.5, anchor="center")
+        self.show_detail()
+
+    def show_detail(self):
+        chosen = self.tree.selection()
+        item = self.shown.get(chosen[0]) if chosen else None
+        if item is None:
+            self.current = None
+            for label in (*self.texts, self.why_head, self.fix_head):
+                label.config(text="")
+            self.title.config(text="All clear")
+            self.when.config(text="Doctor reads Roblox's logs while your accounts run.")
+            self.action.pack_forget()
+            return
+        self.current = item
+        title, why, fix, action, color = explain(item)
+        self.title.config(text=title, fg=C[color])
+        self.when.config(text=f"{self.who(item)}  ·  {time.strftime('%d %b, %H:%M', time.localtime(item['t']))}")
+        self.why_head.config(text="Why")
+        self.why.config(text=why)
+        self.fix_head.config(text="What to do")
+        self.fix.config(text=fix)
+        self.action_key = action
+        if action and not (action == "login" and not self.app.account(item.get("id"))):
+            self.action.config(text=self.ACTIONS[action])
+            self.action.pack(anchor="w", pady=(int(12 * self.app.scale), 0))
+        else:
+            self.action.pack_forget()
+
+    def act(self):
+        app, key = self.app, self.action_key
+        if key == "login":
+            acc = app.account(self.current.get("id"))
+            if acc:
+                AddAccountDialog(app, acc)
+        elif key == "afk":
+            if not app.anti_afk_var.get():
+                app.flip_anti_afk()
+        else:
+            app.show_page(key)
+
+    def clear(self):
+        if self.app.doctor.items and ask_yes_no("Clear Doctor", "Remove everything from this list?", parent=self.app.root, yes="Clear"):
+            self.app.doctor.items = []
+            self.app.save_doctor()
+            self.refresh()
+
+    def on_show(self):
+        self.refresh()
+        self.app.doctor_scan()
 
 
 class GamesPage(ttk.Frame):
@@ -4229,7 +4895,7 @@ class GamesPage(ttk.Frame):
     def add_game(self):
         text = self.add_var.get()
         if parse_private_server(text):
-            self.app.status.config(text="Private server links aren't saved. Paste them on the Accounts page.")
+            self.app.status.config(text="Paste private server links on the Accounts page; the last one is kept there.")
             return
         place = parse_place_id(text)
         if not place:
@@ -4549,6 +5215,10 @@ class App:
         self.root = root
         self.accounts = accounts
         self.settings = load_settings()
+        for old in ("hatch", "eggs_total", "eggs_since"):   # the egg calculator's numbers, from before 2.8
+            self.settings.pop(old, None)
+        if accounts:   # already set up: no first-run checklist
+            self.settings["onboarded"] = True
         self.scale = root.winfo_fpixels("1i") / 96
         self.presence = {}     # account id -> presence dict
         self.expired = set()   # account ids whose cookie stopped working
@@ -4573,7 +5243,9 @@ class App:
         self.tray = None              # set by main(); without it, closing the window quits
         self.taskbar_busy = False     # a worker is moving Roblox windows on or off the taskbar
         self.history = History()      # hourly totals for Stats, Pulse and the Live panel
-        self.last_sample_at = None    # monotonic time of the previous minute reading
+        self.doctor = Doctor()        # why accounts dropped
+        self.doctor_busy = False      # a log scan is running
+        self.doctor_closed = []       # (account id, when) of windows that closed unexpectedly, to explain
         self.first_seen = {}          # Roblox pid -> when its window was first seen
         self.last_ingame = {}         # account id -> when presence last said "in a game"
         self.server_of = {}           # Roblox pid -> (server it is in now, times it has been moved to another)
@@ -4582,7 +5254,6 @@ class App:
         self.memory_hot = 0           # minute readings in a row with memory nearly full
         self.memory_alerted = False
         self.presence_ticks = 0       # counts presence checks made while hidden
-        self.eggs_dirty = False       # the egg total changed since it was last written to settings.json
         self.recent = collections.deque(maxlen=60)   # (time, measure()) once a minute, for Pulse
         self.pc_meter, self.rbx_meter = PcMeter(), CpuMeter()
         self.next_sample = time.monotonic() + 5
@@ -4591,6 +5262,7 @@ class App:
         self.tick_job = None
 
         if not hasattr(root, "altvault_images"):   # main() styles the window first when it asks for a key
+            apply_accent(self.settings.get("accent"))
             apply_theme(root, self.scale)
         root.title(APP_TITLE)
         saved = self.settings.get("geometry")
@@ -4611,14 +5283,17 @@ class App:
         threading.Thread(target=self.fetch_missing_avatars, daemon=True).start()
         self.tick_job = self.root.after(500, self.tick)
         self.root.after(1000, self.refresh_presence)
+        self.root.after(3000, lambda: self.doctor_scan(quiet=True))
         # Nobody sees presence while AltVault is minimised, so it pauses then and catches up on restore.
         self.presence_stale = False
         root.bind("<Map>", self.on_restore)
 
     # ------------------------------------------------------------ layout
-    NAV = (("accounts", "\uE716", "Accounts"), ("profiles", "\uE77B", "Profiles"), ("games", "\uE7FC", "Games"),
+    NAV = (("home", "\uE80F", "Home"), ("accounts", "\uE716", "Accounts"), ("profiles", "\uE77B", "Profiles"), ("games", "\uE7FC", "Games"),
            ("live", "\uE7F4", "Live"), ("stats", "\uE9D2", "Stats"), ("pulse", "\uE95E", "Pulse"),
+           ("doctor", "\uE9D9", "Doctor"),
            ("settings", "\uE713", "Settings"))
+    NAV_GROUPS = ((None, ("home",)), ("Manage", ("accounts", "profiles", "games")), ("Monitor", ("live", "stats", "pulse", "doctor")))
 
     def build(self):
         s = self.scale
@@ -4636,7 +5311,7 @@ class App:
         # Sidebar: the app icon, then one item per page; Settings sits at the bottom.
         logo_px = int(26 * s)
         self.logo = tk.PhotoImage(data=base64.b64encode(_png(logo_px, _render_icon(logo_px))))
-        self.rail = Rail(self.root, self, self.NAV, self.logo, s)
+        self.rail = Rail(self.root, self, self.NAV, self.logo, s, self.NAV_GROUPS, self.settings.get("sidebar_wide", True))
         self.rail.pack(side="left", fill="y")
 
         main = ttk.Frame(self.root, padding=(16, 14, 16, 12))
@@ -4644,21 +5319,172 @@ class App:
         # The Anti-AFK switch and the status line, the same on every page.
         footer = ttk.Frame(main)
         footer.pack(side="bottom", fill="x", pady=(10, 0))
-        ttk.Checkbutton(footer, text="Anti-AFK", variable=self.anti_afk_var,
-                        command=self.toggle_anti_afk).pack(side="left")
+        afk_box = ttk.Checkbutton(footer, text="Anti-AFK", variable=self.anti_afk_var, command=self.toggle_anti_afk)
+        afk_box.pack(side="left")
+        tip(afk_box, "Stops Roblox's 20-minute idle kick. Ctrl+Shift+A")
         self.status = FlashLabel(footer, text="", bg=C["bg"], fg=C["muted"], font=FONT)
         self.status.pack(side="right")
 
         host = ttk.Frame(main)
         host.pack(fill="both", expand=True)
-        self.pages = {"accounts": self.build_accounts(host), "profiles": ProfilesPage(self, host),
+        self.toast_box = None
+        self.pages = {"home": HomePage(self, host), "accounts": self.build_accounts(host), "profiles": ProfilesPage(self, host),
                       "games": GamesPage(self, host), "live": LivePage(self, host), "stats": StatsPage(self, host),
-                      "pulse": PulsePage(self, host), "settings": SettingsPage(self, host)}
+                      "pulse": PulsePage(self, host), "doctor": DoctorPage(self, host), "settings": SettingsPage(self, host)}
         self.page = None
-        self.show_page("accounts")
-        for i, (key, _, _) in enumerate(self.NAV[:-1], 1):   # Ctrl+1..6; Settings is Ctrl+,
+        self.show_page("home")
+        for i, (key, _, _) in enumerate(self.NAV[:-1], 1):   # Ctrl+1..8; Settings is Ctrl+,
             self.root.bind(f"<Control-Key-{i}>", lambda _e, k=key: self.show_page(k))
         self.root.bind("<Control-comma>", lambda _e: self.show_page("settings"))
+        self.root.bind("<Control-b>", lambda _e: self.set_sidebar(not self.rail.wide))
+        self.root.bind("<Control-j>", lambda _e: self.join_selected())
+        self.root.bind("<Control-n>", lambda _e: AddAccountDialog(self))
+        self.root.bind("<Control-Shift-A>", lambda _e: self.flip_anti_afk())
+        self.root.bind("<F1>", lambda _e: self.show_shortcuts())
+
+    def doctor_scan(self, quiet=False):
+        """Looks for new evidence on a worker thread. `quiet` files it without alerting (first scan)."""
+        if self.doctor_busy:
+            return
+        self.doctor_busy = True
+
+        def work():
+            try:
+                events = self.doctor.scan()
+            except Exception:
+                log.exception("Doctor couldn't read Roblox's logs")
+                events = []
+            self.ui(self.doctor_absorb, events, quiet)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def doctor_absorb(self, events, quiet):
+        self.doctor_busy = False
+        now, fresh = time.time(), []
+        for e in events:
+            user = e["user"]
+            if e["kind"] == "exit" and e["code"] == CLIENT_LEFT:
+                continue
+            details = {"code": e["code"]} if e["code"] else {}
+            if e["memory"]:
+                details["memory"] = True
+            acc = self.account(user)
+            if now - e["t"] <= DOCTOR_FRESH:   # what AltVault is doing now only explains what just happened
+                if not self.anti_afk_var.get():
+                    details["anti_afk"] = "off"
+                elif acc and self.afk_skipped(acc):
+                    details["anti_afk"] = "skipped"
+            item = self.doctor.add(e["kind"], user, e["t"], **details)
+            if item:
+                fresh.append(item)
+        for account_id, closed_at in self.doctor_closed:
+            left = self.doctor.exits.get(account_id)
+            if left is None or abs(left - closed_at) > DOCTOR_FRESH:   # nothing in the log says why it went
+                item = self.doctor.add("crash", account_id, closed_at)
+                if item:
+                    fresh.append(item)
+        self.doctor_closed = []
+        serious = [i for i in fresh if explain(i)[4] == "red"]
+        if serious and not quiet:
+            title = explain(serious[0])[0]
+            who = self.pages["doctor"].who(serious[0])
+            self.alert(f"{who}: {title}" if len(serious) == 1 else f"{len(serious)} accounts dropped",
+                       "Open Doctor to see why and what to do.")
+        if self.doctor.dirty:
+            self.save_doctor()
+        if fresh and self.page == "doctor":
+            self.pages["doctor"].refresh()
+
+    def doctor_note(self, kind, account_id, **details):
+        """A finding AltVault saw itself, rather than one from a log."""
+        if self.doctor.add(kind, account_id, **details):
+            self.save_doctor()
+            if self.page == "doctor":
+                self.pages["doctor"].refresh()
+
+    def save_doctor(self):
+        try:
+            self.doctor.save()
+        except OSError as e:
+            log.warning("Couldn't save Doctor's findings: %s", type(e).__name__)
+
+    def set_sidebar(self, wide):
+        self.rail.set_wide(wide)
+        self.settings["sidebar_wide"] = wide
+        self.pages["settings"].wide_var.set(wide)
+        save_settings(self.settings)
+
+    def flip_anti_afk(self):
+        self.anti_afk_var.set(not self.anti_afk_var.get())
+        self.toggle_anti_afk()
+
+    def show_shortcuts(self):
+        show_info("Keyboard shortcuts", "Ctrl+1 to Ctrl+8   Go to a page\nCtrl+,   Settings\nCtrl+J   Join the selected accounts\n"
+                  "Ctrl+N   Add an account\nCtrl+B   Show or hide page names\nCtrl+Shift+A   Anti-AFK on or off\n"
+                  "F1   This list", parent=self.root)
+
+    def toast(self, title, text="", warning=False):
+        """A note in the corner that doesn't interrupt anything and goes away by itself."""
+        if self.toast_box is not None:
+            self.toast_box.destroy()
+        s = self.scale
+        box = self.toast_box = tk.Frame(self.root, bg=C["field"], highlightthickness=1, highlightbackground=C["line_hover"],
+                                        padx=int(14 * s), pady=int(10 * s))
+        tk.Frame(box, bg=C["yellow"] if warning else C["accent"], width=max(int(3 * s), 3)).pack(side="left", fill="y", padx=(0, int(10 * s)))
+        words = tk.Frame(box, bg=C["field"])
+        words.pack(side="left")
+        tk.Label(words, text=title, bg=C["field"], fg=C["fg"], font=("Segoe UI Semibold", 9), anchor="w").pack(anchor="w")
+        if text:
+            tk.Label(words, text=text, bg=C["field"], fg=C["muted"], font=FONT, justify="left", wraplength=int(320 * s)).pack(anchor="w")
+        box.place(relx=1.0, rely=1.0, x=-int(20 * s), y=-int(48 * s), anchor="se")
+        box.after(7000 if warning else 4000, lambda: self.hide_toast(box))
+        box.bind("<Button-1>", lambda _e: self.hide_toast(box))
+
+    def hide_toast(self, box):
+        if box is self.toast_box:
+            self.toast_box = None
+        try:
+            box.destroy()
+        except tk.TclError:
+            pass
+
+    def alert(self, title, text):
+        """Something worth knowing: a toast if AltVault is open, and a tray alert either way."""
+        if self.root.state() == "normal":
+            self.toast(title, text, warning=True)
+        if self.tray:
+            self.tray.notify(title, text, warning=True)
+
+    def export_settings(self):
+        path = filedialog.asksaveasfilename(parent=self.root, title="Back up settings", defaultextension=".json",
+                                            initialfile="altvault-settings.json", filetypes=[("Settings backup", "*.json")])
+        if not path:
+            return
+        self.save_settings()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(settings_backup(self.settings), f, indent=1)
+        except OSError as e:
+            return show_error("Back up settings", f"Couldn't write that file: {e.strerror or e}", parent=self.root)
+        self.toast("Settings backed up", os.path.basename(path))
+
+    def import_settings(self):
+        path = filedialog.askopenfilename(parent=self.root, title="Restore settings", filetypes=[("Settings backup", "*.json")])
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                count = restore_backup(self.settings, json.load(f))
+        except (OSError, ValueError) as e:
+            log.warning("Couldn't restore settings: %s", type(e).__name__)
+            return show_error("Restore settings", "That file isn't an AltVault settings backup.", parent=self.root)
+        for var, key in ((self.multi_var, "multi"), (self.same_server_var, "same_server"), (self.auto_tile_var, "auto_tile"),
+                         (self.stream_var, "stream_mode"), (self.hide_taskbar_var, "hide_taskbar")):
+            var.set(self.settings.get(key, var.get()))
+        self.save_settings()
+        self.update_recents_box()
+        self.refresh()
+        self.toast("Settings restored", f"{count} settings restored. Colours apply the next time you open AltVault.")
 
     def show_page(self, key):
         if key == self.page:
@@ -4686,7 +5512,9 @@ class App:
         game.pack(fill="x", pady=(14, 0))
         ttk.Label(game, text="Game", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(game, text="Server (optional)", style="Muted.TLabel").grid(row=0, column=3, sticky="w", padx=(14, 0))
-        self.place_var = tk.StringVar(value=self.settings.get("place", ""))
+        self.private_link = load_private_link()
+        reopen_link = self.private_link and self.settings.get("place_is_private") and not self.stream_var.get()
+        self.place_var = tk.StringVar(value=self.private_link if reopen_link else self.settings.get("place", ""))
         self.place_box = ttk.Combobox(game, textvariable=self.place_var)
         self.place_box.grid(row=1, column=0, sticky="ew", pady=(3, 0))
         add_placeholder(self.place_box, self.place_var, "Paste a game or private server link, or pick one")
@@ -4694,7 +5522,7 @@ class App:
         self.star_btn.grid(row=1, column=1, padx=(6, 0), pady=(3, 0), sticky="ns")
         ttk.Button(game, text="Servers...", command=self.open_servers).grid(row=1, column=2, padx=(6, 0), pady=(3, 0),
                                                                            sticky="ns")
-        self.place_var.trace_add("write", lambda *_: self.update_star())
+        self.place_var.trace_add("write", lambda *_: (self.update_star(), self.keep_private_link()))
         self.job_var = tk.StringVar()
         job = ttk.Entry(game, textvariable=self.job_var)
         job.grid(row=1, column=3, sticky="ew", padx=(14, 0), pady=(3, 0))
@@ -4809,9 +5637,10 @@ class App:
 
     def save_settings(self):
         place = self.place_var.get().strip()
-        if parse_private_server(place):   # a private server link is an invite; never write it to disk
+        private = bool(parse_private_server(place))
+        if private:   # kept encrypted by keep_private_link; settings.json is plain text
             place = self.settings.get("place", "")
-        self.settings.update(multi=self.multi_var.get(), same_server=self.same_server_var.get(),
+        self.settings.update(place_is_private=private, multi=self.multi_var.get(), same_server=self.same_server_var.get(),
                              auto_tile=self.auto_tile_var.get(), anti_afk=self.anti_afk_var.get(),
                              stream_mode=self.stream_var.get(), hide_taskbar=self.hide_taskbar_var.get(),
                              place=place)
@@ -4972,11 +5801,47 @@ class App:
         return [{**g, "name": clean_name(g["name"]) or f"Place {g['id']}"} for g in items
                 if isinstance(g, dict) and "id" in g and "name" in g] if isinstance(items, list) else []
 
+    def keep_private_link(self):
+        """Saves a private server link the moment it's in the Game box, so closing or a crash can't
+        lose it. Stays saved when the box moves on to another game, until Forget is used."""
+        link = self.place_var.get().strip()
+        if not parse_private_server(link) or link == self.private_link:
+            return
+        try:
+            save_private_link(link)
+        except OSError as e:
+            log.warning("Couldn't save the private server link (%s)", type(e).__name__)
+            self.status.config(text="Couldn't save that private server link. It still works until you close AltVault.")
+            return
+        self.private_link = link
+        self.settings["place_is_private"] = True
+        save_settings(self.settings)
+        self.update_recents_box()
+
+    def forget_private_link(self):
+        try:
+            os.remove(PRIVATE_FILE)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.warning("Couldn't delete the saved private server link (%s)", type(e).__name__)
+            self.status.config(text="Couldn't delete the saved private server link.")
+            return
+        if self.place_var.get().strip() == self.private_link:
+            self.place_var.set("")
+        self.private_link = None
+        self.settings["place_is_private"] = False
+        save_settings(self.settings)
+        self.update_recents_box()
+        self.status.config(text="Forgot the saved private server link.")
+
     def update_recents_box(self):
-        """Favourites first (starred), then recent games that aren't favourites."""
+        """The saved private server link (kept off screen in Stream mode), favourites (starred), then
+        recent games that aren't favourites."""
         favs = self.favorites()
         fav_ids = {f["id"] for f in favs}
-        self.place_box["values"] = [f"★ {f['name']}  ({f['id']})" for f in favs] + \
+        private = [self.private_link] if self.private_link and not self.stream_var.get() else []
+        self.place_box["values"] = private + [f"★ {f['name']}  ({f['id']})" for f in favs] + \
             [f"{r['name']}  ({r['id']})" for r in self.recents() if r["id"] not in fav_ids]
         self.update_star()
 
@@ -5140,31 +6005,30 @@ class App:
                     self.lost_flagged.add(acc["id"])
                     self.history.add(lost=1)
                     dropped.append(self.who(acc))
+                    self.doctor_note("lost", acc["id"])
                     log.warning("%s has had a Roblox window open but hasn't been in a game for %d min",
                                 self.who(acc), self.seconds_out_of_game(acc, pid, now) // 60)
         for acc_id in self.lost_flagged - still:
             self.lost_flagged.discard(acc_id)
             acc = self.account(acc_id)
             log.info("%s is back in a game (or its window closed)", self.who(acc) if acc else acc_id)
-        if self.tray:
-            if dropped:
-                self.tray.notify("Roblox window out of its game",
-                                 f"{', '.join(dropped[:3])}{' and more' if len(dropped) > 3 else ''}: open for over "
-                                 f"{LOST_AFTER // 60} min but not in a game. Check the Live page.", warning=True)
-            if moved:
-                self.tray.notify("Moved to a different server",
-                                 f"{', '.join(moved[:3])}{' and more' if len(moved) > 3 else ''}: the game moved "
-                                 "the account to another server.", warning=True)
+        if dropped:
+            self.alert("Roblox window out of its game",
+                       f"{', '.join(dropped[:3])}{' and more' if len(dropped) > 3 else ''}: open for over "
+                       f"{LOST_AFTER // 60} min but not in a game. Check the Live page.")
+        if moved:
+            self.alert("Moved to a different server", f"{', '.join(moved[:3])}{' and more' if len(moved) > 3 else ''}: "
+                       "the game moved the account to another server.")
 
     def note_expired(self, account_id):
         acc = self.account(account_id)
         if not acc or account_id in self.expired_told:
             return
         self.expired_told.add(account_id)
-        log.warning("The login for %s has expired", self.who(acc))
-        if self.tray:
-            self.tray.notify("A login has expired", f"{self.who(acc)} needs to log in again: right-click it, "
-                             "Account, Log in again. Its Roblox window can't stay connected without it.", warning=True)
+        log.warning("The login for %s has expired, %s after it was saved", self.who(acc), self.login_age(account_id))
+        self.doctor_note("login", account_id, lasted=self.login_age(account_id))
+        self.alert("A login has expired", f"{self.who(acc)} needs to log in again: right-click it, "
+                   "Account, Log in again. Its Roblox window can't stay connected without it.")
 
     def tick(self):
         """Keeps track of which Roblox window belongs to which account and labels each window."""
@@ -5186,9 +6050,12 @@ class App:
                     set_window_title(hwnd, self.window_title(acc))
             self.running = {pid: a for pid, a in self.running.items() if pid in alive}
             gone = set(before) - alive
-            closed = len(gone - self.expected_close)
+            unexpected = gone - self.expected_close
+            closed = len(unexpected)
             if closed:
                 self.history.add(closed=closed)
+                self.doctor_closed += [(before[pid], time.time()) for pid in unexpected if before.get(pid)]
+                self.root.after(4000, self.doctor_scan)   # Roblox needs a moment to finish its log
             self.expected_close -= gone
             if self.running != before:
                 self.refresh()
@@ -5217,10 +6084,6 @@ class App:
         linked = [w for w in windows if self.running.get(w[1])]
         ingame = sum(1 for _, pid, _ in linked
                      if (self.presence.get(self.running.get(pid)) or {}).get("userPresenceType") == 2)
-        now = time.monotonic()   # real time since the last reading (capped, so a sleeping PC doesn't count)
-        minutes = 1.0 if self.last_sample_at is None else min(now - self.last_sample_at, 120) / 60
-        self.last_sample_at = now
-        self.count_eggs(ingame, minutes)
         used = memory_used_fraction()
         self.memory_hot = self.memory_hot + 1 if (len(linked) >= 2 and used >= MEMORY_ALERT) else 0
         if used < AFK_PRESSURE:
@@ -5228,86 +6091,25 @@ class App:
         if self.memory_hot >= 3 and not self.memory_alerted:
             self.memory_alerted = True
             log.warning("Memory is %.0f%% full with %d Roblox windows open", used * 100, len(linked))
-            if self.tray:
-                self.tray.notify("Your PC is out of memory",
-                                 f"Memory is {used:.0%} full with {len(linked)} Roblox windows. Clients slow to a crawl "
-                                 "and Anti-AFK can miss, so accounts get re-joined or kicked. Close some windows or apps.",
-                                 warning=True)
+            self.doctor_note("memory", None)
+            self.alert("Your PC is out of memory", f"Memory is {used:.0%} full with {len(linked)} Roblox windows. "
+                       "Clients slow to a crawl and Anti-AFK can miss, so accounts get re-joined or kicked. "
+                       "Close some windows or apps.")
         self.history.sample(open=len(linked), ingame=ingame if linked else None,
                             pc_cpu=reading["pc_cpu"], pc_ram=reading["pc_ram"],
                             rbx_cpu=reading["rbx_cpu"] if windows else None,
                             rbx_ram=reading["rbx_ram"] if windows else None)
         self.recent.append((time.time(), reading))
+        if windows:
+            self.doctor_scan()
         if self.page == "pulse":
             self.pages["pulse"].draw_charts()
-
-    def hatch_rate(self):
-        """One alt's hatch speed in eggs per minute, as typed on the Live page; None if not set."""
-        h = self.settings.get("hatch")
-        if isinstance(h, dict) and isinstance(h.get("value"), (int, float)) and h["value"] > 0 \
-                and h.get("unit") in ("min", "hour", "sec"):
-            return per_minute(h["value"], h["unit"])
-        return None
-
-    def count_eggs(self, alts_in_game, minutes):
-        """Adds the eggs `alts_in_game` accounts would have hatched in `minutes` at the typed speed.
-        An estimate: the game's own counter is out of AltVault's reach."""
-        rate = self.hatch_rate()
-        if not rate or alts_in_game <= 0 or minutes <= 0:
-            return 0.0
-        eggs = rate * alts_in_game * minutes
-        self.history.add(eggs=eggs)
-        self.settings["eggs_total"] = float(self.settings.get("eggs_total") or 0) + eggs
-        self.settings.setdefault("eggs_since", time.time())
-        self.eggs_dirty = True
-        return eggs
-
-    def egg_card(self, hours, span):
-        """(value, caption) for the Stats card: eggs over the chosen range, and the running total."""
-        rate = self.hatch_rate()
-        eggs = self.history.total("eggs", hours)
-        total = float(self.settings.get("eggs_total") or 0)
-        if rate is None and not total:
-            return "—", "Type one alt's hatch speed on the Live page to start counting."
-        since = self.settings.get("eggs_since")
-        when = f" since {time.strftime('%d %b', time.localtime(since))}" if since else ""
-        return short_number(eggs), f"last {span}" + "\n" + f"Total{when}: {short_number(total)}"
-
-    def set_eggs_total(self, value):
-        """Makes the running total match the game's own counter (the estimate carries on from there)."""
-        self.settings["eggs_total"] = max(float(value), 0.0)
-        self.settings["eggs_since"] = time.time()
-        self.eggs_dirty = True
-        self.save_history()
-
-    def ask_eggs_total(self):
-        def check(text):
-            try:
-                n = float(text.replace(",", "").strip())
-            except ValueError:
-                return "Type a number, such as 12500."
-            return None if 0 <= n < 1e15 else "That number is out of range."
-        text = Dialog(self.root, "Set eggs hatched", "Type the eggs hatched total your game shows right now. "
-                      "AltVault will carry on counting from it. Use 0 to start over.", "question",
-                      (("Cancel", None), ("Set total", True)),
-                      entry=f"{float(self.settings.get('eggs_total') or 0):.0f}", validate=check).result
-        if text is not None:
-            self.set_eggs_total(float(text.replace(",", "").strip()))
-            if self.page == "stats":
-                self.pages["stats"].refresh()
-            self.status.config(text=f"Eggs hatched total set to {short_number(self.settings['eggs_total'])}.")
 
     def save_history(self):
         try:
             self.history.save()
         except OSError as e:
             log.warning("Couldn't save history: %s", e)
-        if self.eggs_dirty:   # the running total lives in settings.json; written with the history, not every minute
-            self.eggs_dirty = False
-            try:
-                save_settings(self.settings)
-            except OSError as e:
-                log.warning("Couldn't save the egg total: %s", e)
 
     def close_windows(self, pids):
         """Closes Roblox processes on purpose, so they don't count as unexpected closes."""
@@ -5330,6 +6132,22 @@ class App:
         self.join_selected()
 
     # ------------------------------------------------------------ account actions
+    def note_login_saved(self, account_ids):
+        """Remembers when each login was saved (a time only, never the login) so that a login Roblox
+        later rejects can be logged with how long it lasted. That is what shows why one died."""
+        saved = self.settings.setdefault("login_saved", {})
+        now = time.time()
+        for account_id in account_ids:
+            saved[str(account_id)] = now
+        save_settings(self.settings)
+
+    def login_age(self, account_id):
+        t = (self.settings.get("login_saved") or {}).get(str(account_id))
+        if not isinstance(t, (int, float)):
+            return "an unknown time"
+        minutes = max(time.time() - t, 0) / 60
+        return f"{minutes:.0f} min" if minutes < 120 else f"{minutes / 60:.1f} h"
+
     def add_many(self, items):
         """Saves several checked accounts at once: [(user, {'cookie', 'group', 'note'})]. Entries
         from an AltVault export also carry 'fps_cap', 'low_graphics', 'muted' and 'afk_skip'; they
@@ -5360,6 +6178,7 @@ class App:
             self.settings.update({key: sorted(ids) for key, ids in flags.items()})
             save_settings(self.settings)
         if items:
+            self.note_login_saved([user["id"] for user, _ in items])
             self.save()
             self.refresh()
             threading.Thread(target=self.fetch_missing_avatars, daemon=True).start()
@@ -5376,6 +6195,7 @@ class App:
             self.accounts.append({"id": user["id"], "name": user["name"],
                                   "displayName": user["displayName"], "cookie": cookie, "note": note})
         self.expired.discard(user["id"])
+        self.note_login_saved([user["id"]])
         self.save()
         self.refresh()
         self.status.config(text=f"Saved {self.who(self.account(user['id']))}.")
@@ -5668,7 +6488,10 @@ class App:
     # ------------------------------------------------------------ privacy
     def toggle_stream(self):
         on = self.stream_var.get()
+        if on:   # the feed may name accounts from before Stream mode was on
+            ACTIVITY.items.clear()
         self.save_settings()
+        self.update_recents_box()
         self.refresh()
         self.tick_now()
         self.status.config(text="Stream mode is on: names and avatars are hidden." if on else "Stream mode is off.")
@@ -5900,6 +6723,11 @@ class App:
             self.schedule_afk(self.afk_next_delay(now))
             return
         oldest = max(ages[h] for h in targets)
+        if (oldest < AFK_BUSY_INTERVAL[0] and idle_seconds() < AFK_AWAY
+                and not any(h in self.afk_misses for h in targets)):
+            self.afk_wait_started = None   # in use, and no window needs it yet: leave the PC alone
+            self.schedule_afk(30)
+            return
         if self.afk_wait_started is None:
             self.afk_wait_started = now
         if (oldest < AFK_URGENT and idle_seconds() < AFK_IDLE
@@ -5919,7 +6747,7 @@ class App:
         used = memory_used_fraction()
         strong = used >= AFK_PRESSURE
         if strong:
-            log.info("Anti-AFK: memory is %.0f%% full, so Roblox windows are slow; using slower, doubled key taps", used * 100)
+            log.info("Anti-AFK: memory is %.0f%% full, so Roblox windows are slow; giving them longer before the key press", used * 100)
 
         def work():
             try:
@@ -6112,7 +6940,10 @@ class App:
                 try:
                     launch(acc["cookie"], place_id, job_id, link_code)
                 except CookieExpired:
+                    log.warning("Roblox rejected the login for %s at launch, %s after it was saved",
+                                self.who(acc), self.login_age(acc["id"]))
                     self.expired.add(acc["id"])
+                    self.ui(lambda a=acc["id"], age=self.login_age(acc["id"]): self.doctor_note("login", a, lasted=age))
                     problems.append(f"{self.who(acc)}: login expired — right-click > Log in again.")
                     self.ui(lambda: self.history.add(launch_fail=1))
                     continue
@@ -6293,6 +7124,7 @@ def main():
     # --- access key (begin) ---
     state, why = license_state()
     if state != "ok":   # no valid key on this PC: ask for one, or end here
+        apply_accent(load_settings().get("accent"))
         apply_theme(root, root.winfo_fpixels("1i") / 96)
         root.withdraw()
         if not ActivationWindow(root, "" if state == "none" else why).activated:

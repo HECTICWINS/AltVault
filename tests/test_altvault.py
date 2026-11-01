@@ -242,7 +242,7 @@ class TestPrivateServers(unittest.TestCase):
         self.assertEqual(launched, [("c", "55", "", "OLD1")])
         self.assertEqual(problems, [])
 
-    def test_private_link_is_never_saved(self):
+    def test_private_link_stays_out_of_plain_settings(self):
         saved = []
         fake = types.SimpleNamespace(
             settings={"place": "https://www.roblox.com/games/1/Public"},
@@ -254,6 +254,22 @@ class TestPrivateServers(unittest.TestCase):
             av.App.save_settings(fake)
         self.assertNotIn("SECRET123", repr(saved))
         self.assertEqual(saved[-1]["place"], "https://www.roblox.com/games/1/Public")
+        self.assertTrue(saved[-1]["place_is_private"])
+
+    def test_private_link_survives_a_restart_encrypted(self):
+        link = "https://www.roblox.com/share?code=SECRET123&type=Server"
+        self.addCleanup(lambda: os.path.exists(av.PRIVATE_FILE) and os.remove(av.PRIVATE_FILE))
+        av.save_private_link(link)
+        self.assertEqual(av.load_private_link(), link)
+        with open(av.PRIVATE_FILE, "rb") as f:
+            self.assertNotIn(b"SECRET123", f.read())
+
+    def test_a_damaged_private_link_file_is_harmless(self):
+        self.addCleanup(lambda: os.path.exists(av.PRIVATE_FILE) and os.remove(av.PRIVATE_FILE))
+        os.makedirs(av.APP_DIR, exist_ok=True)
+        with open(av.PRIVATE_FILE, "wb") as f:
+            f.write(b"not encrypted")
+        self.assertIsNone(av.load_private_link())
 
 
 ROBLOX_SETTINGS_SAMPLE = (
@@ -564,7 +580,7 @@ class TestAntiAfkTiming(unittest.TestCase):
         user32 = types.SimpleNamespace(IsIconic=lambda h: False, GetWindowThreadProcessId=lambda h, p: None)
         with mock.patch.object(av.time, "monotonic", lambda: clock[0]), \
                 mock.patch.object(av, "roblox_windows", lambda: [(h, p, "Roblox") for h, p in windows.items()]), \
-                mock.patch.object(av, "idle_seconds", lambda: 0.0 if rnd.random() < busy_user else 10.0), \
+                mock.patch.object(av, "idle_seconds", lambda: 0.0 if rnd.random() < busy_user else 600.0), \
                 mock.patch.object(av, "_user32", user32), \
                 mock.patch.object(av, "anti_afk_pass", fake_pass), \
                 mock.patch.object(av.random, "uniform", rnd.uniform), \
@@ -590,8 +606,13 @@ class TestAntiAfkTiming(unittest.TestCase):
             worst = self.simulate(seed)
             flaky = max(flaky, worst[103])
             healthy = max(healthy, max(v for h, v in worst.items() if h != 103))
-        self.assertLess(healthy / 60, 12, "a healthy window went too long without a ping")
+        self.assertLess(healthy / 60, 15.5, "a healthy window went too long without a ping")
         self.assertLess(flaky / 60, 17, "a window that often misses went too long without a ping")
+
+    def test_pc_in_use_is_disturbed_about_half_as_often(self):
+        worst = self.simulate(1, flaky=0, busy_user=1)
+        self.assertGreater(max(worst.values()) / 60, 11.9)
+        self.assertLess(max(worst.values()) / 60, 15.5)
 
     def test_calm_conditions_ping_on_schedule(self):
         worst = self.simulate(1, flaky=0, busy_user=0)
@@ -624,15 +645,183 @@ class TestStayConnected(unittest.TestCase):
         app.first_seen[1] = 0.0
         self.assertFalse(av.App.is_lost(app, acc, 1))
 
-    def test_strong_press_taps_twice_and_only_while_in_front(self):
-        taps = []
-        with mock.patch.object(av.time, "sleep"), mock.patch.object(av, "tap_key", lambda vk, hold=0: taps.append(hold)),                 mock.patch.object(av._user32, "GetForegroundWindow", lambda: 7):
-            self.assertTrue(av.press_when_ready(7, 0x20, strong=True))
-            self.assertEqual(taps, [av.AFK_HOLD_SLOW] * 2)
-            taps.clear()
-            self.assertTrue(av.press_when_ready(7, 0x20))
-            self.assertEqual(taps, [av.AFK_HOLD])
-            self.assertFalse(av.press_when_ready(8, 0x20))
+    def test_every_ping_is_exactly_one_short_tap(self):
+        """A second tap or a long hold double jumps, which pulls a character off an egg."""
+        taps, waits = [], []
+        with mock.patch.object(av.time, "sleep", waits.append), \
+                mock.patch.object(av, "tap_key", lambda vk, *a: taps.append(a)), \
+                mock.patch.object(av._user32, "GetForegroundWindow", lambda: 7):
+            for strong in (False, True):
+                taps.clear()
+                self.assertTrue(av.press_when_ready(7, 0x20, strong))
+                self.assertEqual(taps, [()], "one tap, at the normal length")
+            self.assertIn(av.AFK_SETTLE_SLOW, waits, "memory pressure only waits longer first")
+            self.assertFalse(av.press_when_ready(8, 0x20), "never press into a window that isn't in front")
+        self.assertLess(av.AFK_HOLD, 0.25)
+
+
+class TestLaunchTicket(unittest.TestCase):
+    def run_ticket(self, replies, user_ok=True):
+        calls = iter(replies)
+        users = mock.Mock(side_effect=None if user_ok else av.CookieExpired())
+        with mock.patch.object(av, "_post", lambda *a, **k: next(calls)), mock.patch.object(av, "get_user", users), \
+                mock.patch.object(av.time, "sleep"):
+            return av.get_auth_ticket("c" * 60)
+
+    def test_a_dead_login_is_reported_as_expired(self):
+        with self.assertRaises(av.CookieExpired):
+            self.run_ticket([(401, {}, b"{}")], user_ok=False)
+
+    def test_a_working_login_is_not_called_expired_and_is_retried(self):
+        ok = (200, {"rbx-authentication-ticket": "T"}, b"")
+        self.assertEqual(self.run_ticket([(401, {}, b"no"), ok]), "T")
+
+    def test_still_refused_gives_a_plain_error_not_expired(self):
+        with self.assertRaises(av.RobloxError) as cm:
+            self.run_ticket([(401, {}, b"no"), (401, {}, b"no")])
+        self.assertNotIsInstance(cm.exception, av.CookieExpired)
+
+
+def roblox_line(when, text):
+    return f"{when}Z,12.5,27b8,6 {text}\n".encode()
+
+
+JOIN = "[FLog::Output] ! Joining game '{}' place 728 at 10.60.1.34"
+A, B = "3e8ae2c7-a54b-4aaa-a217-479e51ee0ec0", "8b4f3378-a54b-4aaa-a217-479e51ee0ec1"
+LOADED = ("[FLog::GameJoinLoadTime] Report game_join_loadtime: placeid:728, join_time:0.9, universeid:1, "
+          "referral_page:RequestGame, sid:daa6, clienttime:1793406922.4260001183, userid:{},")
+DROP = "[FLog::Network] Sending disconnect with reason: {}"
+LOW = "[FLog::SingleSurfaceApp] memoryPrioritizationCallback (level:3)"
+
+
+class TestDoctorLogs(unittest.TestCase):
+    def log(self, *lines):
+        return b"".join(roblox_line(*line) for line in lines)
+
+    def test_an_idle_kick_names_the_account_once(self):
+        state, data = {}, self.log(("2026-10-27T15:00:00.100", JOIN.format(A)), ("2026-10-27T15:00:00.100", LOADED.format(77)),
+                                   ("2026-10-27T15:36:51.155", DROP.format(278)), ("2026-10-27T15:36:51.156", DROP.format(278)))
+        events = av.parse_client_log(state, data)
+        self.assertEqual(len(events), 1, "Roblox writes the line twice")
+        self.assertEqual((events[0]["kind"], events[0]["code"], events[0]["user"]), ("exit", 278, 77))
+        self.assertEqual(events[0]["t"], av.calendar.timegm((2026, 10, 27, 15, 36, 51)))
+        self.assertFalse(events[0]["memory"])
+
+    def test_critical_memory_counts_only_when_it_was_close(self):
+        near = self.log(("2026-10-27T15:36:00.000", LOW), ("2026-10-27T15:36:51.155", DROP.format(278)))
+        far = self.log(("2026-10-27T15:00:00.000", LOW), ("2026-10-27T15:36:51.155", DROP.format(278)))
+        self.assertTrue(av.parse_client_log({}, near)[0]["memory"])
+        self.assertFalse(av.parse_client_log({}, far)[0]["memory"])
+
+    def test_memory_evidence_carries_across_reads(self):
+        state = {}
+        av.parse_client_log(state, self.log(("2026-10-27T15:36:00.000", LOW)))
+        self.assertTrue(av.parse_client_log(state, self.log(("2026-10-27T15:36:51.155", DROP.format(278))))[0]["memory"])
+
+    def test_a_server_move_is_seen_but_a_rejoin_or_new_place_is_not(self):
+        state = {"user": 7}
+        lines = [("2026-10-27T15:00:00.000", JOIN.format(A)), ("2026-10-27T15:10:00.000", JOIN.format(A)),
+                 ("2026-10-27T15:20:00.000", JOIN.format(B))]
+        events = av.parse_client_log(state, self.log(*lines))
+        self.assertEqual([e["kind"] for e in events], ["moved"])
+        state = {"user": 7, "job": A, "place": "999"}
+        self.assertEqual(av.parse_client_log(state, self.log(("2026-10-27T15:20:00.000", JOIN.format(B)))), [])
+
+    def test_doctor_reads_only_new_whole_lines_and_finds_the_account_later(self):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(lambda: av.shutil.rmtree(folder, ignore_errors=True))
+        doctor = av.Doctor(os.path.join(folder, "d.json"), folder)
+        doctor.since = 0
+        path = os.path.join(folder, "0.745_20261031T003520Z_Player_8486C_last.log")
+        ignored = os.path.join(folder, "0.745_20261031T003520Z_Player_8486C_CrashHandler_last.log")
+        first = self.log(("2026-10-27T15:00:00.100", LOADED.format(77)), ("2026-10-27T15:36:51.155", DROP.format(278)))
+        with open(ignored, "wb") as f:
+            f.write(first)
+        with open(path, "wb") as f:
+            f.write(first[:-6])          # the last line is still being written
+        self.assertEqual(doctor.scan(), [])
+        with open(path, "wb") as f:
+            f.write(first)
+        self.assertEqual([e["code"] for e in doctor.scan()], [278])
+        self.assertEqual(doctor.scan(), [], "nothing is read twice")
+        self.assertEqual(doctor.exits[77], av.calendar.timegm((2026, 10, 27, 15, 36, 51)))
+
+    def test_no_log_folder_and_garbage_are_harmless(self):
+        self.assertEqual(av.Doctor(os.path.join(tempfile.gettempdir(), "nope.json"), "Z:/missing").scan(), [])
+        self.assertEqual(av.parse_client_log({}, b"\x00\xff garbage Sending disconnect with reason: 278\n"), [])
+
+    def test_findings_survive_a_restart_hold_no_text_and_do_not_repeat(self):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(lambda: av.shutil.rmtree(folder, ignore_errors=True))
+        path = os.path.join(folder, "d.json")
+        doctor = av.Doctor(path, folder)
+        now = time.time()
+        self.assertTrue(doctor.add("exit", 77, now, code=278))
+        self.assertIsNone(doctor.add("exit", 77, now, code=278))
+        self.assertIsNone(doctor.add("crash", 77, now - 8 * 86400), "older than a week isn't kept")
+        doctor.add("login", 78, now, lasted="14 min")
+        doctor.save()
+        again = av.Doctor(path, folder)
+        self.assertEqual([i["kind"] for i in again.items], ["exit", "login"])
+        self.assertEqual(again.count(("exit",)), 1)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        self.assertEqual(av.Doctor(path, folder).items, [])
+
+    def test_every_finding_has_a_full_explanation(self):
+        items = [{"kind": "exit", "code": c} for c in (*av.DOCTOR_CODES, 278, 9999)] + [{"kind": k} for k in av.DOCTOR_EVENTS]
+        for item in items:
+            title, why, fix, action, color = av.explain(item)
+            self.assertTrue(title and why and fix, item)
+            self.assertIn(color, ("red", "yellow"))
+            self.assertTrue(action is None or action in av.DoctorPage.ACTIONS, item)
+
+    def test_an_idle_kick_blames_the_real_cause(self):
+        explain = lambda **k: av.explain({"kind": "exit", "code": 278, **k})
+        self.assertEqual(explain(anti_afk="off")[3], "afk")
+        self.assertIn("off for this account", explain(anti_afk="skipped")[1])
+        self.assertIn("critically low", explain(memory=True)[1])
+        self.assertNotIn("Anti-AFK was off", explain()[1])
+
+
+class TestSettingsBackup(unittest.TestCase):
+    def test_a_backup_never_holds_logins_or_private_links(self):
+        settings = {"multi": True, "geometry": "1x1", "cookie": "SECRET", "private_link": "SECRET"}
+        backup = av.settings_backup(settings)
+        self.assertEqual(backup, {"altvault_settings": 1, "multi": True})
+
+    def test_restore_takes_only_known_keys_of_the_right_type(self):
+        settings = {}
+        data = {"altvault_settings": 1, "multi": False, "afk_key": 5, "evil": "x", "favorites": []}
+        self.assertEqual(av.restore_backup(settings, data), 2)
+        self.assertEqual(settings, {"multi": False, "favorites": []})
+
+    def test_a_random_file_is_refused(self):
+        for bad in ({}, [], "x", {"altvault_settings": 2}):
+            with self.assertRaises(ValueError):
+                av.restore_backup({}, bad)
+
+
+class TestAccent(unittest.TestCase):
+    def test_each_accent_changes_the_palette_and_main_buttons(self):
+        before, buttons = dict(av.C), dict(av.ACCENT)
+        self.addCleanup(lambda: (av.C.update(before), av.ACCENT.update(buttons)))
+        for name in ("Teal", "Violet", "not a colour"):
+            av.apply_accent(name)
+            want = av.ACCENTS.get(name, av.ACCENTS["Violet"])["accent"]
+            self.assertEqual(av.C["accent"], want)
+            self.assertEqual(av.ACCENT["normal"][0], want)
+
+
+class TestAntiAfkGivesWay(unittest.TestCase):
+    def test_user_input_during_the_wait_is_noticed(self):
+        ticks = iter([5, 9])
+        with mock.patch.object(av, "last_input_tick", lambda: next(ticks)), mock.patch.object(av.time, "sleep"):
+            self.assertTrue(av.user_came_back())
+
+    def test_quiet_wait_carries_on(self):
+        with mock.patch.object(av, "last_input_tick", lambda: 5), mock.patch.object(av.time, "sleep"):
+            self.assertFalse(av.user_came_back())
 
 
 class TestAntiAfkBlocked(unittest.TestCase):
@@ -1186,6 +1375,8 @@ class TestWindow(unittest.TestCase):
         live = self.app.pages["live"]
         registered, released = set(), []
         windows = [(200 + i, 300 + i, "Roblox") for i in range(12)]
+        self.addCleanup(mock.patch.stopall)
+        mock.patch.object(av, "ask_yes_no", lambda *a, **k: False).start()   # a stray real click must not block the run
         with mock.patch.object(av, "roblox_windows", lambda: list(windows)),                 mock.patch.object(av, "register_thumbnail", lambda d, h: registered.add(h) or h),                 mock.patch.object(av, "unregister_thumbnail", released.append),                 mock.patch.object(av, "place_thumbnail", lambda t, r: True),                 mock.patch.object(av, "client_size", lambda h: (800, 600)),                 mock.patch.object(av, "save_settings", lambda s: None),                 mock.patch.object(av._user32, "IsIconic", lambda h: False):
             for i in range(30):
                 self.app.show_page(self.app.NAV[i % len(self.app.NAV)][0])
@@ -1228,7 +1419,7 @@ class TestWindow(unittest.TestCase):
 
     def test_every_sidebar_page_opens(self):
         self.assertEqual([k for k, _, _ in self.app.NAV],
-                         ["accounts", "profiles", "games", "live", "stats", "pulse", "settings"])
+                         ["home", "accounts", "profiles", "games", "live", "stats", "pulse", "doctor", "settings"])
         with mock.patch.object(av, "roblox_windows", lambda: []):
             for key, _, _ in self.app.NAV:
                 self.app.show_page(key)
@@ -1278,76 +1469,155 @@ class TestWindow(unittest.TestCase):
         finally:
             self.app.history = saved
 
-    def egg_setup(self, hatch):
-        saved = (self.app.history, dict(self.app.settings), self.app.last_sample_at)
-        self.app.history = av.History(os.path.join(av.APP_DIR, "history-eggs.json"))
-        for key in ("eggs_total", "eggs_since", "hatch"):
-            self.app.settings.pop(key, None)
-        if hatch:
-            self.app.settings["hatch"] = hatch
-        self.app.last_sample_at = None
-        return saved
+    def test_private_link_is_kept_when_pasted_and_can_be_forgotten(self):
+        link = 'https://www.roblox.com/share?code=SECRET123&type=Server'
+        self.addCleanup(self.app.place_var.set, '')
+        self.app.place_var.set(link)
+        self.assertEqual(av.load_private_link(), link)
+        self.assertEqual(self.app.place_box['values'][0], link)
+        self.app.place_var.set('')
+        self.assertEqual(av.load_private_link(), link, 'clearing the box must not lose it')
+        self.app.forget_private_link()
+        self.assertIsNone(av.load_private_link())
+        self.assertNotIn(link, self.app.place_box['values'])
 
-    def egg_restore(self, saved):
-        self.app.history, settings, self.app.last_sample_at = saved
-        self.app.settings.clear()
-        self.app.settings.update(settings)
-        self.app.eggs_dirty = False
+    def test_card_rims_are_one_solid_colour_where_they_stretch(self):
+        """Tk repeats everything outside an image's border, so a changing rim there shows as dashes."""
+        images, top = self.app.root.altvault_images, self.app.root.altvault_glass_top
+        for name in ("AVGlass", "AVGlassHover"):
+            picture = images[name]
+            for x in (0, 1, picture.width() - 1, picture.width() - 2):
+                column = {picture.get(x, y) for y in range(top, picture.height() - top // 2)}
+                self.assertEqual(len(column), 1, f"{name} rim changes colour at x={x}")
 
-    def test_eggs_are_estimated_from_speed_alts_and_time(self):
-        saved = self.egg_setup({"value": 30, "unit": "min"})
-        try:
-            self.assertEqual(self.app.count_eggs(4, 1.0), 120)      # 4 alts x 30/min x 1 min
-            self.assertEqual(self.app.count_eggs(2, 0.5), 30)
-            self.assertEqual(self.app.count_eggs(0, 1.0), 0)         # nobody in a game: nothing counted
-            self.assertEqual(self.app.settings["eggs_total"], 150)
-            self.assertEqual(self.app.history.total("eggs", 1), 150)
-            self.app.settings["hatch"] = {"value": 2, "unit": "sec"}  # 2 s per egg = 30 per minute
-            self.assertEqual(self.app.hatch_rate(), 30)
-            self.app.settings["hatch"] = {"value": 0, "unit": "min"}
-            self.assertIsNone(self.app.hatch_rate())
-            self.assertEqual(self.app.count_eggs(5, 1.0), 0, "no speed set: no guessing")
-        finally:
-            self.egg_restore(saved)
+    def doctor_app(self):
+        saved = self.app.doctor
+        self.addCleanup(setattr, self.app, "doctor", saved)
+        self.addCleanup(self.app.doctor_closed.clear)
+        self.addCleanup(self.app.pages["doctor"].refresh)
+        folder = tempfile.mkdtemp()
+        self.addCleanup(lambda: av.shutil.rmtree(folder, ignore_errors=True))
+        self.app.doctor = av.Doctor(os.path.join(folder, "d.json"), folder)
+        return self.app.doctor
 
-    def test_minute_sample_counts_real_elapsed_time_but_not_a_sleeping_pc(self):
-        saved = self.egg_setup({"value": 60, "unit": "min"})
-        windows = [(1, 4001, "Roblox - alt4")]
-        self.app.running[4001] = 4
-        self.app.presence[4] = {"userPresenceType": 2}
-        reading = {"pc_cpu": 1.0, "pc_ram": 1.0, "rbx_cpu": 1.0, "rbx_ram": 1.0, "windows": 1}
-        try:
-            with mock.patch.object(av, "measure", lambda w, a, b: reading):
-                self.app.sample_minute(windows)                        # first reading counts one minute
-                self.assertEqual(self.app.settings["eggs_total"], 60)
-                self.app.last_sample_at -= 600                         # ten minutes pass (PC slept)
-                self.app.sample_minute(windows)
-            self.assertEqual(self.app.settings["eggs_total"], 60 + 120, "capped at two minutes")
-        finally:
-            self.app.running.pop(4001, None)
-            self.app.presence.pop(4, None)
-            self.egg_restore(saved)
+    def event(self, code, user=4, kind="exit", memory=False, age=10):
+        return {"t": time.time() - age, "user": user, "kind": kind, "code": code, "memory": memory}
 
-    def test_setting_the_total_continues_from_the_games_number_and_is_saved(self):
-        saved = self.egg_setup({"value": 30, "unit": "min"})
-        written = []
-        try:
-            with mock.patch.object(av, "save_settings", lambda st: written.append(dict(st))):
-                self.app.set_eggs_total(12500)
-                self.assertEqual(written[-1]["eggs_total"], 12500)
-                self.app.count_eggs(1, 1.0)
-                self.assertTrue(self.app.eggs_dirty)
-                self.app.save_history()
-            self.assertEqual(written[-1]["eggs_total"], 12530)
-            self.assertFalse(self.app.eggs_dirty)
-            value, caption = self.app.egg_card(24, "24 hours")
-            self.assertEqual(value, "30")
-            self.assertIn("12.5K", caption)
-            self.app.settings.pop("hatch")
-            self.app.settings.pop("eggs_total")
-            self.assertEqual(self.app.egg_card(24, "24 hours")[0], "—")
-        finally:
-            self.egg_restore(saved)
+    def test_a_normal_leave_is_not_reported_but_a_drop_is(self):
+        doctor = self.doctor_app()
+        with mock.patch.object(self.app, "alert") as alert:
+            self.app.doctor_absorb([self.event(285)], False)
+            self.assertEqual(doctor.items, [])
+            alert.assert_not_called()
+            self.app.doctor_absorb([self.event(278)], False)
+            self.assertEqual(doctor.items[0]["code"], 278)
+            alert.assert_called_once()
+
+    def test_the_first_scan_files_old_events_without_alerting(self):
+        doctor = self.doctor_app()
+        with mock.patch.object(self.app, "alert") as alert:
+            self.app.doctor_absorb([self.event(278, age=5000)], True)
+        alert.assert_not_called()
+        self.assertEqual(len(doctor.items), 1)
+        self.assertNotIn("anti_afk", doctor.items[0], "today's switch says nothing about an old event")
+
+    def test_a_window_that_vanishes_with_no_reason_is_a_crash_but_a_goodbye_is_not(self):
+        doctor = self.doctor_app()
+        now = time.time()
+        with mock.patch.object(self.app, "alert"):
+            self.app.doctor_closed.append((4, now))
+            self.app.doctor_absorb([], False)
+            self.assertEqual([i["kind"] for i in doctor.items], ["crash"])
+            doctor.items.clear()
+            doctor.exits[5] = now - 2
+            self.app.doctor_closed.append((5, now))
+            self.app.doctor_absorb([], False)
+            self.assertEqual(doctor.items, [])
+
+    def test_doctor_page_shows_why_and_offers_the_fix(self):
+        doctor = self.doctor_app()
+        doctor.add("login", 4, lasted="14 min")
+        doctor.add("exit", 123456, time.time() - 60, code=9999)
+        self.app.show_page("doctor")
+        self.pump(50)
+        page = self.app.pages["doctor"]
+        self.assertEqual(len(page.tree.get_children()), 2)
+        self.assertEqual(page.title.cget("text"), "Login rejected")
+        self.assertIn("14 min", page.why.cget("text"))
+        self.assertEqual(page.action.cget("text"), "Log in again")
+        page.tree.selection_set(page.tree.get_children()[1])
+        self.pump(50)
+        self.assertIn("error 9999", page.title.cget("text"))
+        self.assertEqual(page.who(page.current), "Not in AltVault")
+        self.app.show_page("home")
+
+    def test_a_log_on_disk_becomes_a_finding_on_doctor_and_home(self):
+        doctor = self.doctor_app()
+        doctor.since = time.time() - 3600
+        when = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 30))
+        lines = (roblox_line(when + ".100", LOADED.format(self.app.accounts[0]["id"])) + roblox_line(when + ".200", LOW)
+                 + roblox_line(when + ".300", DROP.format(278)))
+        with open(os.path.join(doctor.folder, "0.745_20261031T003520Z_Player_8486C_last.log"), "wb") as f:
+            f.write(lines)
+        with mock.patch.object(av.threading, "Thread", lambda target, daemon: types.SimpleNamespace(start=target)),                 mock.patch.object(self.app, "alert") as alert:
+            self.app.doctor_scan()
+            self.pump(50)
+        self.assertFalse(self.app.doctor_busy, "the scan must always finish")
+        alert.assert_called_once()
+        self.assertEqual((doctor.items[0]["code"], doctor.items[0]["memory"]), (278, True))
+        self.assertTrue(os.path.exists(doctor.path))
+        with open(doctor.path, encoding="utf-8") as f:
+            self.assertNotIn("Sending", f.read())
+        self.assertTrue(any("Idle-kicked" in text for _, text, _ in self.app.pages["home"].attention()))
+
+    def test_doctor_page_when_nothing_went_wrong(self):
+        self.doctor_app()
+        self.app.pages["doctor"].refresh()
+        self.assertEqual(self.app.pages["doctor"].title.cget("text"), "All clear")
+
+    def test_stream_mode_hides_names_on_doctor(self):
+        doctor = self.doctor_app()
+        doctor.add("login", self.app.accounts[0]["id"])
+        self.app.stream_var.set(True)
+        self.addCleanup(self.app.stream_var.set, False)
+        page = self.app.pages["doctor"]
+        self.assertTrue(page.who(doctor.items[0]).startswith("Account "))
+
+    def test_home_page_reports_and_never_crashes_on_an_empty_state(self):
+        self.app.show_page("home")
+        self.pump(50)
+        home = self.app.pages["home"]
+        home.refresh()
+        self.assertTrue(home.job, "it refreshes while on screen")
+        self.app.show_page("accounts")
+        self.assertIsNone(home.job, "and stops as soon as it isn't")
+
+    def test_home_attention_lists_what_matters_most_first(self):
+        home = self.app.pages["home"]
+        self.app.expired.add(99)
+        self.addCleanup(self.app.expired.discard, 99)
+        self.assertIn("expired", home.attention()[0][1])
+
+    def test_sidebar_collapses_and_remembers(self):
+        rail = self.app.rail
+        start = rail.wide
+        self.addCleanup(self.app.set_sidebar, start)
+        with mock.patch.object(av, "save_settings"):
+            self.app.set_sidebar(False)
+            self.pump(50)
+            self.assertEqual(rail.itemcget(rail.label["live"], "state"), "hidden")
+            self.assertFalse(self.app.settings["sidebar_wide"])
+            self.app.set_sidebar(True)
+            self.pump(50)
+            self.assertEqual(rail.itemcget(rail.label["live"], "state"), "normal")
+
+    def test_a_toast_replaces_the_last_and_goes_away(self):
+        self.app.toast("One")
+        first = self.app.toast_box
+        self.app.toast("Two", "text", warning=True)
+        self.assertFalse(first.winfo_exists())
+        self.app.hide_toast(self.app.toast_box)
+        self.assertIsNone(self.app.toast_box)
 
     def test_windows_not_from_altvault_do_not_skew_time_in_game(self):
         saved, self.app.history = self.app.history, av.History(os.path.join(av.APP_DIR, "history-linked.json"))
@@ -1447,18 +1717,15 @@ class TestLiveHelpers(unittest.TestCase):
         self.assertEqual(av.fit_rect(800, 600, 10, 20, 400, 400), (10, 70, 410, 370))
         self.assertEqual(av.fit_rect(0, 0, 5, 5, 10, 10), (5, 5, 15, 15))
 
-    def test_numbers_and_hatch_rate(self):
+    def test_numbers(self):
         self.assertEqual([av.short_number(n) for n in (0, 999, 9999, 12345, 2_500_000, 3e9)],
                          ["0", "999", "9,999", "12.3K", "2.5M", "3B"])
-        self.assertEqual(av.hatch_totals(30, 4), (120, 7200, 172800))
-        self.assertEqual(av.hatch_totals(30, 0), (0, 0, 0))
-        self.assertEqual([av.per_minute(v, u) for v, u in ((30, "min"), (1800, "hour"), (2, "sec"))], [30, 30, 30])
 
     def test_window_never_bigger_than_the_screen(self):
         with mock.patch.object(av, "work_area", lambda: (1366, 728)):
             self.assertEqual(av.fit_to_screen("1200x740"), "1200x688+83+0")
             self.assertEqual(av.fit_to_screen("1000x500+10+20"), "1000x500+10+20")
-            self.assertEqual(av.min_size(1.5), (1350, 728))
+            self.assertEqual(av.min_size(1.5), (1366, 728))
 
     def test_cpu_meter(self):
         meter = av.CpuMeter()
