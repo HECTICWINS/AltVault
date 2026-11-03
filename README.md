@@ -7,7 +7,7 @@ A secure, lightweight Roblox account manager for Windows. Download, unzip, doubl
 
 > **The only official download is the [Releases](https://github.com/HECTICWINS/AltVault/releases) page of this repository.**
 > Fake "AltVault" downloads on other sites, YouTube descriptions or Discord servers are a common way to steal Roblox accounts.
-> There is no installer: if someone gives you a "setup" file for AltVault, it isn't AltVault. A key (see [Access key](#access-key)) only ever comes from the maker, and getting one never needs your Roblox password or cookie.
+> There is no installer: if someone gives you a "setup" file for AltVault, it isn't AltVault.
 
 ## Why AltVault
 
@@ -33,6 +33,7 @@ A secure, lightweight Roblox account manager for Windows. Download, unzip, doubl
 - **Saved accounts:** logins are encrypted with Windows DPAPI.
 - **Join:** launch one or many accounts into a game, optionally all into the same server or a specific Job ID.
 - **Private servers:** paste a private server link and every selected account joins that private server.
+- **Modes:** one click on Home switches every alt to **Grind** (15 FPS, lowest graphics, muted, Windows efficiency mode) or **Max alts** (10 FPS, and Windows moves alts out of memory first), while your **main account** keeps full quality.
 - **FPS caps, lowest graphics and mute per account:** run alts at 15 FPS, minimum graphics and no sound to save power, while your main stays smooth.
 - **Server browser:** see a game's servers with player counts, ping and FPS, and join one, or let AltVault pick the least busy server with room for all your accounts.
 - **Join a player:** join the server a friend is in by typing their username.
@@ -47,6 +48,12 @@ A secure, lightweight Roblox account manager for Windows. Download, unzip, doubl
 - **Stream mode:** hides usernames and avatars, in AltVault and in Roblox's window titles, for screen sharing.
 - **Hide from taskbar:** keeps a dozen Roblox windows out of the taskbar and Alt+Tab.
 - **Export and import:** move your accounts to another PC in a password-protected file.
+- **Smarter joining:** a server with room for every account, an optional gap between launches, a wait for free memory before each one, a Stop button, and the accounts that didn't start selected for a one-click retry.
+- **Lighter rendering:** alts on lowest graphics also get the lowest textures, no anti-aliasing, a plain sky and no grass, through the flags Roblox allows players to set.
+- **Minimise all:** a minimised Roblox draws nothing, so it uses far less CPU and GPU.
+- **Discord alerts:** disconnects, expired logins, crashes and low memory sent to your own Discord channel.
+- **Panic hotkey:** Ctrl+Alt+End closes every Roblox window from any app.
+- **Upkeep:** old Roblox logs deleted once a day, and a note when a new AltVault is out.
 
 ## Install
 
@@ -99,16 +106,6 @@ Double-clicking `altvault.py` only works if `.py` files open with Python on your
 
 **Upgrading from PyRAM?** Close PyRAM, then start AltVault. Your saved accounts, settings and avatars move over automatically.
 
-## Access key
-
-This build needs a key, and a key works on one PC only.
-
-1. Start AltVault. It shows your **PC code**, which is a short code made from your Windows install (it doesn't reveal anything about you).
-2. Click **Copy request message** and send it to **hecticxww on Discord**. They decide whether to approve you.
-3. If they approve, they send back a key. Paste it into the window and click **Activate**.
-
-The key is saved in AltVault's data folder, so updating AltVault keeps it. You only need a new one if you reinstall Windows or move to another PC. Earlier versions (2.6.0 and before) don't need a key.
-
 ## Finding your way around
 
 - **Sidebar:** **Accounts**, **Profiles**, **Games**, **Live**, **Stats** and **Pulse** (Ctrl+1 to Ctrl+6), and **Settings** at the bottom (Ctrl+,).
@@ -121,9 +118,9 @@ The key is saved in AltVault's data folder, so updating AltVault keeps it. You o
 - **Accounts page, top:** search the list.
 - **Game box:** what to join. **★** pins a game; **Servers...** shows its servers. The **Server** box under it is optional.
 - **Account list:** select accounts (Ctrl+click, Shift+click, Ctrl+A, or click a group's header). The **Join** button shows how many will launch.
-- **Right-click** an account or group: **Join**, **Performance** (FPS cap, lowest graphics, mute, Anti-AFK), **Group**, **Account** (note, profile, log in again), and **Remove**.
+- **Right-click** an account or group: **Join**, **Performance** (main account, FPS cap, lowest graphics, mute, Anti-AFK), **Group**, **Account** (note, profile, log in again), and **Remove**.
 - **Bottom (every page):** the **Anti-AFK** switch and what AltVault last did.
-- **Live page:** a tile for every Roblox window. Click one to bring that window to the front; its **✕** closes it. The dot shows its state: green in a game, yellow still joining, red not responding, grey for a window AltVault didn't open. On the right: how many windows are in a game, Roblox's CPU and RAM use, your PC's free RAM, the **egg hatch** calculator, and the last 24 hours at a glance (time in a game, launches that worked, Anti-AFK pings, windows closed outside AltVault). Type one alt's speed (eggs per minute, eggs per hour or seconds per egg) and it multiplies it by the accounts in a game. Previews are drawn by Windows itself (like taskbar previews), only while the page is open, so they cost nothing the rest of the time.
+- **Live page:** a tile for every Roblox window. Click one to bring that window to the front; its **✕** closes it. The dot shows its state: green in a game, yellow still joining, red not responding, grey for a window AltVault didn't open. On the right: how many windows are in a game, Roblox's CPU and RAM use, your PC's free RAM, and the last 24 hours at a glance (time in a game, launches that worked, Anti-AFK pings, windows closed outside AltVault). Previews are drawn by Windows itself (like taskbar previews), only while the page is open, so they cost nothing the rest of the time.
 - **Settings page:** things you set once: Multi-Roblox, same server, window arranging, the Anti-AFK key, **Stream mode**, **Hide Roblox from the taskbar**, and **Export / Import**.
 
 ## Moving your accounts to another PC
@@ -189,6 +186,18 @@ Double-clicking a header only opens or closes it, so it never launches a whole g
 
 Click **☆** next to the Game box to add the current game to your favourites. Favourites stay at the top of the game list with a ★.
 
+## Modes and your main account
+
+Pick a mode at the top of **Home** (or in **Settings > Modes**). It applies to every account except your **main account**, the one you play on:
+
+- **Normal**: every account starts with your own Roblox settings and its per-account ones below;
+- **Grind**: alts run at 15 FPS, lowest graphics and muted, in Windows' efficiency mode (a lower clock and below-normal priority, like Task Manager's Efficiency mode);
+- **Max alts**: like Grind at 10 FPS, and Windows moves alts out of memory first when memory runs short, so your main account and other programs stay fast.
+
+To set your main account, right-click it and choose **Performance > Main account**, or pick it in **Settings > Modes**. It keeps your own Roblox settings and normal priority in every mode.
+FPS, graphics and sound apply from each window's next join; efficiency mode and memory priority apply to open windows straight away. An account's own FPS cap wins over the mode's.
+Nothing is injected into Roblox: modes use Roblox's own settings file (see below) and the same Windows switches as Task Manager.
+
 ## FPS caps, lowest graphics and mute
 
 Right-click an account (or several, or a group) and choose:
@@ -203,6 +212,24 @@ Each setting applies from that account's **next join**; windows that are already
 They use Roblox's own settings: just before launching an account, AltVault writes that account's values into Roblox's `GlobalBasicSettings_13.xml`, and once the client has started it puts your own settings back exactly.
 Only those numbers are changed, and nothing is injected into Roblox.
 To check an FPS cap, press **Shift+F5** in that Roblox window to show its frame rate.
+
+## Joining many accounts
+
+- With **Put accounts in the same server** on (Settings > General), AltVault looks for a public server with room for everyone and sends every account straight there. If there's none, the others follow the first account into its server.
+- **Wait between launches** gives each client time to load before the next starts. **Wait for free memory** holds the next launch for up to a minute while memory is over 90% full.
+- While a join runs, the Join button reads **Joining... (stop)**: click it to stop after the account that's starting. The accounts that didn't start are selected afterwards, so Join tries them again.
+
+## Lighter rendering
+
+Accounts on lowest graphics (their own setting, or Grind or Max alts mode) also start with Roblox's lowest texture quality, no anti-aliasing, a grey sky and no grass.
+These are rendering flags Roblox lets players set (its Fast Flag allowlist) in `ClientAppSettings.json` next to the player.
+AltVault adds them just before an alt starts and puts the file back exactly as it was once the client has read it, so your main account and normal Roblox are never affected; even if AltVault stops mid-launch, the next start puts the file back.
+When Roblox starts through a bootstrapper such as Bloxstrap, the bootstrapper manages that file, so AltVault leaves it alone. Turn this off in **Settings > Modes**.
+
+## Discord alerts and the panic hotkey
+
+In **Settings > Alerts**, paste a webhook link from a Discord server you own (Server Settings, Integrations, Webhooks). AltVault then posts disconnects, expired logins, crashes and low memory there, at most 20 an hour. The link is stored encrypted to your Windows user, nothing but the alert text is sent, and @mentions are turned off.
+The **panic hotkey**, Ctrl+Alt+End (off by default), closes every Roblox window and stops any join, from any app.
 
 ## Importing from Roblox Account Manager
 

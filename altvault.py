@@ -21,6 +21,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -30,6 +31,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
+import winreg
 import zlib
 from tkinter import filedialog, font as tkfont, ttk
 
@@ -40,6 +42,8 @@ APP_DIR = os.path.join(os.environ["LOCALAPPDATA"], "AltVault")
 DATA_FILE = os.path.join(APP_DIR, "accounts.dat")
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
 PRIVATE_FILE = os.path.join(APP_DIR, "private-link.dat")
+WEBHOOK_FILE = os.path.join(APP_DIR, "webhook.dat")
+FLAGS_BACKUP = os.path.join(APP_DIR, "client-flags-backup.json")
 AVATAR_DIR = os.path.join(APP_DIR, "avatars")
 ICON_DIR = os.path.join(APP_DIR, "game-icons")
 LOG_FILE = os.path.join(APP_DIR, "altvault.log")
@@ -77,6 +81,12 @@ AFK_SETTLE_SLOW = 1.2            # ...by waiting this long after focusing a wind
 LOST_AFTER = 300                 # seconds a window may sit out of its game before it counts as disconnected
 HIDDEN_PRESENCE_EVERY = 6        # while hidden in the tray, check presence every 6th time (3 min) if windows are open
 MEMORY_ALERT = 0.92              # memory this full for 3 readings in a row, with several Roblox windows: warn
+LAUNCH_MEMORY = 0.90             # memory this full: wait before starting the next Roblox client...
+LAUNCH_MEMORY_WAIT = 60          # ...for up to this many seconds, then launch anyway
+LAUNCH_DELAYS = (0, 5, 10, 20, 30)   # seconds between launches the user can choose
+ROBLOX_LOG_DAYS = 3              # Roblox's own log files older than this are deleted once a day
+WEBHOOK_PER_HOUR = 20            # Discord alerts sent at most this often, so a bad night can't spam
+PANIC_HOTKEY = "Ctrl+Alt+End"    # closes every Roblox window, from anywhere
 AFK_DEFAULT_KEY = "f13"          # a key no game uses: a jump can bump a character away from what it's doing
 AFK_KEYS = {"space": 0x20, "f13": 0x7C, **{c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"}}
 
@@ -330,6 +340,43 @@ def kill_process(pid):
     handle = _kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
     if handle:
         _kernel32.TerminateProcess(handle, 0)
+        _kernel32.CloseHandle(handle)
+
+
+PROCESS_SET_INFORMATION = 0x0200
+NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS = 0x0020, 0x4000
+PROCESS_MEMORY_PRIORITY, PROCESS_POWER_THROTTLING = 0, 4      # PROCESS_INFORMATION_CLASS values
+MEMORY_PRIORITY_LOW, MEMORY_PRIORITY_NORMAL = 2, 5
+POWER_THROTTLING_EXECUTION_SPEED = 0x1
+
+
+class POWER_THROTTLING(ctypes.Structure):
+    _fields_ = [("Version", wt.ULONG), ("ControlMask", wt.ULONG), ("StateMask", wt.ULONG)]
+
+
+_kernel32.SetPriorityClass.argtypes = [wt.HANDLE, wt.DWORD]
+_kernel32.SetProcessInformation.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.DWORD]
+
+
+def set_process_saving(pid, eco=False, memory_low=False):
+    """Asks Windows to run a Roblox client gently, or normally again. eco: Windows' efficiency mode
+    (EcoQoS: a lower clock, its efficient cores) and below-normal CPU priority, the switches behind
+    Task Manager's Efficiency mode. memory_low: when memory runs short, Windows pages this client
+    out before your other programs. Roblox itself isn't touched. False if Windows refused."""
+    handle = _kernel32.OpenProcess(PROCESS_SET_INFORMATION, False, pid)
+    if not handle:
+        return False
+    try:
+        speed = POWER_THROTTLING_EXECUTION_SPEED if eco else 0   # both 0: Windows decides, as normal
+        throttle = POWER_THROTTLING(1, speed, speed)
+        memory = wt.ULONG(MEMORY_PRIORITY_LOW if memory_low else MEMORY_PRIORITY_NORMAL)
+        return all((
+            _kernel32.SetPriorityClass(handle, BELOW_NORMAL_PRIORITY_CLASS if eco else NORMAL_PRIORITY_CLASS),
+            _kernel32.SetProcessInformation(handle, PROCESS_POWER_THROTTLING, ctypes.byref(throttle),
+                                            ctypes.sizeof(throttle)),
+            _kernel32.SetProcessInformation(handle, PROCESS_MEMORY_PRIORITY, ctypes.byref(memory),
+                                            ctypes.sizeof(memory))))
+    finally:
         _kernel32.CloseHandle(handle)
 
 
@@ -619,6 +666,16 @@ def set_on_taskbar(hwnd, shown):
         _user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ctypes.c_long(new & 0xFFFFFFFF).value)
         _user32.ShowWindowAsync(hwnd, SW_SHOWNA)
     return True
+
+
+SW_SHOWNOACTIVATE, SW_SHOWMINNOACTIVE = 4, 7
+
+
+def minimize_windows(hwnds, minimized):
+    """Minimises the windows (a minimised Roblox draws nothing, so it uses far less CPU and GPU) or
+    restores them, without taking focus. Async, so a frozen Roblox can't freeze AltVault."""
+    for hwnd in hwnds:
+        _user32.ShowWindowAsync(hwnd, SW_SHOWMINNOACTIVE if minimized else SW_SHOWNOACTIVATE)
 
 
 # ---------------------------------------------------------------- live view
@@ -1068,6 +1125,9 @@ _user32.DestroyWindow.argtypes = [wt.HWND]
 _user32.RegisterWindowMessageW.argtypes = [wt.LPCWSTR]
 _user32.AllowSetForegroundWindow.argtypes = [wt.DWORD]
 _user32.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT]
+_user32.PostThreadMessageW.argtypes = [wt.DWORD, wt.UINT, wt.WPARAM, wt.LPARAM]
+_user32.RegisterHotKey.argtypes = [wt.HWND, ctypes.c_int, wt.UINT, wt.UINT]
+_user32.UnregisterHotKey.argtypes = [wt.HWND, ctypes.c_int]
 _user32.TranslateMessage.argtypes = [ctypes.POINTER(wt.MSG)]
 _user32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
 _kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
@@ -1181,6 +1241,41 @@ class TrayIcon:
             _user32.SendMessageTimeoutW(hwnd, WM_CLOSE, 0, 0, SMTO_ABORTIFHUNG, 2000, ctypes.byref(result))
 
 
+MOD_ALT, MOD_CONTROL, MOD_NOREPEAT = 0x0001, 0x0002, 0x4000
+VK_END = 0x23
+WM_HOTKEY, WM_QUIT = 0x0312, 0x0012
+
+
+class Hotkey:
+    """A key combination that works from any app. Its thread sleeps inside GetMessage until the
+    keys are pressed, so it uses no CPU while waiting. `callback` runs on that thread."""
+
+    def __init__(self, mods, vk, callback):
+        self.thread_id, self.registered = None, False
+        ready = threading.Event()
+        self.thread = threading.Thread(target=self._run, args=(mods, vk, callback, ready), daemon=True)
+        self.thread.start()
+        ready.wait(2)
+
+    def _run(self, mods, vk, callback, ready):
+        self.thread_id = _kernel32.GetCurrentThreadId()
+        self.registered = bool(_user32.RegisterHotKey(None, 1, mods | MOD_NOREPEAT, vk))
+        ready.set()
+        if not self.registered:   # another program already uses these keys
+            return
+        msg = wt.MSG()
+        try:
+            while _user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                if msg.message == WM_HOTKEY:
+                    callback()
+        finally:
+            _user32.UnregisterHotKey(None, 1)
+
+    def stop(self):
+        if self.registered and self.thread_id:
+            _user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
+
+
 DWMWA_WINDOW_CORNER_PREFERENCE, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR = 33, 34, 35, 36
 DWMWCP_ROUND = 2
 
@@ -1235,6 +1330,32 @@ CLIENT_SETTINGS = {"FramerateCap": b"int", "SavedQualityLevel": b"token",
                    "GraphicsQualityLevel": b"int", "MasterVolume": b"float"}
 LOW_GRAPHICS = {"SavedQualityLevel": "1", "GraphicsQualityLevel": "1"}   # Roblox's lowest level
 MUTED = {"MasterVolume": "0"}
+
+# Modes: one switch for how hard every account except your main one saves power and memory. The
+# main account keeps your own Roblox settings and normal priority, so the one you play stays smooth.
+# An account's own FPS cap, if it has one, wins over the mode's.
+MODES = {"normal": {},
+         "grind": {"fps": 15, "low_graphics": True, "muted": True, "eco": True},
+         "max": {"fps": 10, "low_graphics": True, "muted": True, "eco": True, "memory_low": True}}
+MODE_NAMES = (("normal", "Normal"), ("grind", "Grind"), ("max", "Max alts"))
+MODE_HELP = {"normal": "Every account starts with your own Roblox settings and its per-account ones.",
+             "grind": "Alts run at 15 FPS, lowest graphics and muted, in Windows' efficiency mode.",
+             "max": "Like Grind at 10 FPS, and Windows moves alts out of memory first when it runs short."}
+
+
+def mode_of(settings):
+    mode = settings.get("mode")
+    return mode if isinstance(mode, str) and mode in MODES else "normal"
+
+
+def main_account(settings):
+    main = settings.get("main_account")
+    return main if isinstance(main, int) and not isinstance(main, bool) else None
+
+
+def mode_rules(settings, account_id):
+    """What the current mode asks of this account: nothing for your main account."""
+    return {} if account_id == main_account(settings) else MODES[mode_of(settings)]
 
 
 def _setting_tag(name):
@@ -1295,6 +1416,141 @@ def read_fps_cap(path):
 
 def write_fps_cap(path, value):
     write_client_settings(path, {"FramerateCap": int(value)})
+
+
+# Roblox lets players set a short list of rendering flags (its Fast Flag allowlist) in
+# ClientAppSettings.json beside the player. Alts on lowest graphics also get these, written just
+# before they start and taken out again once the client has read them, like the settings above.
+# The file as it was is saved first, so even a crash mid-launch can't leave alt flags behind.
+LOW_FLAGS = {"DFFlagTextureQualityOverrideEnabled": "True", "DFIntTextureQualityOverride": "0",
+             "FIntDebugForceMSAASamples": "0", "FFlagDebugSkyGray": "True",
+             "FIntFRMMaxGrassDistance": "0", "FIntFRMMinGrassDistance": "0",
+             "DFIntDebugFRMQualityLevelOverride": "1"}
+FLAGS_NAME = "ClientAppSettings.json"
+
+
+def wants_low_flags(settings, account_id):
+    """True if this account starts on lowest graphics (its own setting or the mode's) and the
+    lighter rendering option is on."""
+    if settings.get("lighter_rendering", True) is False:
+        return False
+    low = settings.get("low_graphics")
+    return (isinstance(low, list) and account_id in low) or bool(mode_rules(settings, account_id).get("low_graphics"))
+
+
+def roblox_player_folder():
+    """The folder of the Roblox player that roblox-player: links start, or None when they go through
+    a bootstrapper (Bloxstrap and others rewrite the flags file themselves on every launch)."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"roblox-player\shell\open\command") as key:
+            command = winreg.QueryValue(key, None)
+    except OSError:
+        return None
+    m = re.match(r'\s*"([^"]+)"|\s*(\S+)', command or "")
+    exe = m and (m.group(1) or m.group(2))
+    if not exe or os.path.basename(exe).lower() != ROBLOX_EXE or not os.path.isfile(exe):
+        return None
+    return os.path.dirname(exe)
+
+
+def write_flags(folder, flags):
+    """Adds `flags` to the player's ClientAppSettings.json. Raises ValueError, leaving the file
+    alone, if it holds something other than a flags object."""
+    path = os.path.join(folder, "ClientSettings", FLAGS_NAME)
+    try:
+        with open(path, "rb") as f:
+            old = f.read()
+    except FileNotFoundError:
+        old = None
+    current = {}
+    if old and old.strip():
+        current = json.loads(old.decode("utf-8-sig"))
+        if not isinstance(current, dict):
+            raise ValueError("ClientAppSettings.json isn't a flags file")
+    os.makedirs(APP_DIR, exist_ok=True)
+    with open(FLAGS_BACKUP, "w", encoding="utf-8") as f:
+        json.dump({"path": path, "old": None if old is None else base64.b64encode(old).decode()}, f)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".altvault.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({**current, **flags}, f, indent=1)
+    os.replace(tmp, path)
+
+
+def restore_flags():
+    """Puts the flags file back exactly as write_flags found it. Does nothing if nothing is pending."""
+    try:
+        with open(FLAGS_BACKUP, encoding="utf-8") as f:
+            saved = json.load(f)
+        path, old = saved["path"], saved["old"]
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError, KeyError, TypeError):
+        os.remove(FLAGS_BACKUP)
+        return
+    if os.path.basename(str(path)) == FLAGS_NAME:   # never touch any other file
+        if old is None:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        else:
+            tmp = path + ".altvault.tmp"
+            with open(tmp, "wb") as f:
+                f.write(base64.b64decode(old))
+            os.replace(tmp, path)
+    os.remove(FLAGS_BACKUP)
+
+
+def restore_flags_safely():
+    try:
+        restore_flags()
+    except OSError as e:
+        log.warning("Couldn't put Roblox's flags file back: %s", type(e).__name__)
+
+
+def clean_roblox_logs(days=ROBLOX_LOG_DAYS, now=None):
+    """Deletes Roblox's own log files older than `days`; one a client still has open is skipped.
+    Returns (files, bytes) removed."""
+    folder = os.path.join(os.environ["LOCALAPPDATA"], "Roblox", "logs")
+    cutoff = (now or time.time()) - days * 86400
+    files = size = 0
+    try:
+        entries = list(os.scandir(folder))
+    except OSError:
+        return 0, 0
+    for entry in entries:
+        if not entry.name.lower().endswith(".log"):
+            continue
+        try:
+            st = entry.stat()
+            if entry.is_file() and st.st_mtime < cutoff:
+                os.remove(entry.path)
+                files, size = files + 1, size + st.st_size
+        except OSError:
+            continue
+    return files, size
+
+
+RELEASES_API = "https://api.github.com/repos/HECTICWINS/AltVault/releases/latest"
+
+
+def version_tuple(text):
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", str(text or "").strip())
+    return tuple(int(n) for n in m.groups()) if m else None
+
+
+def latest_release():
+    """(version tuple, release page) of the newest published AltVault, or None. Asks GitHub only;
+    nothing about you or your accounts is sent, and nothing is downloaded."""
+    status, _, body = _request(RELEASES_API, headers={"Accept": "application/vnd.github+json"})
+    if status != 200:
+        return None
+    data = json.loads(body)
+    version, page = version_tuple(data.get("tag_name")), str(data.get("html_url", ""))
+    if not version or not page.startswith(GITHUB_URL + "/releases/"):
+        return None
+    return version, page
 
 
 # ---------------------------------------------------------------- import from Roblox Account Manager
@@ -1412,11 +1668,59 @@ def save_private_link(link):
     restrict_to_owner(PRIVATE_FILE)
 
 
+# ---------------------------------------------------------------- Discord alerts
+# A webhook link lets anyone who has it post in that channel, so like a private server link it's
+# only stored encrypted to this Windows user, and never logged.
+WEBHOOK_RE = re.compile(r"https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d{5,25}/[\w-]{20,100}")
+
+
+def load_webhook():
+    try:
+        with open(WEBHOOK_FILE, "rb") as f:
+            url = unprotect(f.read()).decode("utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        log.warning("Couldn't read the saved Discord webhook (%s)", type(e).__name__)
+        return None
+    return url if WEBHOOK_RE.fullmatch(url) else None
+
+
+def save_webhook(url):
+    """Saves a Discord webhook link, or deletes the saved one when url is None."""
+    if url is None:
+        try:
+            os.remove(WEBHOOK_FILE)
+        except FileNotFoundError:
+            pass
+        return
+    if not WEBHOOK_RE.fullmatch(url):
+        raise ValueError("not a Discord webhook link")
+    os.makedirs(APP_DIR, exist_ok=True)
+    tmp = WEBHOOK_FILE + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(protect(url.encode("utf-8")))
+    os.replace(tmp, WEBHOOK_FILE)
+    restrict_to_owner(WEBHOOK_FILE)
+
+
+def send_webhook(url, title, text):
+    """Posts one alert to a Discord webhook. No login is ever sent, and @mentions are disabled so a
+    username can't ping anyone. Returns True if Discord accepted it."""
+    if not WEBHOOK_RE.fullmatch(url):
+        return False
+    body = json.dumps({"username": "AltVault", "content": f"**{title}**\n{text}"[:1900],
+                       "allowed_mentions": {"parse": []}}).encode()
+    status, _, _ = _request(url, method="POST", headers={"Content-Type": "application/json"}, data=body)
+    return status in (200, 204)
+
+
 # What a settings backup may hold, and each value's type. Logins and private server links are not here.
 BACKUP_KEYS = {"multi": bool, "same_server": bool, "auto_tile": bool, "anti_afk": bool, "stream_mode": bool,
                "hide_taskbar": bool, "sidebar_wide": bool, "afk_key": str, "accent": str, "favorites": list,
                "recents": list, "profiles": list, "fps_caps": dict, "low_graphics": list, "muted": list,
-               "afk_skip": list}
+               "afk_skip": list, "mode": str, "main_account": int, "launch_delay": int, "launch_memory_wait": bool,
+               "lighter_rendering": bool, "clean_logs": bool, "update_check": bool, "panic_hotkey": bool}
 
 
 def settings_backup(settings):
@@ -1744,117 +2048,6 @@ def open_export(data, password):
         raise RobloxError("That export file has no accounts in it.")
     return payload
 
-# --- access key (begin) ---
-# ---------------------------------------------------------------- access key
-# This build only starts with a key. A key is a digital signature, made with the maker's private
-# key (which is never in this program or its repository), over this PC's code, so it works on one
-# PC and nowhere else, and it can't be changed or invented without the private key. Only the
-# matching public key is here, and it can check a key but not make one. The check happens offline.
-# Keys are made with tools/license_tool.py.
-LICENSE_REQUIRED = True
-LICENSE_PUBLIC_KEY = "4543533120000000c92aba53f172a26fdd6dd7ce55b42d6b76aef5d87a014fa82738a2ceb837442a266171f83048f983868040e5df78d951d685017ea9779356b186c76f30ff9217"   # hex of an ECDSA P-256 public key blob
-LICENSE_FILE = os.path.join(APP_DIR, "license.key")   # in the data folder, so updates keep it
-KEY_PREFIX = "AVK"
-LICENSE_CONTACT = "hecticxww on Discord"   # where to ask for a key (a name, Discord tag or link), shown in the activation window
-
-_bcrypt.BCryptImportKeyPair.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wt.LPCWSTR, ctypes.POINTER(ctypes.c_void_p),
-                                        ctypes.c_char_p, wt.ULONG, wt.ULONG]
-_bcrypt.BCryptImportKeyPair.restype = ctypes.c_long
-_bcrypt.BCryptVerifySignature.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, wt.ULONG,
-                                          ctypes.c_char_p, wt.ULONG, wt.ULONG]
-_bcrypt.BCryptVerifySignature.restype = ctypes.c_long
-
-
-def b32(data):
-    return base64.b32encode(data).decode().rstrip("=")
-
-
-def unb32(text):
-    text = re.sub(r"[^A-Za-z2-7]", "", text).upper()
-    return base64.b32decode(text + "=" * (-len(text) % 8))
-
-
-def group(text, size):
-    return "-".join(text[i:i + size] for i in range(0, len(text), size))
-
-
-def pc_raw():
-    """10 bytes that identify this Windows install: a hash of its machine GUID. They stay the same
-    across AltVault updates and change only if Windows is reinstalled."""
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography", 0,
-                            winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as k:
-            guid = str(winreg.QueryValueEx(k, "MachineGuid")[0])
-    except OSError:
-        guid = f"unknown-{uuid.getnode()}"
-    return hashlib.sha256(b"AltVault pc|" + guid.encode()).digest()[:10]
-
-
-def pc_code():
-    """The code shown to the user, like ABCD-EFGH-JKLM-NPQR, to send to whoever makes their key."""
-    return group(b32(pc_raw()), 4)
-
-
-def license_message(pc, expires):
-    """What a key signs: this PC's bytes and an expiry date as YYYYMMDD (0 = never expires)."""
-    return b"AltVault licence v1|" + pc + b"|" + struct.pack(">I", expires)
-
-
-def _ecdsa_valid(public_blob, digest, signature):
-    alg, key = ctypes.c_void_p(), ctypes.c_void_p()
-    if _bcrypt.BCryptOpenAlgorithmProvider(ctypes.byref(alg), "ECDSA_P256", None, 0):
-        return False
-    try:
-        if _bcrypt.BCryptImportKeyPair(alg, None, "ECCPUBLICBLOB", ctypes.byref(key), public_blob,
-                                       len(public_blob), 0):
-            return False
-        try:
-            return _bcrypt.BCryptVerifySignature(key, None, digest, len(digest), signature, len(signature), 0) == 0
-        finally:
-            _bcrypt.BCryptDestroyKey(key)
-    finally:
-        _bcrypt.BCryptCloseAlgorithmProvider(alg, 0)
-
-
-def check_key(text, pc=None, public_key=None, today=None):
-    """('ok'|'invalid'|'expired', plain explanation) for a key typed or pasted by the user."""
-    compact = re.sub(r"[^A-Za-z2-7]", "", text or "").upper()
-    if not compact.startswith(KEY_PREFIX):
-        return "invalid", "That doesn't look like an AltVault key."
-    try:
-        payload = unb32(compact[len(KEY_PREFIX):])
-        public_blob = bytes.fromhex(public_key or LICENSE_PUBLIC_KEY)
-    except ValueError:
-        return "invalid", "That key is incomplete. Paste the whole key."
-    if len(payload) != 4 + 64:
-        return "invalid", "That key is incomplete. Paste the whole key."
-    expires, signature = struct.unpack(">I", payload[:4])[0], payload[4:]
-    digest = hashlib.sha256(license_message(pc or pc_raw(), expires)).digest()
-    if not _ecdsa_valid(public_blob, digest, signature):
-        return "invalid", "This key isn't valid for this PC. Keys only work on the PC they were made for."
-    if expires and expires < int(today or time.strftime("%Y%m%d")):
-        return "expired", "This key has expired. Ask for a new one."
-    return "ok", "Key accepted."
-
-
-def license_state():
-    """('ok'|'none'|'invalid'|'expired', explanation) for the key saved on this PC, if any."""
-    if not LICENSE_REQUIRED:
-        return "ok", "No key needed."
-    try:
-        with open(LICENSE_FILE, encoding="utf-8") as f:
-            return check_key(f.read(4096))
-    except OSError:
-        return "none", "No key is saved on this PC yet."
-
-
-def save_key(text):
-    os.makedirs(APP_DIR, exist_ok=True)
-    with open(LICENSE_FILE, "w", encoding="utf-8") as f:
-        f.write(text.strip() + "\n")
-
-# --- access key (end) ---
 
 # ---------------------------------------------------------------- Roblox web API
 
@@ -1990,6 +2183,20 @@ def get_servers(place_id, cursor="", fewest_first=True):
     except (ValueError, KeyError, TypeError, AttributeError):
         raise RobloxError("Roblox sent an unexpected server list.") from None
     return servers, page.get("nextPageCursor") or ""
+
+
+def server_with_room(place_id, needed, pages=3):
+    """The emptiest public server with room for `needed` more players, or None. Sending every
+    account straight there is quicker than waiting for the first one to reach a server."""
+    cursor = ""
+    for _ in range(pages):
+        servers, cursor = get_servers(place_id, cursor)
+        for s in servers:   # emptiest first
+            if s["maxPlayers"] - s["playing"] >= needed:
+                return s["id"]
+        if not cursor:
+            break
+    return None
 
 
 def find_user(username):
@@ -3011,8 +3218,8 @@ def check_and_add(app, entries, report, favorites=None):
 class SettingsPage(ttk.Frame):
     """Options you set once, grouped into tabs. Everyday controls (Join, Anti-AFK) stay elsewhere."""
 
-    TABS = (("general", "General"), ("afk", "Anti-AFK"), ("privacy", "Privacy"),
-            ("look", "Appearance"), ("data", "Data"))
+    TABS = (("general", "General"), ("modes", "Modes"), ("afk", "Anti-AFK"), ("alerts", "Alerts"),
+            ("privacy", "Privacy"), ("look", "Appearance"), ("data", "Data"))
 
     def __init__(self, app, parent):
         super().__init__(parent)
@@ -3043,20 +3250,82 @@ class SettingsPage(ttk.Frame):
             row.pack(anchor="w", pady=(8, 0))
             for i, (text, command) in enumerate(items):
                 ttk.Button(row, text=text, command=command).pack(side="left", padx=(6 if i else 0, 0))
+            return row
+
+        def setting(frm, key, default, title, text, after=None):
+            """A tick box saved straight into settings.json under `key`."""
+            var = tk.BooleanVar(value=app.settings.get(key, default) is not False)
+
+            def changed():
+                app.settings[key] = var.get()
+                save_settings(app.settings)
+                if after:
+                    after(var.get())
+            option(frm, var, title, text, changed)
+            return var
 
         tab = self.tabs["general"]
         section(tab, "Joining", first=True)
         option(tab, app.multi_var, "Multi-Roblox", "Run several Roblox windows at once. Turn off only if you "
                "want each launch to replace the previous window.", app.toggle_multi)
         option(tab, app.same_server_var, "Put accounts in the same server",
-               "When joining several accounts with no server chosen, they all follow the first one.",
-               app.save_settings)
+               "When joining several accounts with no server chosen, AltVault picks a server with room for all of "
+               "them. If there's none, the others follow the first account.", app.save_settings)
         option(tab, app.auto_tile_var, "Arrange windows after joining",
                "Splits the screen evenly between every Roblox window, like the Tile button.", app.save_settings)
-        section(tab, "Private servers")
-        detail(tab, "The last private server link you used is kept, encrypted to your Windows user, and comes "
-               "back in the Game box when you reopen AltVault.", indent=0)
-        buttons(tab, ("Forget private link", app.forget_private_link))
+        row = ttk.Frame(tab)
+        row.pack(anchor="w", pady=(10, 2))
+        ttk.Label(row, text="Wait between launches").pack(side="left")
+        self.delay_var = tk.StringVar(value=self.delay_label(app.settings.get("launch_delay", 0)))
+        delay = ttk.Combobox(row, textvariable=self.delay_var, state="readonly", width=10,
+                             values=[self.delay_label(d) for d in LAUNCH_DELAYS])
+        delay.pack(side="left", padx=(8, 0))
+        delay.bind("<<ComboboxSelected>>", lambda _e: self.set_delay())
+        detail(tab, "A gap gives each client time to load before the next one starts. While a join runs, the "
+               "Join button stops it.", indent=0)
+        setting(tab, "launch_memory_wait", True, "Wait for free memory before each launch",
+                f"If memory is over {LAUNCH_MEMORY:.0%} full, the next client waits up to a minute for it to free up, "
+                "so the ones already running don't stall.")
+
+        tab = self.tabs["modes"]
+        section(tab, "Mode", first=True)
+        mode = Segmented(tab, MODE_NAMES, mode_of(app.settings), app.set_mode, s)
+        mode.pack(anchor="w", pady=(8, 0))
+        app.mode_controls.append(mode)
+        for key, label in MODE_NAMES:
+            detail(tab, f"{label}: {MODE_HELP[key]}", indent=0)
+        detail(tab, "FPS, graphics and sound apply from each window's next join, because Roblox reads them when it "
+               "starts. Efficiency mode and memory priority apply to open windows straight away. An account's own "
+               "FPS cap wins over the mode's.", indent=0)
+        section(tab, "Main account")
+        self.main_var = tk.StringVar()
+        self.main_box = ttk.Combobox(tab, textvariable=self.main_var, state="readonly", width=28)
+        self.main_box.pack(anchor="w", pady=(8, 2))
+        self.main_box.bind("<<ComboboxSelected>>", lambda _e: self.set_main())
+        detail(tab, "The account you play on. It keeps your own Roblox settings and normal priority in every mode. "
+               "Right-click an account, Performance, Main account does the same.", indent=0)
+        section(tab, "Lighter rendering")
+        setting(tab, "lighter_rendering", True, "Lower textures and effects on lowest graphics",
+                "Accounts on lowest graphics also start with the lowest texture quality, no anti-aliasing, a plain "
+                "sky and no grass, using the rendering flags Roblox allows players to set. That saves memory and "
+                "GPU. Skipped when Roblox starts through a bootstrapper such as Bloxstrap.")
+
+        tab = self.tabs["alerts"]
+        section(tab, "Discord alerts", first=True)
+        detail(tab, "Get disconnects, expired logins, crashes and low memory on your phone. In a Discord server "
+               "you own: Server Settings, Integrations, Webhooks, New Webhook, Copy Webhook URL, then paste it "
+               "here. The link is stored encrypted to your Windows user.", indent=0)
+        self.hook_var = tk.StringVar()
+        hook = ttk.Entry(tab, textvariable=self.hook_var, show="•", width=60)
+        hook.pack(anchor="w", pady=(8, 0))
+        self.hook_row = buttons(tab, ("Save", self.save_hook), ("Send a test", self.test_hook), ("Remove", self.remove_hook))
+        self.hook_state = ttk.Label(tab, text="", style="Small.TLabel")
+        self.hook_state.pack(anchor="w", pady=(6, 0))
+        self.show_hook_state()
+        section(tab, "Panic hotkey")
+        setting(tab, "panic_hotkey", False, f"Close everything with {PANIC_HOTKEY}",
+                "Closes every Roblox window and stops any join, from any app, without asking first.",
+                after=app.set_panic_hotkey)
 
         tab = self.tabs["afk"]
         section(tab, "How it works", first=True)
@@ -3081,6 +3350,10 @@ class SettingsPage(ttk.Frame):
                "in AltVault, and usernames in Roblox window titles, so you can share your screen.", app.toggle_stream)
         option(tab, app.hide_taskbar_var, "Hide Roblox from the taskbar", "Keeps the taskbar and Alt+Tab "
                "clear. Open a window from the Live page instead.", app.toggle_taskbar)
+        section(tab, "Private servers")
+        detail(tab, "The last private server link you used is kept, encrypted to your Windows user, and comes "
+               "back in the Game box when you reopen AltVault.", indent=0)
+        buttons(tab, ("Forget private link", app.forget_private_link))
 
         tab = self.tabs["look"]
         section(tab, "Accent colour", first=True)
@@ -3103,14 +3376,71 @@ class SettingsPage(ttk.Frame):
         detail(tab, "Back up your options, games, profiles and per-account settings. Logins and private server "
                "links are never included.", indent=0)
         buttons(tab, ("Back up settings...", app.export_settings), ("Restore settings...", app.import_settings))
+        section(tab, "Upkeep")
+        setting(tab, "clean_logs", True, "Delete old Roblox logs",
+                f"Once a day, Roblox's own log files older than {ROBLOX_LOG_DAYS} days are deleted. They pile up over time.")
+        setting(tab, "update_check", True, "Check for updates",
+                "Once a day, asks GitHub whether a newer AltVault is out. Nothing is downloaded by itself.")
         section(tab, "About")
         ttk.Label(tab, text=f"AltVault {APP_VERSION}  ·  Made by HecticWins").pack(anchor="w", pady=(6, 0))
         buttons(tab, ("Open on GitHub", lambda: webbrowser.open(GITHUB_URL)),
                 ("Open log folder", lambda: os.startfile(APP_DIR)), ("Keyboard shortcuts", app.show_shortcuts))
+        buttons(tab, ("Check for updates", lambda: app.check_updates(tell=True)),
+                ("Download page", lambda: webbrowser.open((app.update_available or (None, GITHUB_URL + "/releases"))[1])),
+                ("Copy diagnostics", app.copy_diagnostics))
 
     def show_tab(self, key):
         for name, frame in self.tabs.items():
             frame.pack_forget() if name != key else frame.pack(fill="both", expand=True)
+        if key == "modes":
+            self.fill_main_box()
+
+    def on_show(self):
+        self.fill_main_box()
+
+    def fill_main_box(self):
+        app = self.app
+        self.main_choices = [None] + list(app.accounts)
+        set_text(self.main_box, values=["None"] + [app.who(a) for a in app.accounts])
+        main = app.account(main_account(app.settings))
+        self.main_var.set(app.who(main) if main else "None")
+
+    def set_main(self):
+        i = self.main_box.current()
+        if 0 <= i < len(self.main_choices):
+            self.app.set_main(self.main_choices[i])
+
+    @staticmethod
+    def delay_label(seconds):
+        return "No wait" if not seconds else f"{seconds} seconds"
+
+    def set_delay(self):
+        seconds = next((d for d in LAUNCH_DELAYS if self.delay_label(d) == self.delay_var.get()), 0)
+        self.app.settings["launch_delay"] = seconds
+        save_settings(self.app.settings)
+
+    def show_hook_state(self, text=None):
+        set_text(self.hook_state, text or ("A webhook is saved. Alerts go to Discord." if self.app.webhook
+                                           else "No webhook saved."))
+
+    def save_hook(self):
+        error = self.app.set_webhook(self.hook_var.get())
+        if error:
+            return self.show_hook_state(error)
+        self.hook_var.set("")
+        self.show_hook_state("Saved. Send a test to check it.")
+
+    def remove_hook(self):
+        self.app.set_webhook(None)
+        self.hook_var.set("")
+        self.show_hook_state()
+
+    def test_hook(self):
+        if not self.app.webhook:
+            return self.show_hook_state("Save a webhook first.")
+        self.show_hook_state("Sending...")
+        self.app.test_webhook(lambda ok: self.show_hook_state(
+            "Sent. Check your Discord channel." if ok else "Discord didn't accept it. Check the link, or make a new webhook."))
 
     def set_key(self):
         self.app.settings["afk_key"] = self.key_var.get()
@@ -4433,6 +4763,11 @@ class HomePage(ttk.Frame):
         self.title_label = header.winfo_children()[0].winfo_children()[0]
         ttk.Button(header, text="Join accounts", style="Accent.TButton",
                    command=lambda: app.show_page("accounts")).pack(side="right", anchor="s")
+        mode = Segmented(header, MODE_NAMES, mode_of(app.settings), app.set_mode, s)
+        mode.pack(side="right", anchor="s", padx=(0, int(10 * s)))
+        for key, label in mode.labels.items():
+            tip(label, MODE_HELP[key])
+        app.mode_controls.append(mode)
         cards = ttk.Frame(self)
         cards.pack(fill="x", pady=(int(14 * s), 0))
         self.cards = {}
@@ -4520,9 +4855,13 @@ class HomePage(ttk.Frame):
         used = memory_used_fraction()
         if windows >= 2 and used >= AFK_PRESSURE:
             items.append((C["red"] if used >= MEMORY_ALERT else C["yellow"],
-                          f"Memory is {used:.0%} full. Clients slow down; close some windows or apps.", "pulse"))
+                          f"Memory is {used:.0%} full. Clients slow down; " + (
+                              "close some windows or apps." if mode_of(app.settings) == "max"
+                              else "try Max alts mode, or close some windows."), "pulse"))
         if windows and not app.anti_afk_var.get():
             items.append((C["yellow"], "Anti-AFK is off while Roblox is open.", None))
+        if app.update_available:
+            items.append((C["accent"], f"AltVault {app.update_available[0]} is out. Click to open the download page.", "update"))
         return items or [(C["green"], "Everything looks good.", None)]
 
     def steps(self):
@@ -4539,7 +4878,9 @@ class HomePage(ttk.Frame):
                 (joined, "Select accounts and click Join", "accounts")]
 
     def open_row(self, row):
-        if row.target:
+        if row.target == "update" and self.app.update_available:
+            webbrowser.open(self.app.update_available[1])
+        elif row.target and row.target != "update":
             self.app.show_page(row.target)
 
     def refresh(self):
@@ -5136,82 +5477,6 @@ def add_row_hover(tree):
     tree.bind("<<TreeviewSelect>>", lambda _e: clear(), add="+")
 
 
-# --- access key (begin) ---
-class ActivationWindow(tk.Toplevel):
-    """Shown at start when this PC has no valid key: the PC code to send to the key's maker, and a box
-    for the key. .activated is True once a good key has been saved; closing the window ends AltVault."""
-
-    def __init__(self, root, reason=""):
-        super().__init__(root, bg=C["bg"])
-        self.activated = False
-        scale = root.winfo_fpixels("1i") / 96
-        self.title(f"Activate {APP_TITLE}")
-        self.resizable(False, False)
-        frm = ttk.Frame(self, padding=(int(26 * scale), int(22 * scale)))
-        frm.pack(fill="both", expand=True)
-        wrap = int(440 * scale)
-        ttk.Label(frm, text=f"Activate {APP_TITLE}", style="Title.TLabel").pack(anchor="w")
-        ask = f"Message {LICENSE_CONTACT}" if LICENSE_CONTACT else "Message the person who made AltVault"
-        ttk.Label(frm, text=f"This copy needs a key, and a key works on one PC only. {ask} with the PC code "
-                  "below to ask for one. If they approve, they'll send you a key to paste here.",
-                  wraplength=wrap, justify="left").pack(anchor="w", pady=(8, 0))
-        ttk.Label(frm, text="Your PC code", style="Muted.TLabel").pack(anchor="w", pady=(16, 3))
-        row = ttk.Frame(frm)
-        row.pack(fill="x")
-        self.code_var = tk.StringVar(value=pc_code())
-        code = ttk.Entry(row, textvariable=self.code_var, state="readonly", font=("Consolas", 12), width=26)
-        code.pack(side="left", fill="x", expand=True)
-        self.copy_btn = ttk.Button(row, text="Copy", command=self.copy_code)
-        self.copy_btn.pack(side="left", padx=(6, 0))
-        self.request_btn = ttk.Button(row, text="Copy request message", command=self.copy_request)
-        self.request_btn.pack(side="left", padx=(6, 0))
-        ttk.Label(frm, text="Your key", style="Muted.TLabel").pack(anchor="w", pady=(14, 3))
-        self.key_var = tk.StringVar()
-        entry = ttk.Entry(frm, textvariable=self.key_var)
-        entry.pack(fill="x")
-        add_placeholder(entry, self.key_var, "Paste the whole key here")
-        entry.bind("<Return>", lambda _e: self.activate())
-        self.status = ttk.Label(frm, text=reason, style="Error.TLabel", wraplength=wrap, justify="left")
-        self.status.pack(anchor="w", pady=(10, 0))
-        btns = ttk.Frame(frm)
-        btns.pack(fill="x", pady=(14, 0))
-        ttk.Button(btns, text="Activate", style="Accent.TButton", command=self.activate).pack(side="right")
-        ttk.Button(btns, text="Quit", command=self.destroy).pack(side="right", padx=(0, 6))
-        self.bind("<Escape>", lambda _e: self.destroy())
-        self.update_idletasks()
-        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
-        self.geometry(f"+{(self.winfo_screenwidth() - w) // 2}+{(self.winfo_screenheight() - h) // 3}")
-        dark_title_bar(self)
-        self.grab_set()
-        entry.focus_set()
-        self.wait_window()
-
-    def copy_code(self):
-        self.clipboard_clear()
-        self.clipboard_append(self.code_var.get())
-        set_text(self.copy_btn, "Copied")
-        self.after(1500, lambda: self.winfo_exists() and set_text(self.copy_btn, "Copy"))
-
-    def copy_request(self):
-        self.clipboard_clear()
-        self.clipboard_append(f"Hi, could I have an {APP_TITLE} key? My PC code is {self.code_var.get()}")
-        set_text(self.request_btn, "Copied: paste it in a message")
-        self.after(2500, lambda: self.winfo_exists() and set_text(self.request_btn, "Copy request message"))
-
-    def activate(self):
-        state, why = check_key(self.key_var.get())
-        if state != "ok":
-            self.status.config(text=why)
-            return
-        try:
-            save_key(self.key_var.get())
-        except OSError as e:
-            self.status.config(text=f"Couldn't save the key: {e.strerror or e}")
-            return
-        self.activated = True
-        self.destroy()
-
-# --- access key (end) ---
 
 
 class App:
@@ -5227,6 +5492,15 @@ class App:
         self.presence = {}     # account id -> presence dict
         self.expired = set()   # account ids whose cookie stopped working
         self.running = {}      # Roblox pid -> account id
+        self.saving = {}       # Roblox pid -> (eco, memory_low) AltVault last set for it
+        self.saving_refused = set()   # pids Windows wouldn't let AltVault change
+        self.mode_controls = []       # the Mode switches on Home and in Settings, kept in step
+        self.join_cancel = threading.Event()   # set by the Join button's "stop" while a join runs
+        self.join_failed = []         # account ids the last join couldn't start
+        self.webhook = load_webhook()
+        self.webhook_sent = []        # times of recent Discord alerts, for WEBHOOK_PER_HOUR
+        self.hotkey = None
+        self.update_available = None  # (version text, release page) once a newer AltVault is out
         self.avatars = {}      # account id -> PhotoImage
         sizes = (48, 60, 75, 100, 110, 150)
         self.avatar_px = next((s for s in sizes if s >= 40 * self.scale), 150)
@@ -5288,6 +5562,9 @@ class App:
         self.tick_job = self.root.after(500, self.tick)
         self.root.after(1000, self.refresh_presence)
         self.root.after(3000, lambda: self.doctor_scan(quiet=True))
+        restore_flags_safely()   # if AltVault stopped mid-launch, an alt's flags may still be in place
+        self.root.after(60_000, self.daily_chores)
+        self.set_panic_hotkey(self.settings.get("panic_hotkey", False), quiet=True)
         # Nobody sees presence while AltVault is minimised, so it pauses then and catches up on restore.
         self.presence_stale = False
         root.bind("<Map>", self.on_restore)
@@ -5460,6 +5737,27 @@ class App:
             self.toast(title, text, warning=True)
         if self.tray:
             self.tray.notify(title, text, warning=True)
+        self.send_alert(title, text)
+
+    def send_alert(self, title, text):
+        """Also posts the alert to the user's Discord webhook, if they set one, at most
+        WEBHOOK_PER_HOUR times an hour."""
+        now = time.time()
+        self.webhook_sent = [t for t in self.webhook_sent if now - t < 3600]
+        if not self.webhook or len(self.webhook_sent) >= WEBHOOK_PER_HOUR:
+            return
+        self.webhook_sent.append(now)
+        threading.Thread(target=self.post_webhook, args=(self.webhook, title, text), daemon=True).start()
+
+    def post_webhook(self, url, title, text):
+        try:
+            if not send_webhook(url, title, text):
+                log.warning("Discord didn't accept the alert; the webhook may have been deleted")
+                return False
+            return True
+        except RobloxError:
+            log.warning("Couldn't reach Discord to send an alert")
+            return False
 
     def export_settings(self):
         path = filedialog.asksaveasfilename(parent=self.root, title="Back up settings", defaultextension=".json",
@@ -5546,6 +5844,11 @@ class App:
         self.close_btn.pack(side="right", padx=(0, 6))
         self.tile_btn = ttk.Button(btns, text="Tile", command=self.tile, state="disabled")
         self.tile_btn.pack(side="right", padx=(0, 6))
+        self.min_btn = ttk.Button(btns, text="Minimize all", command=self.minimize_all, state="disabled")
+        self.min_btn.pack(side="right", padx=(0, 6))
+        tip(self.min_btn, "A minimised Roblox draws nothing, so it uses far less CPU and GPU. "
+                          "Anti-AFK can't reach minimised windows. Ctrl+M")
+        self.root.bind("<Control-m>", lambda _e: self.minimize_all())
 
         table = ttk.Frame(outer)
         table.pack(fill="both", expand=True, pady=(12, 0))
@@ -5586,16 +5889,21 @@ class App:
         self.join_btn.config(text="Join" if n == 0 else f"Join {n} account{'s' if n != 1 else ''}",
                              state="normal" if n else "disabled")
 
-    def update_window_buttons(self, count):
+    def update_window_buttons(self, count, windows=()):
         """Tile and Close all only do something while Roblox windows are open."""
         state = "normal" if count else "disabled"
-        for btn in (self.tile_btn, self.close_btn):
+        for btn in (self.tile_btn, self.close_btn, self.min_btn):
             if str(btn.cget("state")) != state:
                 btn.config(state=state)
+        if windows:
+            set_text(self.min_btn, "Restore all" if all(_user32.IsIconic(h) for h, _, _ in windows) else "Minimize all")
 
     # ------------------------------------------------------------ helpers
     def ui(self, fn, *args):
-        self.root.after(0, lambda: fn(*args))
+        try:
+            self.root.after(0, lambda: fn(*args))
+        except (RuntimeError, tk.TclError):   # a background job finished after the window closed
+            pass
 
     def set_status(self, text):
         self.ui(lambda: self.status.config(text=text))
@@ -5659,10 +5967,11 @@ class App:
         running = acc["id"] in self.running.values()
         p = self.presence.get(acc["id"])
         kind = p.get("userPresenceType") if p else None
-        cap = self.fps_cap_of(acc)
-        extras = ([f"{cap} FPS"] if cap else []) + \
-            (["low graphics"] if acc["id"] in self.flagged("low_graphics") else []) + \
-            (["muted"] if acc["id"] in self.flagged("muted") else [])
+        rules = mode_rules(self.settings, acc["id"])
+        cap = self.fps_cap_of(acc) or rules.get("fps")
+        extras = (["main"] if acc["id"] == main_account(self.settings) else []) + ([f"{cap} FPS"] if cap else []) + \
+            (["low graphics"] if acc["id"] in self.flagged("low_graphics") or rules.get("low_graphics") else []) + \
+            (["muted"] if acc["id"] in self.flagged("muted") or rules.get("muted") else [])
         fps = "".join(f" · {e}" for e in extras)
         if kind == 2:
             where = clean_name(p.get("lastLocation")) or "a game"
@@ -6040,7 +6349,7 @@ class App:
         """Keeps track of which Roblox window belongs to which account and labels each window."""
         try:
             windows = roblox_windows()
-            self.update_window_buttons(len(windows))
+            self.update_window_buttons(len(windows), windows)
             alive = {pid for _, pid, _ in windows}
             by_title = {}   # a window is titled with the username, or 'Account n' in stream mode
             for i, a in enumerate(self.accounts, 1):
@@ -6055,6 +6364,7 @@ class App:
                 if acc and title != self.window_title(acc) and responsive(hwnd):
                     set_window_title(hwnd, self.window_title(acc))
             self.running = {pid: a for pid, a in self.running.items() if pid in alive}
+            self.apply_modes()
             gone = set(before) - alive
             unexpected = gone - self.expected_close
             closed = len(unexpected)
@@ -6100,7 +6410,8 @@ class App:
             self.doctor_note("memory", None)
             self.alert("Your PC is out of memory", f"Memory is {used:.0%} full with {len(linked)} Roblox windows. "
                        "Clients slow to a crawl and Anti-AFK can miss, so accounts get re-joined or kicked. "
-                       "Close some windows or apps.")
+                       + ("Close some windows or apps." if mode_of(self.settings) == "max"
+                          else "Try Max alts mode on Home, or close some windows."))
         self.history.sample(open=len(linked), ingame=ingame if linked else None,
                             pc_cpu=reading["pc_cpu"], pc_ram=reading["pc_ram"],
                             rbx_cpu=reading["rbx_cpu"] if windows else None,
@@ -6281,6 +6592,11 @@ class App:
 
     def performance_menu(self, parent, accounts):
         menu = themed_menu(parent)
+        if len(accounts) == 1:
+            main = accounts[0]["id"] == main_account(self.settings)
+            menu.add_command(label=("✓ " if main else "") + "Main account (keeps full quality in every mode)",
+                             command=lambda: self.set_main(None if main else accounts[0]))
+            menu.add_separator()
         menu.add_cascade(label="FPS cap", menu=self.fps_menu(menu, accounts))
         self.add_performance_items(menu, accounts)
         menu.add_separator()
@@ -6372,22 +6688,24 @@ class App:
     def client_overrides(self, acc):
         """The Roblox settings this account should start with, beyond the user's own."""
         values = {}
-        cap = self.fps_cap_of(acc)
+        rules = mode_rules(self.settings, acc["id"])
+        cap = self.fps_cap_of(acc) or rules.get("fps")
         if cap:
             values["FramerateCap"] = str(cap)
-        if acc["id"] in self.flagged("low_graphics"):
+        if acc["id"] in self.flagged("low_graphics") or rules.get("low_graphics"):
             values.update(LOW_GRAPHICS)
-        if acc["id"] in self.flagged("muted"):
+        if acc["id"] in self.flagged("muted") or rules.get("muted"):
             values.update(MUTED)
         return values
 
     def client_values_in_use(self):
         """Every value AltVault writes for some account, by setting name."""
-        used = {"FramerateCap": {str(c) for c in self.fps_caps().values()}}
-        if self.flagged("low_graphics"):
+        rules = MODES[mode_of(self.settings)]
+        used = {"FramerateCap": {str(c) for c in self.fps_caps().values()} | ({str(rules["fps"])} if "fps" in rules else set())}
+        if self.flagged("low_graphics") or rules.get("low_graphics"):
             for name, value in LOW_GRAPHICS.items():
                 used.setdefault(name, set()).add(value)
-        if self.flagged("muted"):
+        if self.flagged("muted") or rules.get("muted"):
             for name, value in MUTED.items():
                 used.setdefault(name, set()).add(value)
         return used
@@ -6435,7 +6753,177 @@ class App:
 
     def needs_client_settings(self):
         own, _ = self.client_state()
-        return bool(self.fps_caps() or self.flagged("low_graphics") or self.flagged("muted") or own)
+        return bool(self.fps_caps() or self.flagged("low_graphics") or self.flagged("muted") or own
+                    or mode_of(self.settings) != "normal")
+
+    # ------------------------------------------------------------ modes and the main account
+    def set_mode(self, key):
+        self.settings["mode"] = key
+        save_settings(self.settings)
+        for control in self.mode_controls:
+            control.set(key)
+        self.apply_modes()
+        self.refresh()
+        main = self.account(main_account(self.settings))
+        self.toast(f"{dict(MODE_NAMES)[key]} mode", MODE_HELP[key] + (
+            "" if key == "normal" else f" {self.who(main)} is your main account and isn't changed." if main
+            else " Right-click the account you play on, Performance, Main account, to keep it at full quality."))
+
+    def set_main(self, acc):
+        self.settings["main_account"] = acc["id"] if acc else None
+        save_settings(self.settings)
+        self.apply_modes()
+        self.refresh()
+        self.status.config(text=f"{self.who(acc)} is your main account: it keeps your own Roblox settings in every mode."
+                           if acc else "No main account: modes apply to every account.")
+
+    def apply_modes(self):
+        """Gives each open window the Windows priority its account's mode asks for. Called every tick
+        but only calls Windows when something changed, so it costs nothing while all is settled."""
+        self.saving = {pid: state for pid, state in self.saving.items() if pid in self.running}
+        self.saving_refused &= set(self.running)
+        for pid, account_id in self.running.items():
+            rules = mode_rules(self.settings, account_id)
+            want = (bool(rules.get("eco")), bool(rules.get("memory_low")))
+            if want == self.saving.get(pid, (False, False)) or pid in self.saving_refused:
+                continue
+            if set_process_saving(pid, *want):
+                self.saving[pid] = want
+            else:   # not retried every tick; a new window or AltVault restart tries again
+                self.saving_refused.add(pid)
+                log.warning("Windows refused to change the priority of a Roblox window (process %s)", pid)
+
+    # ------------------------------------------------------------ windows, hotkey and upkeep
+    def minimize_all(self):
+        """Minimises every Roblox window, or restores them all if they're all minimised already."""
+        hwnds = [hwnd for hwnd, _, _ in roblox_windows()]
+        if not hwnds:
+            self.status.config(text="No Roblox windows open.")
+            return
+        restore = all(_user32.IsIconic(h) for h in hwnds)
+        minimize_windows(hwnds, not restore)
+        if restore:
+            self.status.config(text=f"Restored {len(hwnds)} window(s).")
+        elif self.anti_afk_var.get():
+            self.toast("Windows minimised", "Anti-AFK can't reach minimised windows, so restore them within "
+                       "about 15 minutes or Roblox may kick them for being idle.", warning=True)
+        else:
+            self.status.config(text=f"Minimised {len(hwnds)} window(s). They use far less CPU and GPU now.")
+        self.root.after(300, lambda w=None: self.update_window_buttons(len(w := roblox_windows()), w))
+
+    def set_panic_hotkey(self, on, quiet=False):
+        if self.hotkey:
+            self.hotkey.stop()
+            self.hotkey = None
+        if on:
+            self.hotkey = Hotkey(MOD_CONTROL | MOD_ALT, VK_END, lambda: self.ui(self.panic))
+            if not self.hotkey.registered:
+                self.hotkey = None
+                log.warning("Another program already uses %s, so the panic hotkey is off", PANIC_HOTKEY)
+                if not quiet:
+                    self.toast("Panic hotkey not available", f"Another program already uses {PANIC_HOTKEY}.", warning=True)
+                return False
+        return True
+
+    def panic(self):
+        """The panic hotkey: stop any join and close every Roblox window at once, no questions."""
+        self.join_cancel.set()
+        pids = {pid for _, pid, _ in roblox_windows()}
+        if not pids:
+            return
+        self.expected_close |= pids
+        close_all_roblox()
+        log.warning("Panic hotkey: closed %d Roblox window(s)", len(pids))
+        self.toast("Closed every Roblox window", f"{PANIC_HOTKEY} was pressed.")
+        if self.tray and self.root.state() != "normal":
+            self.tray.notify("Closed every Roblox window", f"{PANIC_HOTKEY} was pressed.")
+
+    def daily_chores(self):
+        """A minute after start, then once a day: delete old Roblox logs and look for a newer
+        AltVault. Each is one short job on its own thread; nothing runs in between."""
+        if self.settings.get("clean_logs", True):
+            threading.Thread(target=self.clean_logs, daemon=True).start()
+        if self.settings.get("update_check", True) and time.time() - self.settings.get("update_checked", 0) > 20 * 3600:
+            self.check_updates()
+        self.root.after(24 * 3600 * 1000, self.daily_chores)
+
+    def clean_logs(self):
+        files, size = clean_roblox_logs()
+        if files:
+            log.info("Deleted %d old Roblox log file(s), %.0f MB", files, size / 2 ** 20)
+        return files, size
+
+    def check_updates(self, tell=False):
+        self.settings["update_checked"] = time.time()
+        save_settings(self.settings)
+
+        def work():
+            try:
+                found = latest_release()
+            except (RobloxError, ValueError, AttributeError):
+                found = None
+            newer = found if found and found[0] > version_tuple(APP_VERSION) else None
+            self.ui(self.show_update, newer, tell)
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_update(self, found, tell):
+        if found:
+            version, page = ".".join(map(str, found[0])), found[1]
+            self.update_available = (version, page)
+            log.info("AltVault %s is out", version)
+            self.toast(f"AltVault {version} is out", "Get it from the Releases page on GitHub: Settings, Data.")
+        elif tell:
+            self.toast("AltVault is up to date", f"You have the newest version, {APP_VERSION}.")
+
+    def diagnostics(self):
+        """A short report for bug reports: versions, counts and recent warnings. No logins, links,
+        usernames or folder names."""
+        w = sys.getwindowsversion()
+        free, total = memory_status()
+        lines = [f"AltVault {APP_VERSION}, Python {sys.version.split()[0]}, Windows {w.major}.{w.minor} build {w.build}",
+                 f"Memory: {free / 2 ** 30:.1f} of {total / 2 ** 30:.0f} GB free",
+                 f"Accounts: {len(self.accounts)} ({len(self.expired)} need logging in), Roblox windows: {len(roblox_windows())}",
+                 f"Mode: {mode_of(self.settings)}, main account set: {main_account(self.settings) is not None}",
+                 "Options: " + ", ".join(f"{k}={self.settings[k]}" for k in (
+                     "multi", "same_server", "auto_tile", "anti_afk", "afk_key", "launch_delay", "launch_memory_wait",
+                     "lighter_rendering", "clean_logs", "panic_hotkey", "stream_mode", "hide_taskbar") if k in self.settings),
+                 f"Roblox player: {'found' if roblox_player_folder() else 'bootstrapper or not found'}, "
+                 f"settings file: {'found' if roblox_settings_file() else 'not found'}",
+                 "Recent warnings:"]
+        names = sorted(((a["name"], f"account {i}") for i, a in enumerate(self.accounts, 1)), key=lambda p: -len(p[0]))
+        home = os.path.expanduser("~")
+        for created, level, message in reversed(list(ACTIVITY.items)):
+            if level < logging.WARNING:
+                continue
+            for name, alias in names:
+                message = re.sub(rf"(?<![\w]){re.escape(name)}(?![\w])", alias, message, flags=re.I)
+            lines.append(time.strftime("  %d %b %H:%M  ", time.localtime(created)) + message.replace(home, "~"))
+        if lines[-1] == "Recent warnings:":
+            lines.append("  none")
+        return "\n".join(lines)
+
+    def copy_diagnostics(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.diagnostics())
+        self.toast("Diagnostics copied", "Paste them into a bug report. They hold no logins, links or usernames.")
+
+    def set_webhook(self, url):
+        """Saves or (url None) removes the Discord webhook. Returns an error message, or None."""
+        url = url.strip() if url else None
+        if url and not WEBHOOK_RE.fullmatch(url):
+            return "That isn't a Discord webhook link. It starts with https://discord.com/api/webhooks/"
+        try:
+            save_webhook(url)
+        except OSError as e:
+            return f"Couldn't save it: {e.strerror or e}"
+        self.webhook = url
+        return None
+
+    def test_webhook(self, done):
+        if not self.webhook:
+            return done(False)
+        threading.Thread(target=lambda: self.ui(done, self.post_webhook(
+            self.webhook, "AltVault test", "Alerts from AltVault will show up here.")), daemon=True).start()
 
     def ask_join_player(self, accounts):
         if not accounts:
@@ -6859,7 +7347,10 @@ class App:
 
     # ------------------------------------------------------------ joining
     def join_selected(self):
-        if self.joining:
+        if self.joining:   # the Join button reads "stop" while a join runs
+            if not self.join_cancel.is_set():
+                self.join_cancel.set()
+                self.status.config(text="Stopping after the account that's starting now...")
             return
         sel = self.selected_accounts()
         if not sel:
@@ -6894,7 +7385,8 @@ class App:
             return
         self.save_settings()
         self.joining = True
-        self.join_btn.config(state="disabled", text=f"{SPINNER[0]}  Joining...")
+        self.join_cancel.clear()
+        self.join_btn.config(text=f"{SPINNER[0]}  Joining... (stop)")
         self.spin(1)
         # Everyone joining through a private server link ends up in that private server anyway.
         same_server = self.same_server_var.get() and len(sel) > 1 and not private
@@ -6918,6 +7410,8 @@ class App:
 
     def join_worker(self, accounts, place_id, job_id, same_server, private=None):
         problems = []
+        failed = []   # accounts worth trying again (not ones that need logging in)
+        self.join_failed = []
         link_code = ""
         fps_file = None
         if self.needs_client_settings():
@@ -6925,6 +7419,11 @@ class App:
             if fps_file is None:
                 problems.append("Couldn't find Roblox's settings file, so FPS caps, graphics and mute weren't applied. "
                                 "Start Roblox once normally, then try again.")
+        flags_folder = None
+        if any(wants_low_flags(self.settings, a["id"]) for a in accounts):
+            flags_folder = roblox_player_folder()
+            if flags_folder is None:
+                log.info("Roblox starts through a bootstrapper, so lighter rendering flags were left to it")
         try:
             if private:
                 try:
@@ -6932,10 +7431,32 @@ class App:
                 except RobloxError as e:
                     problems.append(str(e))
                     return
+            if same_server and not job_id and not link_code:
+                self.set_status("Looking for a server with room for everyone...")
+                try:
+                    job_id = server_with_room(place_id, len(accounts)) or ""
+                except RobloxError as e:
+                    log.info("Couldn't look for a roomy server (%s); the others will follow the first", e)
+                if job_id:
+                    same_server = False   # everyone goes straight there, nobody waits for the first
             for i, acc in enumerate(accounts):
                 last = i == len(accounts) - 1
+                if self.join_cancel.is_set() or (i and not self.pause_before_launch()):
+                    problems.append(f"Stopped. {len(accounts) - i} account(s) weren't launched.")
+                    failed.extend(accounts[i:])
+                    break
                 self.set_status(f"Launching {self.who(acc)} ({i + 1}/{len(accounts)})...")
                 before = {pid for _, pid, _ in roblox_windows()}
+                lighter = False
+                if flags_folder:
+                    restore_flags_safely()   # an earlier launch that failed may have left an alt's flags
+                if flags_folder and wants_low_flags(self.settings, acc["id"]):
+                    try:
+                        write_flags(flags_folder, LOW_FLAGS)
+                        lighter = True
+                    except (OSError, ValueError) as e:
+                        log.warning("Couldn't add lighter rendering flags: %s", type(e).__name__)
+                        flags_folder = None
                 if fps_file:
                     try:
                         self.apply_client_settings(fps_file, acc)
@@ -6956,16 +7477,20 @@ class App:
                 except (RobloxError, OSError) as e:
                     log.warning("Launch of %s failed: %s", acc["name"], e)
                     problems.append(f"{self.who(acc)}: {e}")
+                    failed.append(acc)
                     self.ui(lambda: self.history.add(launch_fail=1))
                     continue
                 pid = self.wait_for_new_window(before)
                 if pid is None:
                     problems.append(f"{self.who(acc)}: Roblox didn't open a window within {WINDOW_TIMEOUT}s.")
+                    failed.append(acc)
                     self.ui(lambda: self.history.add(launch_fail=1))
                     continue
                 self.ui(lambda: self.history.add(launch_ok=1))
                 self.ui(self.running.__setitem__, pid, acc["id"])
                 time.sleep(3)
+                if lighter:   # the client has read its flags by now
+                    restore_flags_safely()
                 if fps_file:   # the client has read its cap by now
                     try:
                         self.restore_client_settings(fps_file)
@@ -6994,7 +7519,25 @@ class App:
                     self.restore_client_settings(fps_file)
                 except (OSError, ValueError) as e:
                     log.warning("Couldn't restore your own Roblox settings: %s", e)
+            if flags_folder:
+                restore_flags_safely()
+            self.join_failed = [a["id"] for a in failed]
             self.ui(self.join_finished, problems)
+
+    def pause_before_launch(self):
+        """Before each launch after the first: the gap the user chose, then, if memory is nearly
+        full, a wait for it to free up (a client started into a full PC stalls the others too).
+        False if the user stopped the join meanwhile."""
+        delay = self.settings.get("launch_delay", 0)
+        if delay in LAUNCH_DELAYS and delay and self.join_cancel.wait(delay):
+            return False
+        if self.settings.get("launch_memory_wait", True):
+            deadline = time.monotonic() + LAUNCH_MEMORY_WAIT
+            while (used := memory_used_fraction()) >= LAUNCH_MEMORY and time.monotonic() < deadline:
+                self.set_status(f"Waiting for memory to free up ({used:.0%} used)...")
+                if self.join_cancel.wait(2):
+                    return False
+        return not self.join_cancel.is_set()
 
     def wait_for_new_window(self, before):
         deadline = time.time() + WINDOW_TIMEOUT
@@ -7026,15 +7569,19 @@ class App:
     def spin(self, i):
         """Animates the Join button while a join runs. It stops by itself when the join ends."""
         if self.joining:
-            set_text(self.join_btn, f"{SPINNER[i % len(SPINNER)]}  Joining...")
+            set_text(self.join_btn, f"{SPINNER[i % len(SPINNER)]}  Joining... (stop)")
             self.root.after(90, self.spin, i + 1)
 
     def join_finished(self, problems):
         self.joining = False
         self.join_btn.config(state="normal")
-        self.update_join_label()
         self.status.config(text="Done." if not problems else "Done, with problems.")
         self.refresh()
+        retry = [str(i) for i in self.join_failed if self.tree.exists(str(i))]
+        if retry:   # ready to try again with one click on Join
+            self.tree.selection_set(retry)
+            problems = problems + [f"The {len(retry)} account(s) that didn't start are selected now: click Join to try them again."]
+        self.update_join_label()
         if self.auto_tile_var.get() and len(roblox_windows()) > 1:
             self.tile()
             # Roblox can resize its window once the game finishes loading, so tile again after that.
@@ -7076,6 +7623,8 @@ class App:
         for hwnd, _, _ in roblox_windows():   # never leave Roblox windows without a taskbar button
             if not on_taskbar(hwnd):
                 set_on_taskbar(hwnd, True)
+        if self.hotkey:
+            self.hotkey.stop()
         if self.tray:
             self.tray.remove()
         self.root.destroy()
@@ -7127,19 +7676,6 @@ def main():
         show_error(APP_TITLE, f"Couldn't read saved accounts:\n{e}\n\nFile: {DATA_FILE}")
         root.destroy()
         return
-    # --- access key (begin) ---
-    state, why = license_state()
-    if state != "ok":   # no valid key on this PC: ask for one, or end here
-        apply_accent(load_settings().get("accent"))
-        apply_theme(root, root.winfo_fpixels("1i") / 96)
-        root.withdraw()
-        if not ActivationWindow(root, "" if state == "none" else why).activated:
-            log.info("Not activated; exiting")
-            root.destroy()
-            return
-        root.deiconify()
-        log.info("Activated")
-    # --- access key (end) ---
     threading.Thread(target=remove_stale_login_profiles, daemon=True).start()
     if os.path.exists(DATA_FILE):
         threading.Thread(target=restrict_to_owner, args=(DATA_FILE,), daemon=True).start()

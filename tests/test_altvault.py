@@ -206,7 +206,8 @@ class TestPrivateServers(unittest.TestCase):
 
         fake = types.SimpleNamespace(expired=set(), running={}, presence={}, settings={},
                                      set_status=lambda text: None, ui=lambda fn, *a: fn(*a),
-                                     join_finished=finished.append, remember_place=lambda c, p: None)
+                                     join_finished=finished.append, remember_place=lambda c, p: None,
+                                     join_cancel=threading.Event(), pause_before_launch=lambda: True)
         for name in ("join_worker", "resolve_private", "wait_for_new_window", "fps_caps", "fps_cap_of",
                      "flagged", "client_overrides", "client_values_in_use", "client_state", "needs_client_settings", "apply_client_settings", "restore_client_settings"):
             setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
@@ -409,7 +410,8 @@ class TestFpsCaps(unittest.TestCase):
         fake = types.SimpleNamespace(expired=set(), running={}, presence={}, ui=lambda fn, *a: fn(*a),
                                      settings={"fps_caps": {"1": 20, "3": 45}},
                                      set_status=lambda text: None, join_finished=lambda p: events.append(("done", p)),
-                                     remember_place=lambda c, p: None, wait_for_server=lambda *a: None)
+                                     remember_place=lambda c, p: None, wait_for_server=lambda *a: None,
+                                     join_cancel=threading.Event(), pause_before_launch=lambda: True)
         for name in ("join_worker", "wait_for_new_window", "fps_caps", "fps_cap_of",
                      "flagged", "client_overrides", "client_values_in_use", "client_state", "needs_client_settings", "apply_client_settings", "restore_client_settings"):
             setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
@@ -429,6 +431,414 @@ class TestFpsCaps(unittest.TestCase):
             fake.join_worker(accounts, "1", "", False)
         self.assertEqual(events, [("cookie1", 20), ("cookie2", 60), ("cookie3", 45), ("done", [])])
         self.assertEqual(av.read_fps_cap(self.path), 60)
+
+
+class TestModes(unittest.TestCase):
+    """Modes make alts save power and memory; the main account keeps your own settings."""
+
+    OWN = {"FramerateCap": "60", "GraphicsQualityLevel": "3", "SavedQualityLevel": "6", "MasterVolume": "0.5"}
+    ALT = {"SavedQualityLevel": "1", "GraphicsQualityLevel": "1", "MasterVolume": "0"}
+
+    def setUp(self):
+        self.path = os.path.join(tempfile.mkdtemp(dir=TEMP_HOME), "GlobalBasicSettings_13.xml")
+        with open(self.path, "wb") as f:
+            f.write(ROBLOX_SETTINGS_SAMPLE.replace(
+                b'\t\t\t<int name="GraphicsQualityLevel">3</int>\r\n',
+                b'\t\t\t<int name="GraphicsQualityLevel">3</int>\r\n\t\t\t<token name="SavedQualityLevel">6</token>\r\n'))
+        self.original = self.contents()
+
+    def contents(self):
+        with open(self.path, "rb") as f:
+            return f.read()
+
+    def make_app(self, caps=None, **settings):
+        return TestFpsCaps.make_app(self, caps or {}, **settings)
+
+    def starts_with(self, app, ids):
+        """What each account's client would start with; your own settings must come back after each."""
+        seen = {}
+        with mock.patch.object(av, "save_settings", lambda s: None):
+            for acc_id in ids:
+                app.apply_client_settings(self.path, {"id": acc_id})
+                seen[acc_id] = av.read_client_settings(self.path)
+                app.restore_client_settings(self.path)
+                self.assertEqual(self.contents(), self.original, "every setting must go back exactly")
+        return seen
+
+    def test_grind_saves_on_alts_but_not_the_main_account(self):
+        seen = self.starts_with(self.make_app({"3": 30}, mode="grind", main_account=1), (1, 2, 3))
+        self.assertEqual(seen[1], self.OWN)
+        self.assertEqual(seen[2], {**self.ALT, "FramerateCap": "15"})
+        self.assertEqual(seen[3], {**self.ALT, "FramerateCap": "30"}, "an account's own cap wins over the mode's")
+
+    def test_main_account_keeps_its_own_per_account_settings(self):
+        seen = self.starts_with(self.make_app({"1": 45}, mode="max", main_account=1), (1, 2))
+        self.assertEqual(seen[1], {**self.OWN, "FramerateCap": "45"})
+        self.assertEqual(seen[2], {**self.ALT, "FramerateCap": "10"})
+
+    def test_normal_mode_changes_nothing(self):
+        seen = self.starts_with(self.make_app(mode="normal", main_account=1), (1, 2))
+        self.assertEqual(seen, {1: self.OWN, 2: self.OWN})
+        self.assertFalse(self.make_app(mode="normal").needs_client_settings())
+        self.assertTrue(self.make_app(mode="grind").needs_client_settings())
+
+    def test_a_closing_alt_cant_make_grind_values_your_own(self):
+        app = self.make_app(mode="grind")
+        self.starts_with(app, (2,))                              # learns your own values
+        av.write_client_settings(self.path, {**self.ALT, "FramerateCap": "15"})   # the alt saved its own on close
+        with mock.patch.object(av, "save_settings", lambda s: None):
+            app.apply_client_settings(self.path, {"id": 3})
+            app.restore_client_settings(self.path)
+        self.assertEqual(self.contents(), self.original)
+
+    def test_bad_values_mean_normal_and_no_main(self):
+        for bad in (None, "turbo", 3, ["grind"], {"max": 1}):
+            self.assertEqual(av.mode_of({"mode": bad}), "normal")
+        for bad in (True, "1", 1.0, None):
+            self.assertIsNone(av.main_account({"main_account": bad}))
+        self.assertEqual(av.mode_rules({"mode": "max", "main_account": 7}, 7), {})
+        self.assertEqual(av.mode_rules({"mode": "max", "main_account": 7}, 8)["fps"], 10)
+        self.assertEqual(set(av.MODES), {key for key, _ in av.MODE_NAMES})
+        self.assertEqual(set(av.MODES), set(av.MODE_HELP))
+
+    def test_windows_is_only_asked_when_something_changes(self):
+        calls = []
+        fake = types.SimpleNamespace(settings={"mode": "max", "main_account": 1}, running={100: 1, 200: 2, 300: 3},
+                                     saving={}, saving_refused=set())
+
+        def fake_set(pid, eco, memory_low):
+            calls.append((pid, eco, memory_low))
+            return pid != 300                                  # Windows refuses this one
+        with mock.patch.object(av, "set_process_saving", fake_set), mock.patch.object(av.log, "warning"):
+            av.App.apply_modes(fake)
+            self.assertEqual(calls, [(200, True, True), (300, True, True)], "the main account is left alone")
+            av.App.apply_modes(fake)
+            self.assertEqual(len(calls), 2, "settled, so no calls, and a refusal isn't retried every tick")
+            fake.settings["mode"] = "normal"
+            av.App.apply_modes(fake)
+            self.assertEqual(calls[2:], [(200, False, False)], "back to normal priority")
+            del fake.running[200]
+            av.App.apply_modes(fake)
+        self.assertEqual(fake.saving, {}, "closed windows are forgotten")
+
+
+SERVER_ROOMY = "11111111-2222-3333-4444-555555555555"
+SERVER_TIGHT = "66666666-7777-8888-9999-000000000000"
+
+
+class TestJoinExtras(unittest.TestCase):
+    """Stop, retry, a server with room for everyone, and waiting for memory."""
+
+    def make(self, settings=None, launch=None):
+        windows, launched = [], []
+        fake = types.SimpleNamespace(expired=set(), running={}, presence={}, settings=settings or {},
+                                     set_status=lambda text: None, ui=lambda fn, *a: fn(*a), join_cancel=threading.Event(),
+                                     pause_before_launch=lambda: True, remember_place=lambda c, p: None)
+        fake.finished = []
+        fake.join_finished = fake.finished.append
+        for name in ("join_worker", "wait_for_new_window", "fps_caps", "fps_cap_of", "flagged", "client_overrides",
+                     "client_values_in_use", "client_state", "needs_client_settings", "apply_client_settings",
+                     "restore_client_settings"):
+            setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
+        fake.who = lambda acc: "@" + acc["name"]
+        fake.login_age = lambda account_id: "a while"
+        fake.history = types.SimpleNamespace(add=lambda now=None, **k: None)
+
+        def fake_launch(cookie, place_id, job_id="", link_code=""):
+            if launch:
+                launch(fake, cookie)
+            launched.append((cookie, job_id))
+            windows.append((len(windows), 900 + len(windows), "Roblox"))
+        return fake, launched, windows, fake_launch
+
+    def run_join(self, fake, fake_launch, windows, accounts, same_server=False, servers=None):
+        def get_servers(place_id, cursor=""):
+            if isinstance(servers, Exception):
+                raise servers
+            return servers or [], ""
+        with mock.patch.object(av, "launch", fake_launch), \
+                mock.patch.object(av, "get_servers", get_servers), \
+                mock.patch.object(av, "roblox_windows", lambda: list(windows)), \
+                mock.patch.object(av.time, "sleep", lambda s: None), \
+                mock.patch.object(av.threading, "Thread", lambda target, args=(), daemon=None:
+                                  types.SimpleNamespace(start=lambda: target(*args))):
+            fake.join_worker(accounts, "1818", "", same_server)
+        return fake.finished[0]
+
+    accounts = [{"id": i, "name": f"alt{i}", "cookie": f"cookie{i}"} for i in (1, 2, 3)]
+
+    def test_everyone_goes_straight_to_a_server_with_room(self):
+        fake, launched, windows, fake_launch = self.make()
+        fake.wait_for_server = lambda *a: self.fail("nobody should wait for the first account")
+        servers = [{"id": SERVER_TIGHT, "playing": 9, "maxPlayers": 10}, {"id": SERVER_ROOMY, "playing": 2, "maxPlayers": 10}]
+        problems = self.run_join(fake, fake_launch, windows, self.accounts, same_server=True, servers=servers)
+        self.assertEqual(problems, [])
+        self.assertEqual(launched, [(f"cookie{i}", SERVER_ROOMY) for i in (1, 2, 3)])
+
+    def test_without_a_server_list_the_others_follow_the_first(self):
+        fake, launched, windows, fake_launch = self.make()
+        followed = []
+        fake.wait_for_server = lambda acc, place: followed.append(acc["id"]) or SERVER_ROOMY
+        self.run_join(fake, fake_launch, windows, self.accounts, same_server=True, servers=av.RobloxError("429"))
+        self.assertEqual(followed, [1])
+        self.assertEqual([j for _, j in launched], ["", SERVER_ROOMY, SERVER_ROOMY])
+
+    def test_stop_leaves_the_rest_ready_to_retry(self):
+        fake, launched, windows, fake_launch = self.make(launch=lambda f, cookie: f.join_cancel.set())
+        problems = self.run_join(fake, fake_launch, windows, self.accounts)
+        self.assertEqual([c for c, _ in launched], ["cookie1"])
+        self.assertIn("Stopped. 2 account(s) weren't launched.", problems)
+        self.assertEqual(fake.join_failed, [2, 3])
+
+    def test_a_failed_launch_is_offered_for_retry(self):
+        def launch(f, cookie):
+            if cookie == "cookie2":
+                raise av.RobloxError("Roblox is down")
+        fake, launched, windows, fake_launch = self.make(launch=launch)
+        problems = self.run_join(fake, fake_launch, windows, self.accounts)
+        self.assertEqual([c for c, _ in launched], ["cookie1", "cookie3"])
+        self.assertEqual(fake.join_failed, [2])
+        self.assertTrue(any("Roblox is down" in p for p in problems))
+
+    def pause(self, settings, memory, waits):
+        """Runs pause_before_launch with fake memory readings; `waits` gets each wait's seconds."""
+        readings = iter(memory)
+        cancel = types.SimpleNamespace(wait=lambda s: waits.append(s) or False, is_set=lambda: False)
+        statuses = []
+        fake = types.SimpleNamespace(settings=settings, join_cancel=cancel, set_status=statuses.append)
+        with mock.patch.object(av, "memory_used_fraction", lambda: next(readings, 0.5)):
+            return av.App.pause_before_launch(fake), statuses
+
+    def test_waits_for_memory_then_launches(self):
+        waits = []
+        ok, statuses = self.pause({}, [0.95, 0.93, 0.6], waits)
+        self.assertTrue(ok)
+        self.assertEqual(waits, [2, 2])
+        self.assertIn("95% used", statuses[0])
+
+    def test_gap_between_launches_uses_allowed_values_only(self):
+        waits = []
+        self.pause({"launch_delay": 10, "launch_memory_wait": False}, [], waits)
+        self.assertEqual(waits, [10])
+        waits.clear()
+        self.pause({"launch_delay": 7, "launch_memory_wait": False}, [], waits)
+        self.assertEqual(waits, [], "7 isn't one of the choices, so it's ignored")
+
+    def test_stopping_during_the_wait_stops_the_join(self):
+        cancel = types.SimpleNamespace(wait=lambda s: True, is_set=lambda: True)
+        fake = types.SimpleNamespace(settings={"launch_delay": 5}, join_cancel=cancel, set_status=lambda t: None)
+        self.assertFalse(av.App.pause_before_launch(fake))
+
+
+class TestLighterRendering(unittest.TestCase):
+    """Allowed rendering flags for alts: added just before launch, the user's file always put back."""
+
+    def setUp(self):
+        self.folder = tempfile.mkdtemp(dir=TEMP_HOME)
+        self.path = os.path.join(self.folder, "ClientSettings", "ClientAppSettings.json")
+        backup = os.path.join(tempfile.mkdtemp(dir=TEMP_HOME), "client-flags-backup.json")
+        patcher = mock.patch.object(av, "FLAGS_BACKUP", backup)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.backup = backup
+
+    def contents(self):
+        with open(self.path, "rb") as f:
+            return f.read()
+
+    def test_flags_go_in_and_your_file_comes_back_byte_for_byte(self):
+        os.makedirs(os.path.dirname(self.path))
+        mine = b'\xef\xbb\xbf{"FFlagMyOwnThing": "True"}'
+        with open(self.path, "wb") as f:
+            f.write(mine)
+        av.write_flags(self.folder, av.LOW_FLAGS)
+        written = av.json.loads(self.contents())
+        self.assertEqual(written["FFlagMyOwnThing"], "True", "your own flags stay while the alt starts")
+        self.assertEqual(written["DFIntTextureQualityOverride"], "0")
+        av.restore_flags()
+        self.assertEqual(self.contents(), mine)
+        self.assertFalse(os.path.exists(self.backup))
+
+    def test_a_file_that_wasnt_there_is_removed_again(self):
+        av.write_flags(self.folder, av.LOW_FLAGS)
+        self.assertTrue(os.path.exists(self.path))
+        av.restore_flags()
+        self.assertFalse(os.path.exists(self.path))
+        av.restore_flags()   # nothing pending: does nothing
+
+    def test_a_damaged_file_is_left_alone(self):
+        os.makedirs(os.path.dirname(self.path))
+        with open(self.path, "wb") as f:
+            f.write(b"[1, 2]")
+        with self.assertRaises(ValueError):
+            av.write_flags(self.folder, av.LOW_FLAGS)
+        self.assertEqual(self.contents(), b"[1, 2]")
+        self.assertFalse(os.path.exists(self.backup))
+
+    def test_a_backup_never_touches_another_file(self):
+        other = os.path.join(self.folder, "important.txt")
+        with open(other, "w") as f:
+            f.write("keep me")
+        with open(self.backup, "w") as f:
+            av.json.dump({"path": other, "old": None}, f)
+        av.restore_flags()
+        self.assertTrue(os.path.exists(other))
+        self.assertFalse(os.path.exists(self.backup))
+
+    def test_only_alts_on_lowest_graphics_get_them(self):
+        self.assertTrue(av.wants_low_flags({"mode": "grind", "main_account": 1}, 2))
+        self.assertFalse(av.wants_low_flags({"mode": "grind", "main_account": 1}, 1), "the main account keeps full quality")
+        self.assertFalse(av.wants_low_flags({"mode": "normal"}, 2))
+        self.assertTrue(av.wants_low_flags({"low_graphics": [5]}, 5))
+        self.assertFalse(av.wants_low_flags({"mode": "max", "lighter_rendering": False}, 2))
+
+    def test_player_folder_only_when_roblox_starts_directly(self):
+        player = os.path.join(self.folder, "RobloxPlayerBeta.exe")
+        open(player, "w").close()
+        key = mock.MagicMock()
+        for command, expected in ((f'"{player}" %1', self.folder), (r'"C:\Bloxstrap\Bloxstrap.exe" -player "%1"', None)):
+            with mock.patch.object(av.winreg, "OpenKey", lambda *a: key), mock.patch.object(av.winreg, "QueryValue", lambda *a: command):
+                self.assertEqual(av.roblox_player_folder(), expected)
+        with mock.patch.object(av.winreg, "OpenKey", mock.Mock(side_effect=OSError)):
+            self.assertIsNone(av.roblox_player_folder())
+
+    def test_join_gives_flags_to_alts_only(self):
+        seen = []
+        settings_file = os.path.join(self.folder, "GlobalBasicSettings_13.xml")
+        with open(settings_file, "wb") as f:
+            f.write(ROBLOX_SETTINGS_SAMPLE)
+        fake, launched, windows, fake_launch = TestJoinExtras.make(self, settings={"mode": "grind", "main_account": 1},
+                                                                    launch=lambda f, c: seen.append(os.path.exists(self.path)))
+        accounts = [{"id": i, "name": f"alt{i}", "cookie": f"cookie{i}"} for i in (1, 2)]
+        with mock.patch.object(av, "roblox_player_folder", lambda: self.folder), \
+                mock.patch.object(av, "roblox_settings_file", lambda: settings_file), \
+                mock.patch.object(av, "save_settings", lambda s: None):
+            TestJoinExtras.run_join(self, fake, fake_launch, windows, accounts)
+        self.assertEqual(seen, [False, True], "main starts without the flags, the alt with them")
+        self.assertFalse(os.path.exists(self.path), "and they're gone again afterwards")
+
+
+class TestUpkeep(unittest.TestCase):
+    def test_old_roblox_logs_are_deleted_and_new_ones_kept(self):
+        logs = os.path.join(TEMP_HOME, "Roblox", "logs")
+        os.makedirs(logs, exist_ok=True)
+        now = time.time()
+        for name, age_days in (("old.log", 5), ("new.log", 1), ("old-notes.txt", 9)):
+            path = os.path.join(logs, name)
+            with open(path, "w") as f:
+                f.write("x" * 100)
+            os.utime(path, (now - age_days * 86400, now - age_days * 86400))
+        self.assertEqual(av.clean_roblox_logs(now=now), (1, 100))
+        self.assertEqual(sorted(os.listdir(logs)), ["new.log", "old-notes.txt"])
+
+    def test_update_check_reads_only_our_releases(self):
+        def reply(status, body):
+            return lambda *a, **k: (status, {}, av.json.dumps(body).encode())
+        good = {"tag_name": "v2.9.1", "html_url": av.GITHUB_URL + "/releases/tag/v2.9.1"}
+        with mock.patch.object(av, "_request", reply(200, good)):
+            self.assertEqual(av.latest_release(), ((2, 9, 1), good["html_url"]))
+        with mock.patch.object(av, "_request", reply(200, {**good, "html_url": "https://evil.example/download"})):
+            self.assertIsNone(av.latest_release())
+        with mock.patch.object(av, "_request", reply(404, {})):
+            self.assertIsNone(av.latest_release())
+        self.assertEqual(av.version_tuple("2.10.0"), (2, 10, 0))
+        self.assertGreater(av.version_tuple("v2.10.0"), av.version_tuple(av.APP_VERSION))
+        self.assertIsNone(av.version_tuple("latest"))
+
+
+WEBHOOK = "https://discord.com/api/webhooks/123456789012345678/" + "AbC-def_" * 8
+
+
+class TestDiscordAlerts(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(lambda: av.save_webhook(None))
+
+    def test_only_discord_webhook_links_are_accepted(self):
+        for good in (WEBHOOK, WEBHOOK.replace("discord.com", "ptb.discord.com"), WEBHOOK.replace("discord.com", "discordapp.com")):
+            self.assertTrue(av.WEBHOOK_RE.fullmatch(good), good)
+        for bad in ("http://discord.com/api/webhooks/1234567/" + "a" * 30, "https://discord.com.evil.io/api/webhooks/1234567/" + "a" * 30,
+                    "https://evil.io/?https://discord.com/api/webhooks/1234567/" + "a" * 30, WEBHOOK + "/../x", ""):
+            self.assertFalse(av.WEBHOOK_RE.fullmatch(bad), bad)
+            with self.assertRaises(ValueError):
+                av.save_webhook(bad)
+
+    def test_saved_encrypted_and_removable(self):
+        av.save_webhook(WEBHOOK)
+        with open(av.WEBHOOK_FILE, "rb") as f:
+            self.assertNotIn(b"webhooks", f.read())
+        self.assertEqual(av.load_webhook(), WEBHOOK)
+        av.save_webhook(None)
+        self.assertIsNone(av.load_webhook())
+
+    def test_the_post_holds_only_the_alert(self):
+        sent = []
+        with mock.patch.object(av, "_request", lambda url, cookie=None, method="GET", headers=None, data=None:
+                               sent.append((url, cookie, method, av.json.loads(data))) or (204, {}, b"")):
+            self.assertTrue(av.send_webhook(WEBHOOK, "@alt2: idle kick", "Open Doctor."))
+            self.assertFalse(av.send_webhook("https://evil.io/x", "t", "x"))
+        url, cookie, method, payload = sent[0]
+        self.assertEqual((url, cookie, method), (WEBHOOK, None, "POST"))
+        self.assertEqual(payload["allowed_mentions"], {"parse": []}, "a name can't ping anyone")
+        self.assertEqual(payload["content"], "**@alt2: idle kick**\nOpen Doctor.")
+        self.assertEqual(len(sent), 1)
+
+    def test_a_bad_night_cant_spam_discord(self):
+        posted = []
+        fake = types.SimpleNamespace(webhook=WEBHOOK, webhook_sent=[], post_webhook=lambda *a: posted.append(a))
+        with mock.patch.object(av.threading, "Thread", lambda target, args=(), daemon=None:
+                               types.SimpleNamespace(start=lambda: target(*args))):
+            for i in range(30):
+                av.App.send_alert(fake, f"alert {i}", "")
+        self.assertEqual(len(posted), av.WEBHOOK_PER_HOUR)
+        fake.webhook, posted[:] = None, []
+        av.App.send_alert(types.SimpleNamespace(webhook=None, webhook_sent=[]), "t", "")
+        self.assertEqual(posted, [])
+
+
+class TestHotkey(unittest.TestCase):
+    def test_pressed_key_calls_back_and_stops_cleanly(self):
+        pressed = threading.Event()
+        key = av.Hotkey(av.MOD_CONTROL | av.MOD_ALT | 0x0004, 0x87, pressed.set)   # Ctrl+Alt+Shift+F24: never in use
+        self.assertTrue(key.registered)
+        av._user32.PostThreadMessageW(key.thread_id, av.WM_HOTKEY, 1, 0)   # what Windows sends on the key press
+        self.assertTrue(pressed.wait(2))
+        key.stop()
+        key.thread.join(2)
+        self.assertFalse(key.thread.is_alive(), "its thread ends, so nothing is left running")
+
+
+class TestProcessSaving(unittest.TestCase):
+    """Efficiency mode, CPU and memory priority, tried on a throwaway process of our own (never Roblox)."""
+
+    def state(self, pid):
+        k32, wt = av._kernel32, av.wt
+        k32.GetPriorityClass.argtypes = [wt.HANDLE]
+        k32.GetProcessInformation.argtypes = [wt.HANDLE, av.ctypes.c_int, av.ctypes.c_void_p, wt.DWORD]
+        handle = k32.OpenProcess(av.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        self.assertTrue(handle)
+        try:
+            memory, throttle = wt.ULONG(), av.POWER_THROTTLING(1, 0, 0)
+            self.assertTrue(k32.GetProcessInformation(handle, av.PROCESS_MEMORY_PRIORITY, av.ctypes.byref(memory), 4))
+            self.assertTrue(k32.GetProcessInformation(handle, av.PROCESS_POWER_THROTTLING, av.ctypes.byref(throttle), 12))
+            return k32.GetPriorityClass(handle), memory.value, throttle.StateMask
+        finally:
+            k32.CloseHandle(handle)
+
+    def test_on_and_back_to_normal(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        normal = (av.NORMAL_PRIORITY_CLASS, av.MEMORY_PRIORITY_NORMAL, 0)
+        self.assertEqual(self.state(child.pid), normal)
+        self.assertTrue(av.set_process_saving(child.pid, eco=True))
+        self.assertEqual(self.state(child.pid), (av.BELOW_NORMAL_PRIORITY_CLASS, av.MEMORY_PRIORITY_NORMAL, 1))
+        self.assertTrue(av.set_process_saving(child.pid, eco=True, memory_low=True))
+        self.assertEqual(self.state(child.pid), (av.BELOW_NORMAL_PRIORITY_CLASS, av.MEMORY_PRIORITY_LOW, 1))
+        self.assertTrue(av.set_process_saving(child.pid))
+        self.assertEqual(self.state(child.pid), normal)
+
+    def test_a_process_windows_protects_is_refused_quietly(self):
+        self.assertFalse(av.set_process_saving(4, eco=True))     # the System process
 
 
 class TestSecretsNeverLeak(unittest.TestCase):
@@ -805,6 +1215,13 @@ class TestSettingsBackup(unittest.TestCase):
         self.assertEqual(av.restore_backup(settings, data), 2)
         self.assertEqual(settings, {"multi": False, "favorites": []})
 
+    def test_mode_and_main_account_are_backed_up(self):
+        backup = av.settings_backup({"mode": "max", "main_account": 42, "cookie": "SECRET"})
+        self.assertEqual(backup, {"altvault_settings": 1, "mode": "max", "main_account": 42})
+        settings = {}
+        av.restore_backup(settings, backup)
+        self.assertEqual((av.mode_of(settings), av.main_account(settings)), ("max", 42))
+
     def test_a_random_file_is_refused(self):
         for bad in ({}, [], "x", {"altvault_settings": 2}):
             with self.assertRaises(ValueError):
@@ -1076,6 +1493,71 @@ class TestWindow(unittest.TestCase):
         self.assertEqual([a["name"] for a in self.app.selected_accounts()], ["alt1", "alt2"])
         self.assertEqual(sorted(self.app.account_rows()), ["1", "2", "3", "4", "5"])
 
+    def test_mode_switches_stay_in_step_and_show_on_accounts(self):
+        app = self.app
+        self.assertEqual(len(app.mode_controls), 2, "one on Home, one in Settings")
+        self.addCleanup(lambda: [app.settings.pop(k, None) for k in ("mode", "main_account")])
+        with mock.patch.object(av, "save_settings", lambda s: None), mock.patch.object(app, "toast"):
+            app.mode_controls[0].set("grind", notify=True)          # clicking Grind on Home
+            self.assertEqual(app.settings["mode"], "grind")
+            self.assertEqual([c.value for c in app.mode_controls], ["grind", "grind"])
+            app.set_main(app.account(3))
+            self.assertIn("main", app.status_of(app.account(3))[0])
+            self.assertNotIn("15 FPS", app.status_of(app.account(3))[0])
+            self.assertIn("15 FPS · low graphics · muted", app.status_of(app.account(4))[0])
+            settings = app.pages["settings"]
+            settings.show_tab("modes")
+            self.assertEqual(settings.main_var.get(), "@alt3")
+            settings.main_box.current(0)                            # "None"
+            settings.set_main()
+            settings.show_tab("general")
+            self.assertIsNone(av.main_account(app.settings))
+            app.set_mode("normal")
+            self.assertEqual([c.value for c in app.mode_controls], ["normal", "normal"])
+        self.assertNotIn("FPS", app.status_of(app.account(4))[0])
+
+    def test_new_settings_save_and_explain_themselves(self):
+        app, page = self.app, self.app.pages["settings"]
+        self.addCleanup(lambda: [app.settings.pop(k, None) for k in ("launch_delay",)])
+        with mock.patch.object(av, "save_settings", lambda s: None):
+            page.delay_var.set("20 seconds")
+            page.set_delay()
+            self.assertEqual(app.settings["launch_delay"], 20)
+            page.hook_var.set("https://example.com/not-a-webhook")
+            page.save_hook()
+        self.assertIn("isn't a Discord webhook", page.hook_state.cget("text"))
+        self.assertIsNone(app.webhook)
+        page.show_tab("alerts")
+        page.show_tab("general")
+
+    def test_window_buttons_wait_for_roblox(self):
+        self.app.update_window_buttons(0)
+        self.assertEqual(str(self.app.min_btn.cget("state")), "disabled")
+        with mock.patch.object(av._user32, "IsIconic", lambda h: True):
+            self.app.update_window_buttons(1, [(1, 2, "Roblox")])
+        self.assertEqual(self.app.min_btn.cget("text"), "Restore all")
+        self.app.update_window_buttons(0)
+
+    def test_home_points_to_a_new_release(self):
+        home = self.app.pages["home"]
+        self.app.update_available = ("9.9.9", av.GITHUB_URL + "/releases/tag/v9.9.9")
+        self.addCleanup(setattr, self.app, "update_available", None)
+        item = [i for i in home.attention() if i[2] == "update"]
+        self.assertEqual(len(item), 1)
+        self.assertIn("9.9.9", item[0][1])
+        with mock.patch.object(av.webbrowser, "open") as opened:
+            home.open_row(types.SimpleNamespace(target="update"))
+        opened.assert_called_once_with(av.GITHUB_URL + "/releases/tag/v9.9.9")
+
+    def test_diagnostics_hold_no_names_or_logins(self):
+        av.log.warning("Launch of alt3 failed: Roblox is down (%s)", os.path.expanduser("~"))
+        text = self.app.diagnostics()
+        self.assertIn("Launch of account 3 failed", text)
+        self.assertNotIn("alt3", text)
+        self.assertNotIn(os.path.expanduser("~"), text)
+        self.assertNotIn(FAKE_COOKIE[:20], text)
+        self.assertIn(f"AltVault {av.APP_VERSION}", text)
+
     def test_double_clicking_a_group_never_joins(self):
         event = types.SimpleNamespace(y=5)
         with mock.patch.object(self.app, "join_selected") as join:
@@ -1156,7 +1638,8 @@ class TestWindow(unittest.TestCase):
         self.assertEqual(names, ["Join game", "Join a player's server...", "Performance", "Group", "Account", "Remove..."])
         performance = dict(i for i in top if isinstance(i, tuple))["Performance"]
         self.assertEqual([i if isinstance(i, str) else i[0] for i in performance],
-                         ["FPS cap", "Lowest graphics", "Mute", "✓ Anti-AFK"])
+                         ["Main account (keeps full quality in every mode)", "FPS cap", "Lowest graphics", "Mute",
+                          "✓ Anti-AFK"])
         account = dict(i for i in top if isinstance(i, tuple))["Account"]
         self.assertIn("Log in again...", account)
 
@@ -1788,133 +2271,6 @@ class TestHistory(unittest.TestCase):
             root.destroy()
 
 
-# --- access key (begin) ---
-class TestAccessKey(unittest.TestCase):
-    """Keys are ECDSA signatures over a PC's code: valid only on that PC, impossible to alter or invent."""
-
-    @classmethod
-    def setUpClass(cls):
-        spec = importlib.util.spec_from_file_location("license_tool", os.path.join(ROOT, "tools", "license_tool.py"))
-        cls.tool = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.tool)
-        cls.private, public = cls.tool.new_keypair()
-        cls.public = public.hex()
-        cls.pc = bytes(range(10))
-        cls.code = av.group(av.b32(cls.pc), 4)
-
-    def key(self, days=None, today=None):
-        return self.tool.make_key(self.private, self.code, days, today, app=av)
-
-    def check(self, text, pc=None, today=None):
-        return av.check_key(text, pc or self.pc, self.public, today)[0]
-
-    def test_a_key_works_on_its_own_pc_however_it_is_pasted(self):
-        key = self.key()
-        self.assertTrue(key.startswith("AVK-"))
-        self.assertEqual(self.check(key), "ok")
-        self.assertEqual(self.check(key.lower().replace("-", " ")), "ok", "case and separators don't matter")
-        self.assertEqual(self.check("  " + chr(10) + key + chr(10)), "ok")
-
-    def test_a_key_does_not_work_on_another_pc(self):
-        self.assertEqual(self.check(self.key(), pc=bytes(10)), "invalid")
-        self.assertEqual(self.check(self.key(), pc=bytes(range(1, 11))), "invalid")
-
-    def test_altered_or_invented_keys_are_refused(self):
-        key = self.key()
-        compact = key.replace("-", "")
-        flip = lambda i: compact[:i] + ("A" if compact[i] != "A" else "B") + compact[i + 1:]
-        for bad in (flip(len(compact) - 3),   # a character near the end changed (the very last one only holds padding)
-                    flip(10), flip(60),
-                    compact[:-6], "", "AVK", "hello", "AVK-" + "A" * 110):
-            self.assertEqual(self.check(bad), "invalid", bad)
-        other_private, _ = self.tool.new_keypair()   # signed by a different maker's key
-        forged = self.tool.make_key(other_private, self.code, None, None, app=av)
-        self.assertEqual(self.check(forged), "invalid")
-
-    def test_expiry_is_part_of_the_signature(self):
-        import datetime
-        key = self.key(days=30, today=datetime.date(2026, 1, 1))
-        self.assertEqual(self.check(key, today="20260131"), "ok")
-        self.assertEqual(self.check(key, today="20260202"), "expired")
-        self.assertEqual(self.check(self.key(), today="20990101"), "ok", "no days given means never expires")
-        # the expiry sits in the key's first bytes: editing it must break the signature
-        payload = bytearray(av.unb32(key.replace("-", "")[len(av.KEY_PREFIX):]))
-        payload[3] ^= 0x7F
-        edited = "AVK" + av.b32(bytes(payload))
-        self.assertEqual(self.check(edited), "invalid")
-
-    def test_the_saved_key_decides_whether_the_app_starts(self):
-        with mock.patch.object(av, "LICENSE_FILE", os.path.join(av.APP_DIR, "license-test.key")),                 mock.patch.object(av, "LICENSE_PUBLIC_KEY", self.public), mock.patch.object(av, "pc_raw", lambda: self.pc):
-            if os.path.exists(av.LICENSE_FILE):
-                os.remove(av.LICENSE_FILE)
-            self.assertEqual(av.license_state()[0], "none")
-            av.save_key(self.key())
-            self.assertEqual(av.license_state()[0], "ok")
-            av.save_key("AVK-NOTAREALKEY")
-            self.assertEqual(av.license_state()[0], "invalid")
-            with mock.patch.object(av, "LICENSE_REQUIRED", False):
-                self.assertEqual(av.license_state()[0], "ok", "the one switch that makes the app free")
-
-    def test_activation_window_accepts_only_a_good_key(self):
-        import tkinter
-        try:
-            root = tkinter.Tk()
-        except tkinter.TclError as e:
-            self.skipTest(f"no display: {e}")
-        root.withdraw()
-        av.apply_theme(root, 1.0)
-        try:
-            with mock.patch.object(av, "LICENSE_FILE", os.path.join(av.APP_DIR, "license-win.key")),                     mock.patch.object(av, "LICENSE_PUBLIC_KEY", self.public),                     mock.patch.object(av, "pc_raw", lambda: self.pc),                     mock.patch.object(tkinter.Toplevel, "wait_window", lambda self, *a: None):
-                window = av.ActivationWindow(root)
-                self.assertEqual(window.code_var.get(), self.code)
-                window.key_var.set("AVK-WRONG")
-                window.activate()
-                self.assertFalse(window.activated)
-                self.assertTrue(window.status.cget("text"))
-                window.key_var.set(self.key())
-                window.activate()
-                self.assertTrue(window.activated)
-                self.assertEqual(av.license_state()[0], "ok")
-        finally:
-            root.destroy()
-
-    def signing_folder(self):
-        folder = tempfile.mkdtemp(prefix="altvault-signing-test-")
-        with open(os.path.join(folder, self.tool.KEY_FILE), "wb") as f:
-            f.write(self.private)
-        return folder
-
-    def test_the_pc_code_is_picked_out_of_a_whole_message(self):
-        message = "Hi, could I have an AltVault key? My PC code is abcd-efgh-jklm-npqr, thanks!"
-        self.assertEqual(self.tool.find_pc_code(message), "ABCD-EFGH-JKLM-NPQR")
-        self.assertEqual(self.tool.find_pc_code("ABCD-EFGH-JKLM-NPQR"), "ABCD-EFGH-JKLM-NPQR")
-        for nothing in ("", "no code in here", "ABCD-EFGH-JKLM", None):
-            self.assertIsNone(self.tool.find_pc_code(nothing))
-
-    def test_issuing_a_key_makes_a_working_key_and_notes_who_got_it(self):
-        folder = self.signing_folder()
-        key = self.tool.issue_key(folder, self.code, "Sam, the first", None, app=av)
-        self.assertEqual(self.check(key), "ok")
-        ledger = self.tool.read_ledger(folder)
-        self.assertIn("Sam  the first", ledger, "commas in a name can't break the ledger")
-        self.assertIn(self.code, ledger)
-        self.assertNotIn(key, ledger, "the ledger never holds the keys themselves")
-        with self.assertRaises(FileNotFoundError):
-            self.tool.issue_key(tempfile.mkdtemp(prefix="altvault-empty-"), self.code, app=av)
-        self.assertEqual(self.tool.read_ledger(tempfile.mkdtemp(prefix="altvault-empty-")), "No keys made yet.")
-
-    def test_no_signing_key_can_end_up_in_the_repository(self):
-        found = [f for base, _, files in os.walk(ROOT) if ".git" not in base.split(os.sep) and "dev" not in base.split(os.sep)
-                 for f in files if f.endswith(".blob") or f.startswith("signing-key") or f == "license.key"]
-        self.assertEqual(found, [])
-        with open(os.path.join(ROOT, ".gitignore"), encoding="utf-8") as f:
-            ignored = f.read()
-        for pattern in ("*.blob", "signing-key*", "license.key"):
-            self.assertIn(pattern, ignored)
-        with open(SOURCE, encoding="utf-8") as f:
-            self.assertNotIn("ECCPRIVATEBLOB", f.read().replace('"ECCPRIVATEBLOB"', "", 0).split("# ---- access key")[0])
-
-# --- access key (end) ---
 
 
 class TestRepoHygiene(unittest.TestCase):
