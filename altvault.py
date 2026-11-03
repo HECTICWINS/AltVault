@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import queue
 import random
 import re
 import shutil
@@ -1324,6 +1325,11 @@ def dark_title_bar(win):
     """Dark title bar in the app's own colours with a hairline border and rounded corners, so the
     window frame blends into the app. Windows 11 honours all of it; older Windows ignores what it
     doesn't know and keeps the plain dark title bar."""
+    # A window about to appear for the first time is held back until its frame is dark, or it
+    # shows a light title bar for a moment.
+    first = win.state() == "normal" and not win.winfo_ismapped()
+    if first:
+        win.withdraw()
     win.update_idletasks()
     hwnd = _user32.GetParent(win.winfo_id())
     for attribute, value in ((DWMWA_USE_IMMERSIVE_DARK_MODE, 1), (DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND),
@@ -1334,6 +1340,8 @@ def dark_title_bar(win):
             _dwmapi.DwmSetWindowAttribute(hwnd, attribute, ctypes.byref(v), ctypes.sizeof(v))
         except OSError:
             pass
+    if first:
+        win.deiconify()
 
 
 def acquire_instance_lock():
@@ -2603,7 +2611,8 @@ C = {"bg": "#17161b", "panel": "#211f27", "field": "#2b2832", "sel": "#393443", 
      "outline": "#5a5466", "thumb": "#4a4555", "check": "#7d7789", "field_hover": "#504a5d",
      "pressed": "#45404f", "disabled": "#1d1b22", "panel_disabled": "#29262f",
      "line": "#2f2b38", "line_hover": "#4a4458", "glass_light": "#6e6585",
-     "danger": "#da373c", "danger_hover": "#bf2f33", "danger_pressed": "#a3282b"}
+     "danger": "#da373c", "danger_hover": "#bf2f33", "danger_pressed": "#a3282b",
+     "pick": "#7446e0", "on_pick": "#ffffff", "on_accent": "#ffffff"}   # pick: a chosen menu or list item
 FONT = ("Segoe UI", 9)
 NAV_HOVER = C["hover"]
 
@@ -2673,14 +2682,21 @@ def shape_image(w, h, radius, fill=None, border=None, border_w=1.0, box=None, ch
 
 # Colours of the drawn widgets, per state.
 # Each state is (fill, hairline). Everyday buttons are outlined and flat; only the main action is filled.
-BUTTON = {"normal": (C["panel"], C["line"]), "active": (C["hover"], C["line_hover"]),
-          "pressed": (C["sel"], C["line_hover"]), "disabled": (C["bg"], C["line"])}
-ACCENT = {"normal": (C["accent"], None), "active": (C["accent_hover"], None),
-          "pressed": (C["accent_pressed"], None), "disabled": (C["panel"], None)}
-DANGER = {"normal": (C["danger"], None), "active": (C["danger_hover"], None),
-          "pressed": (C["danger_pressed"], None), "disabled": (C["panel"], None)}
-PANEL_BUTTON = {"normal": (C["bg"], C["line"]), "active": (C["hover"], C["line_hover"]),
-                "pressed": (C["sel"], C["line_hover"]), "disabled": (C["bg"], C["line"])}
+BUTTON, ACCENT, DANGER, PANEL_BUTTON = {}, {}, {}, {}
+
+
+def set_widget_colors():
+    BUTTON.update(normal=(C.get("button", C["panel"]), C.get("button_line", C["line"])),
+                  active=(C["hover"], C["line_hover"]), pressed=(C["sel"], C["line_hover"]), disabled=(C["bg"], C["line"]))
+    ACCENT.update(normal=(C["accent"], None), active=(C["accent_hover"], None),
+                  pressed=(C["accent_pressed"], None), disabled=(C["panel"], None))
+    DANGER.update(normal=(C["danger"], None), active=(C["danger_hover"], None),
+                  pressed=(C["danger_pressed"], None), disabled=(C["panel"], None))
+    PANEL_BUTTON.update(normal=(C["bg"], C["line"]), active=(C["hover"], C["line_hover"]),
+                        pressed=(C["sel"], C["line_hover"]), disabled=(C["bg"], C["line"]))
+
+
+set_widget_colors()
 
 
 # The accent colours you can pick. Everything else in the palette stays the same.
@@ -2699,10 +2715,28 @@ ACCENTS = {
 def apply_accent(name):
     """Switches the palette to a saved accent. Must run before apply_theme, which bakes the colours in."""
     colors = ACCENTS.get(name) or ACCENTS["Violet"]
-    swap = {C[key]: value for key, value in colors.items()}
-    for state, value in ACCENT.items():
-        ACCENT[state] = tuple(swap.get(v, v) for v in value)
-    C.update(colors)
+    C.update(colors, pick=colors["accent"])
+    set_widget_colors()
+
+
+# The new interface's colours (ui/app.css, taken from the Figma design): plain greys, the main
+# button light with dark text, focus a plain light outline, no tint and no glow.
+NEW_LOOK = {"bg": "#151516", "panel": "#1b1b1d", "field": "#202023", "sel": "#2c2c30", "hover": "#26262a",
+            "fg": "#e8e8e8", "muted": "#a0a0a3", "dim": "#8e8e93", "deep": "#1b1b1d",
+            "accent": "#e8e8e8", "accent_hover": "#ffffff", "accent_pressed": "#cfcfd2", "accent_light": "#ffffff",
+            "accent_text": "#e8e8e8", "on_accent": "#151516", "pick": "#3d3d42", "on_pick": "#e8e8e8",
+            "green": "#5db85d", "red": "#de6a6a", "yellow": "#cf9f3e",
+            "outline": "#333336", "thumb": "#3a3a3e", "check": "#8e8e93", "field_hover": "#3a3a3e",
+            "pressed": "#2c2c30", "disabled": "#18181a", "panel_disabled": "#1d1d20",
+            "line": "#2a2a2d", "line_hover": "#45454a", "glass_light": "#2a2a2d", "button": "#202023", "button_line": "#333336",
+            "danger": "#b8483f", "danger_hover": "#c65449", "danger_pressed": "#a03f37"}
+
+
+def apply_new_look():
+    """Gives the Tk windows that remain (dialogs, toasts, menus) the new interface's look. Like
+    apply_accent, it must run before apply_theme, which bakes the colours in."""
+    C.update(NEW_LOOK)
+    set_widget_colors()
 
 
 def apply_theme(root, scale):
@@ -2734,7 +2768,7 @@ def apply_theme(root, scale):
 
     s.configure(".", background=C["bg"], foreground=C["fg"], fieldbackground=C["field"],
                 bordercolor=C["bg"], lightcolor=C["bg"], darkcolor=C["bg"], troughcolor=C["bg"],
-                focuscolor=C["accent"], selectbackground=C["accent"], selectforeground="white",
+                focuscolor=C["accent"], selectbackground=C["pick"], selectforeground=C["on_pick"],
                 insertcolor=C["fg"], font=FONT)
     for style, name, colors in (("TButton", "AVButton", BUTTON), ("Accent.TButton", "AVAccent", ACCENT),
                                 ("Panel.TButton", "AVPanelButton", PANEL_BUTTON), ("Danger.TButton", "AVDanger", DANGER)):
@@ -2743,7 +2777,7 @@ def apply_theme(root, scale):
             ("Button.padding", {"sticky": "nsew", "children": [("Button.label", {"sticky": "nsew"})]})]})]})])
     s.configure("TButton", padding=(round(8 * scale), round(5 * scale)), borderwidth=0, anchor="center")
     s.map("TButton", foreground=[("disabled", C["dim"])], background=[("active", C["bg"])])
-    s.configure("Accent.TButton", foreground="white", font=("Segoe UI Semibold", 9))
+    s.configure("Accent.TButton", foreground=C["on_accent"], font=("Segoe UI Semibold", 9))
     s.map("Accent.TButton", foreground=[("disabled", C["dim"])])
     s.configure("Danger.TButton", foreground="white", font=("Segoe UI Semibold", 9))
     s.configure("Panel.TButton", background=C["panel"])
@@ -2777,7 +2811,8 @@ def apply_theme(root, scale):
           selectforeground=[("readonly", C["fg"])])
     root.option_add("*TCombobox*Listbox.background", C["field"])
     root.option_add("*TCombobox*Listbox.foreground", C["fg"])
-    root.option_add("*TCombobox*Listbox.selectBackground", C["accent"])
+    root.option_add("*TCombobox*Listbox.selectBackground", C["pick"])
+    root.option_add("*TCombobox*Listbox.selectForeground", C["on_pick"])
     root.option_add("*TCombobox*Listbox.borderWidth", 0)
     root.option_add("*TCombobox*Listbox.font", FONT)
 
@@ -2789,8 +2824,8 @@ def apply_theme(root, scale):
     kw = {"box": (0.5, 0.5, box - 1, box - 1)}
     checks = {"off": image("check-off", box + gap, box, br, None, C["check"], border_w=rim, **kw),
               "off-hover": image("check-off-hover", box + gap, box, br, None, C["fg"], border_w=rim, **kw),
-              "on": image("check-on", box + gap, box, br, C["accent"], check="#ffffff", check_w=1.8 * scale, **kw),
-              "on-hover": image("check-on-hover", box + gap, box, br, C["accent_light"], check="#ffffff",
+              "on": image("check-on", box + gap, box, br, C["accent"], check=C["on_accent"], check_w=1.8 * scale, **kw),
+              "on-hover": image("check-on-hover", box + gap, box, br, C["accent_light"], check=C["on_accent"],
                                 check_w=1.8 * scale, **kw)}
     s.element_create("AVCheck.indicator", "image", checks["off"], ("selected active", checks["on-hover"]),
                      ("selected", checks["on"]), ("active", checks["off-hover"]), sticky="w")
@@ -2949,8 +2984,8 @@ class Dialog(tk.Toplevel):
         else:
             x, y = (self.winfo_screenwidth() - w) // 2, (self.winfo_screenheight() - h) // 3
         self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
-        self.deiconify()
         dark_title_bar(self)
+        self.deiconify()
         self.lift()
         self.grab_set()
         if entry is not None:
@@ -3006,8 +3041,8 @@ def ask_integer(title, prompt, parent=None, minvalue=None, maxvalue=None, initia
 
 
 def themed_menu(root):
-    return tk.Menu(root, tearoff=0, bg=C["deep"], fg=C["fg"], activebackground=C["accent"],
-                   activeforeground="white", bd=0, relief="flat", activeborderwidth=4, font=FONT)
+    return tk.Menu(root, tearoff=0, bg=C["deep"], fg=C["fg"], activebackground=C["pick"],
+                   activeforeground=C["on_pick"], bd=0, relief="flat", activeborderwidth=4, font=FONT)
 
 
 # ---------------------------------------------------------------- UI
@@ -5437,7 +5472,7 @@ class ProfileDialog(tk.Toplevel):
         listing = ttk.Frame(frm)
         listing.pack(fill="both", expand=True)
         self.list = tk.Listbox(listing, selectmode="multiple", activestyle="none", bg=C["panel"], fg=C["fg"],
-                               selectbackground=C["accent"], selectforeground="white", highlightthickness=0,
+                               selectbackground=C["pick"], selectforeground=C["on_pick"], highlightthickness=0,
                                bd=0, font=FONT, exportselection=False)
         scroll = ttk.Scrollbar(listing, orient="vertical", command=self.list.yview)
         self.list.pack(side="left", fill="both", expand=True)
@@ -5580,8 +5615,12 @@ class App:
         self.expected_close = set()   # Roblox pids AltVault was asked to close, so they aren't counted
         self.tick_job = None
 
+        new_look = self.settings.get("new_look", True) and os.path.exists(os.path.join(UI_DIR, "index.html"))
         if not hasattr(root, "altvault_images"):   # main() styles the window first when it asks for a key
-            apply_accent(self.settings.get("accent"))
+            if new_look:
+                apply_new_look()
+            else:
+                apply_accent(self.settings.get("accent"))
             apply_theme(root, self.scale)
         root.title(APP_TITLE)
         saved = self.settings.get("geometry")
@@ -5591,7 +5630,11 @@ class App:
         root.minsize(*min_size(self.scale))
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.build()
+        root.withdraw()   # shown once the dark title bar and the new interface's dark cover are in place
+        if new_look:
+            self.start_web()
         dark_title_bar(root)
+        root.deiconify()
 
         self.load_cached_avatars()
         self.refresh()
@@ -5605,8 +5648,6 @@ class App:
         self.root.after(3000, lambda: self.doctor_scan(quiet=True))
         restore_flags_safely()   # if AltVault stopped mid-launch, an alt's flags may still be in place
         self.root.after(60_000, self.daily_chores)
-        if self.settings.get("new_look", True) and os.path.exists(os.path.join(UI_DIR, "index.html")):
-            self.start_web()   # now, so its dark cover is there before the window is first drawn
         self.set_panic_hotkey(self.settings.get("panic_hotkey", False), quiet=True)
         # Nobody sees presence while AltVault is minimised, so it pauses then and catches up on restore.
         self.presence_stale = False
@@ -6853,8 +6894,14 @@ class App:
             self.web_host = tk.Frame(self.root, bg="#151516")
             self.web_host.place(x=0, y=0, relwidth=1, relheight=1)
             self.root.update_idletasks()
+            # WebView2 calls back from inside Tk's event loop, where any Tk call leaves tkinter without
+            # its thread state and the next Tk event that runs Python aborts the whole process. So the
+            # callbacks only drop work in a queue, and a waiting thread hands it to Tk like any job.
+            self.web_inbox = queue.SimpleQueue()
+            threading.Thread(target=self.web_relay, daemon=True).start()
             self.web = webview2.WebView(self.web_host.winfo_id(), UI_DIR, os.path.join(APP_DIR, "webview"),
-                                        self.on_web_message, self.web_ready,
+                                        lambda msg: self.web_inbox.put((self.on_web_message, msg)),
+                                        lambda: self.web_inbox.put((self.web_ready,)),
                                         extra_hosts={"avatars.altvault.example": AVATAR_DIR, "icons.altvault.example": ICON_DIR})
             self.web_host.bind("<Configure>", lambda e: self.web and self.web.resize(e.width, e.height))
             self.root.bind("<Configure>", lambda e: self.web and e.widget is self.root and self.web.moved(), add="+")
@@ -6864,6 +6911,19 @@ class App:
             if getattr(self, "web_host", None):
                 self.web_host.destroy()
                 self.web_host = None
+
+    def web_relay(self):
+        """Waits (using nothing) for messages from the page and runs each on Tk's thread."""
+        while True:
+            job = self.web_inbox.get()
+            for _ in range(50):   # Tk's main loop may not be running yet at the very start
+                try:
+                    self.root.after(0, *job)
+                    break
+                except RuntimeError:
+                    time.sleep(0.1)
+                except tk.TclError:   # the window has closed
+                    return
 
     def web_ready(self):
         self.web_sent.clear()   # a fresh page has nothing yet
