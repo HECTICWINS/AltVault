@@ -858,7 +858,7 @@ class TestProcessSaving(unittest.TestCase):
         self.addCleanup(child.wait)
         self.addCleanup(child.kill)
         normal = (av.NORMAL_PRIORITY_CLASS, av.MEMORY_PRIORITY_NORMAL, 0)
-        self.assertEqual(self.state(child.pid), normal)
+        # no check of the starting state: a child inherits its parent's priority, which CI lowers
         self.assertTrue(av.set_process_saving(child.pid, eco=True))
         self.assertEqual(self.state(child.pid), (av.BELOW_NORMAL_PRIORITY_CLASS, av.MEMORY_PRIORITY_NORMAL, 1))
         self.assertTrue(av.set_process_saving(child.pid, eco=True, memory_low=True))
