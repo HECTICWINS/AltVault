@@ -13,7 +13,8 @@ import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_FILES = re.compile(r"(^|/)(accounts\.dat|settings\.json|.*\.log|avatars/|.*\.bak|.*\.tmp)", re.I)
-APP_FILES = ("altvault.py", "README.md", "LICENSE")
+APP_FILES = ("altvault.py", "webview2.py", "WebView2Loader.dll", "README.md", "LICENSE",
+             "ui/index.html", "ui/app.css", "ui/app.js", "ui/pages.js")
 
 
 def personal_strings():

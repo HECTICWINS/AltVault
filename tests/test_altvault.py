@@ -807,6 +807,35 @@ class TestHotkey(unittest.TestCase):
         self.assertFalse(key.thread.is_alive(), "its thread ends, so nothing is left running")
 
 
+class TestNewInterface(unittest.TestCase):
+    """The state the page gets: everything it draws, and nothing it shouldn't have."""
+
+    def test_state_for_the_page(self):
+        accounts = [{"id": 1, "name": "mainacc", "displayName": "Hectic", "cookie": FAKE_COOKIE, "note": ""},
+                    {"id": 2, "name": "farmalt1", "displayName": "Farm One", "cookie": FAKE_COOKIE, "note": "x", "group": "Farm"}]
+        fake = types.SimpleNamespace(accounts=accounts, settings={"mode": "grind", "main_account": 1}, running={77: 2},
+                                     presence={2: {"userPresenceType": 2, "lastLocation": "Pet Sim"}}, expired=set(),
+                                     avatar_px=48, joining=False, stream_var=types.SimpleNamespace(get=lambda: False),
+                                     anti_afk_var=types.SimpleNamespace(get=lambda: True), place_var=types.SimpleNamespace(get=lambda: "1818"),
+                                     status=types.SimpleNamespace(cget=lambda k: "Done."))
+        for name in ("fps_caps", "fps_cap_of", "flagged", "group_of", "who"):
+            setattr(fake, name, types.MethodType(getattr(av.App, name), fake))
+        state = av.App.web_state(fake)
+        main, alt = state["accounts"]
+        self.assertEqual((main["perf"], main["main"], main["status"]), ("Full quality", True, "—"))
+        self.assertEqual((alt["status"], alt["kind"], alt["game"]), ("In game", "ingame", "Pet Sim"))
+        self.assertEqual(alt["perf"], "15 FPS · low graphics · muted")
+        self.assertEqual((state["open"], state["ingame"], state["mode"]), (1, 1, "grind"))
+        self.assertNotIn(FAKE_COOKIE, av.json.dumps(state), "logins never reach the page")
+
+    def test_page_files_are_local_and_locked_down(self):
+        page = open(os.path.join(ROOT, "ui", "index.html"), encoding="utf-8").read()
+        self.assertIn("default-src 'self'", page)
+        script = open(os.path.join(ROOT, "ui", "app.js"), encoding="utf-8").read()
+        for remote in ("fetch(", "XMLHttpRequest", "http://", "eval(", "innerHTML = msg"):
+            self.assertNotIn(remote, script)
+
+
 class TestProcessSaving(unittest.TestCase):
     """Efficiency mode, CPU and memory priority, tried on a throwaway process of our own (never Roblox)."""
 
@@ -1477,7 +1506,8 @@ class TestWindow(unittest.TestCase):
                     for i in range(1, 6)]
         accounts[0]["group"] = accounts[1]["group"] = "Farm"
         accounts[2]["group"] = "Mains"
-        with mock.patch.object(av.threading, "Thread", lambda **k: types.SimpleNamespace(start=lambda: None)):
+        with mock.patch.object(av.threading, "Thread", lambda **k: types.SimpleNamespace(start=lambda: None)), \
+                mock.patch.object(av, "UI_DIR", os.path.join(TEMP_HOME, "no-ui")):   # the classic window only
             cls.app = av.App(cls.root, accounts)
         cls.root.withdraw()
 
@@ -1557,6 +1587,29 @@ class TestWindow(unittest.TestCase):
         self.assertNotIn(os.path.expanduser("~"), text)
         self.assertNotIn(FAKE_COOKIE[:20], text)
         self.assertIn(f"AltVault {av.APP_VERSION}", text)
+
+    def test_every_new_page_gets_clean_data(self):
+        for page in ("home", "profiles", "games", "live", "stats", "pulse", "doctor", "settings"):
+            data = self.app.web_page_data(page)
+            text = av.json.dumps(data)   # must be plain JSON for the page
+            self.assertNotIn(FAKE_COOKIE[:30], text, page)
+        self.assertIsNone(self.app.web_page_data("nonsense"))
+
+    def test_the_page_cant_set_bad_values_or_touch_other_windows(self):
+        app = self.app
+        before = dict(app.settings)
+        with mock.patch.object(av, "save_settings", lambda s: None):
+            for key, value in (("launch_delay", "abc"), ("launch_delay", 7), ("afk_key", "<script>"), ("afk_key", "ab"),
+                               ("mode", "turbo"), ("multi", "yes"), ("cookie", "x"), ("clean_logs", "false")):
+                app.web_set(key, value)
+        self.assertEqual(app.settings, before)
+        with mock.patch.object(av, "roblox_windows", lambda: [(5555, 77, "Roblox")]), \
+                mock.patch.object(av, "focus_window") as focus:
+            app.web_do("show-window", {"hwnd": 1234})   # not a Roblox window
+            focus.assert_not_called()
+            app.web_do("show-window", {"hwnd": 5555})
+            focus.assert_called_once_with(5555)
+        app.web_do("no-such-button", {})
 
     def test_double_clicking_a_group_never_joins(self):
         event = types.SimpleNamespace(y=5)
@@ -2279,8 +2332,13 @@ class TestRepoHygiene(unittest.TestCase):
             tree = ast.parse(f.read())
         modules = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
         modules |= {n.module.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
-        third_party = sorted(m for m in modules if m not in sys.stdlib_module_names)
+        third_party = sorted(m for m in modules if m not in sys.stdlib_module_names and m != "webview2")
         self.assertEqual(third_party, [])
+        with open(os.path.join(ROOT, "webview2.py"), encoding="utf-8") as f:   # AltVault's own, also stdlib-only
+            tree = ast.parse(f.read())
+        modules = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+        modules |= {n.module.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
+        self.assertEqual(sorted(m for m in modules if m not in sys.stdlib_module_names), [])
 
     def test_gitignore_keeps_personal_files_out(self):
         with open(os.path.join(ROOT, ".gitignore"), encoding="utf-8") as f:

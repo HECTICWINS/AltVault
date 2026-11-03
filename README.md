@@ -96,7 +96,7 @@ It's also why the file itself shows the Python icon: changing it would break the
 The running window and taskbar show AltVault's icon. For a desktop shortcut with the same icon, right-click `AltVault.exe` > **Show more options** > **Create shortcut**, then point the shortcut's icon at `AltVault.ico`.
 The download contains no compiled code of ours. The app itself is the readable `altvault.py` next to the exe.
 
-**Already have Python 3.9 or newer?** You can run the source instead of the download. There's nothing to `pip install`; AltVault only uses Python's standard library.
+**Already have Python 3.9 or newer?** You can run the source instead of the download. There's nothing to `pip install`; AltVault only uses Python's standard library, plus Microsoft's WebView2 (built into Windows 11, and a free download for Windows 10) to draw its window.
 
 1. Install Python from [python.org](https://www.python.org/downloads/windows/) (64-bit, 3.13 recommended), not the Microsoft Store version.
 2. Right-click `altvault.py` > **Open with** > **Python**. Or run `pyw altvault.py` in that folder.

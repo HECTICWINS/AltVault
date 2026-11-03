@@ -5,6 +5,7 @@ Every release on the [Releases](../../releases) page is built by GitHub from the
 ## Unreleased
 
 - **Free for everyone:** no access key any more. Download, unzip and run.
+- **A new, plainer look:** every page is redrawn in Microsoft's WebView2: a sidebar, a dense account table, plain status words and a one-line status bar. Windows draws the Live page's previews itself, so they still cost almost nothing. The window opens in under a second, and while it's hidden in the tray the page stops drawing and hands memory back.
 - **Modes:** **Normal**, **Grind** and **Max alts**, one click at the top of Home. Grind runs every alt at 15 FPS, lowest graphics and muted, in Windows' efficiency mode; Max alts goes to 10 FPS and lets Windows move alts out of memory first when it runs short.
 - **Main account:** the account you play on keeps your own Roblox settings and normal priority in every mode. Right-click it, **Performance > Main account**, or pick it in **Settings > Modes**.
 - **A server with room for everyone:** with Put accounts in the same server on, every account goes straight to a public server with space for all of them, instead of waiting for the first to arrive.

@@ -25,7 +25,8 @@ DIST = os.path.join(ROOT, "dist")
 OUT = os.path.join(DIST, "AltVault")
 BASE = sys.base_prefix
 VER = f"{sys.version_info.major}{sys.version_info.minor}"
-APP_FILES = ["altvault.py", "README.md", "LICENSE"]
+APP_FILES = ["altvault.py", "webview2.py", "WebView2Loader.dll", "README.md", "LICENSE",
+             "ui/index.html", "ui/app.css", "ui/app.js", "ui/pages.js"]
 
 # Parts of Python that AltVault never uses. Leaving them out keeps the download small.
 SKIP_LIB = {"test", "idlelib", "ensurepip", "site-packages", "turtledemo", "pydoc_data", "venv",

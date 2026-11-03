@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' https://avatars.altvault.example https://icons.altvault.example; style-src 'self'; script-src 'self'">
+<title>AltVault</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<aside class="side">
+  <nav id="nav"></nav>
+  <div class="grow"></div>
+  <button class="nav" data-page="settings"><span class="ico" data-icon="settings"></span>Settings</button>
+  <div class="mark">HecticWins</div>
+</aside>
+<main id="main">
+  <section class="page" id="page-accounts" hidden>
+    <header class="head">
+      <h1>Accounts <span class="count" id="acc-count"></span></h1>
+      <div class="actions">
+        <button class="btn" data-action="import">Import</button>
+        <button class="btn" data-action="add">Add account</button>
+        <button class="btn primary" id="join">Join</button>
+      </div>
+    </header>
+    <div class="toolbar">
+      <label class="field game"><span>Game</span><input id="place" placeholder="Paste a game or private server link" autocomplete="off" spellcheck="false"></label>
+      <label class="field server"><span>Server</span><input id="job" placeholder="Any" autocomplete="off" spellcheck="false"></label>
+      <label class="field mode"><span>Mode</span><select id="mode"><option value="normal">Normal</option><option value="grind">Grind</option><option value="max">Max alts</option></select></label>
+      <div class="grow"></div>
+      <label class="field show"><span>Show</span><select id="filter"><option value="all">All</option><option value="ingame">In game</option><option value="offline">Offline</option><option value="problems">Problems</option></select></label>
+      <label class="field search"><input id="search" placeholder="Search" autocomplete="off" spellcheck="false"></label>
+    </div>
+    <div class="table" id="table">
+      <div class="row head-row"><span class="c-check"><input type="checkbox" id="check-all" aria-label="Select all"></span><span class="c-acc">Account</span><span class="c-status">Status</span><span class="c-game">Game</span><span class="c-perf">Performance</span><span class="c-up">Note</span></div>
+      <div id="rows"></div>
+      <div class="empty" id="empty" hidden>
+        <strong>No accounts yet</strong>
+        <p>Add an account by logging in through Roblox's own sign-in page, or import them from Roblox Account Manager.</p>
+        <div><button class="btn primary" data-action="add">Add account</button> <button class="btn" data-action="import">Import</button></div>
+      </div>
+    </div>
+  </section>
+  <section class="page" id="page-home" hidden></section>
+  <section class="page" id="page-profiles" hidden></section>
+  <section class="page" id="page-games" hidden></section>
+  <section class="page" id="page-live" hidden></section>
+  <section class="page" id="page-stats" hidden></section>
+  <section class="page" id="page-pulse" hidden></section>
+  <section class="page" id="page-doctor" hidden></section>
+  <section class="page" id="page-settings" hidden></section>
+  <footer class="status" id="status"></footer>
+</main>
+<script src="pages.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

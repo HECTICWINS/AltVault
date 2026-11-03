@@ -44,6 +44,41 @@ SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
 PRIVATE_FILE = os.path.join(APP_DIR, "private-link.dat")
 WEBHOOK_FILE = os.path.join(APP_DIR, "webhook.dat")
 FLAGS_BACKUP = os.path.join(APP_DIR, "client-flags-backup.json")
+STARTED = time.monotonic()   # for timing how long the window takes to be ready
+UI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")   # the new interface's page
+# The explanations under each option on the new Settings page.
+WEB_SETTING_TEXT = {
+    "multi": "Run several Roblox windows at once. Turn off only if you want each launch to replace the previous window.",
+    "same_server": "When joining several accounts with no server chosen, AltVault picks a server with room for all of them. "
+                   "If there's none, the others follow the first account.",
+    "auto_tile": "Splits the screen evenly between every Roblox window, like the Tile button.",
+    "launch_delay": "A gap gives each client time to load before the next one starts. While a join runs, the Join button stops it.",
+    "launch_memory_wait": "If memory is over 90% full, the next client waits up to a minute for it to free up, so the ones "
+                          "already running don't stall.",
+    "modes": "Normal: your own Roblox settings. Grind: alts at 15 FPS, lowest graphics, muted, in Windows' efficiency mode. "
+             "Max alts: like Grind at 10 FPS, and Windows moves alts out of memory first when it runs short.",
+    "main": "The account you play on. It keeps your own Roblox settings and normal priority in every mode.",
+    "lighter": "Accounts on lowest graphics also start with the lowest texture quality, no anti-aliasing, a plain sky and "
+               "no grass, using the rendering flags Roblox allows players to set. Skipped when Roblox starts through a "
+               "bootstrapper such as Bloxstrap.",
+    "afk_how": "Roblox only reads input from the window in front, so Anti-AFK borrows focus for a moment and gives it straight "
+               "back. It waits for you to pause and stops as soon as you touch the mouse or keyboard.",
+    "afk_key": "F13 is a key no game uses, so your character stays where it is. Space makes it jump.",
+    "webhook": "Get disconnects, expired logins, crashes and low memory on your phone. In a Discord server you own: Server "
+               "Settings, Integrations, Webhooks, New Webhook, Copy Webhook URL, then paste it here. It's stored encrypted "
+               "to your Windows user.",
+    "panic": "Closes every Roblox window and stops any join, from any app, without asking first.",
+    "stream": "Hides usernames, avatars and your saved private server link in AltVault, and usernames in Roblox window "
+              "titles, so you can share your screen.",
+    "taskbar": "Keeps the taskbar and Alt+Tab clear. Open a window from the Live page instead.",
+    "private": "The last private server link you used is kept, encrypted to your Windows user, and comes back in the Game "
+               "box when you reopen AltVault.",
+    "accounts": "Updates keep your accounts by themselves. To move them to another PC or Windows user, export them to a "
+                "file locked with a password.",
+    "backup": "Back up your options, games, profiles and per-account settings. Logins and private server links are never included.",
+    "clean_logs": "Once a day, Roblox's own log files older than 3 days are deleted.",
+    "update_check": "Once a day, asks GitHub whether a newer AltVault is out. Nothing is downloaded by itself.",
+}
 AVATAR_DIR = os.path.join(APP_DIR, "avatars")
 ICON_DIR = os.path.join(APP_DIR, "game-icons")
 LOG_FILE = os.path.join(APP_DIR, "altvault.log")
@@ -5501,6 +5536,12 @@ class App:
         self.webhook_sent = []        # times of recent Discord alerts, for WEBHOOK_PER_HOUR
         self.hotkey = None
         self.update_available = None  # (version text, release page) once a newer AltVault is out
+        self.web = self.web_host = None   # the new interface, once WebView2 has started
+        self.web_page, self.web_job, self.web_thumbs = "home", None, {}
+        self.web_sent = {}   # the last data sent to each page
+        self.web_ranges = {"stats": "day", "pulse": "hour"}
+        self.web_settings_tab, self.web_doctor_pick = "general", ""
+        self.web_pc, self.web_rbx = PcMeter(), CpuMeter()
         self.avatars = {}      # account id -> PhotoImage
         sizes = (48, 60, 75, 100, 110, 150)
         self.avatar_px = next((s for s in sizes if s >= 40 * self.scale), 150)
@@ -5564,6 +5605,8 @@ class App:
         self.root.after(3000, lambda: self.doctor_scan(quiet=True))
         restore_flags_safely()   # if AltVault stopped mid-launch, an alt's flags may still be in place
         self.root.after(60_000, self.daily_chores)
+        if self.settings.get("new_look", True) and os.path.exists(os.path.join(UI_DIR, "index.html")):
+            self.start_web()   # now, so its dark cover is there before the window is first drawn
         self.set_panic_hotkey(self.settings.get("panic_hotkey", False), quiet=True)
         # Nobody sees presence while AltVault is minimised, so it pauses then and catches up on restore.
         self.presence_stale = False
@@ -5791,6 +5834,10 @@ class App:
         self.toast("Settings restored", f"{count} settings restored. Colours apply the next time you open AltVault.")
 
     def show_page(self, key):
+        if getattr(self, "web", None):   # the new interface draws every page
+            self.web.post({"type": "show", "page": key})
+            self.show_web_page(key)
+            return
         if key == self.page:
             return
         old = self.pages.get(self.page)
@@ -5995,6 +6042,8 @@ class App:
         return sorted({g for g in map(self.group_of, self.accounts) if g}, key=str.lower)
 
     def refresh(self):
+        if getattr(self, "web", None):
+            self.root.after_idle(self.push_web_state)
         selection = self.tree.selection()
         self.tree.delete(*self.tree.get_children())
         query = self.search_var.get().strip().lower()
@@ -6238,7 +6287,9 @@ class App:
         if self.presence_stale:
             self.presence_stale = False
             self.refresh_presence(reschedule=False)
-        if self.page == "live":
+        if self.web:   # page updates stop while minimised; catch up now
+            self.show_web_page(self.web_page)
+        elif self.page == "live":
             self.pages["live"].resume()
 
     def refresh_presence(self, reschedule=True):
@@ -6792,6 +6843,429 @@ class App:
             else:   # not retried every tick; a new window or AltVault restart tries again
                 self.saving_refused.add(pid)
                 log.warning("Windows refused to change the priority of a Roblox window (process %s)", pid)
+
+    # ------------------------------------------------------------ the new interface (WebView2)
+    # The Accounts page is drawn as a local web page in Microsoft's WebView2 (see webview2.py and
+    # ui/). It covers the window while Accounts is shown; pages not rebuilt yet are the classic ones.
+    def start_web(self):
+        try:
+            import webview2
+            self.web_host = tk.Frame(self.root, bg="#151516")
+            self.web_host.place(x=0, y=0, relwidth=1, relheight=1)
+            self.root.update_idletasks()
+            self.web = webview2.WebView(self.web_host.winfo_id(), UI_DIR, os.path.join(APP_DIR, "webview"),
+                                        self.on_web_message, self.web_ready,
+                                        extra_hosts={"avatars.altvault.example": AVATAR_DIR, "icons.altvault.example": ICON_DIR})
+            self.web_host.bind("<Configure>", lambda e: self.web and self.web.resize(e.width, e.height))
+            self.root.bind("<Configure>", lambda e: self.web and e.widget is self.root and self.web.moved(), add="+")
+        except (ImportError, OSError, AttributeError) as e:
+            log.warning("The new interface couldn't start (%s); using the classic one", e)
+            self.web = None
+            if getattr(self, "web_host", None):
+                self.web_host.destroy()
+                self.web_host = None
+
+    def web_ready(self):
+        self.web_sent.clear()   # a fresh page has nothing yet
+        log.info("New interface ready, %.2f s after start", time.monotonic() - STARTED)
+        self.push_web_state()
+        self.web.post({"type": "show", "page": self.web_page})
+        self.show_web_page(self.web_page)
+
+    def web_state(self):
+        main = main_account(self.settings)
+        accounts = []
+        for a in self.accounts:
+            p = self.presence.get(a["id"]) or {}
+            kind = p.get("userPresenceType")
+            running = a["id"] in self.running.values()
+            if a["id"] in self.expired:
+                status, css = "Login expired", "problem"
+            elif kind == 2:
+                status, css = "In game" if running else "In game (other device)", "ingame"
+            elif running:
+                status, css = "Joining...", "joining"
+            else:
+                status, css = {1: ("Online", ""), 3: ("In Studio", ""), 0: ("Offline", "offline")}.get(kind, ("—", "offline"))
+            rules = mode_rules(self.settings, a["id"])
+            cap = self.fps_cap_of(a) or rules.get("fps")
+            perf = [f"{cap} FPS"] if cap else []
+            if a["id"] in self.flagged("low_graphics") or rules.get("low_graphics"):
+                perf.append("low graphics")
+            if a["id"] in self.flagged("muted") or rules.get("muted"):
+                perf.append("muted")
+            shot = f"{a['id']}_{self.avatar_px}.png"
+            stream = self.stream_var.get()
+            accounts.append({"id": a["id"], "name": "hidden" if stream else a["name"],
+                             "display": self.who(a) if stream else a.get("displayName") or a["name"],
+                             "group": self.group_of(a), "note": a.get("note", ""), "main": a["id"] == main,
+                             "status": status, "kind": css,
+                             "game": clean_name(p.get("lastLocation")) if kind == 2 else "",
+                             "perf": "Full quality" if a["id"] == main else " · ".join(perf),
+                             "shot": "" if stream or not os.path.exists(os.path.join(AVATAR_DIR, shot))
+                             else f"https://avatars.altvault.example/{shot}"})
+        ingame = sum(1 for acc_id in self.running.values() if (self.presence.get(acc_id) or {}).get("userPresenceType") == 2)
+        return {"type": "state", "accounts": accounts, "mode": mode_of(self.settings), "open": len(self.running),
+                "ingame": ingame, "afk": self.anti_afk_var.get(), "joining": self.joining,
+                "place": self.place_var.get(), "note": self.status.cget("text")}
+
+    WEB_REFRESH = {"home": 3000, "live": 2000, "pulse": 2000, "stats": 60_000, "doctor": 30_000}   # ms, while shown
+
+    def web_page_data(self, page):
+        """What a page draws, as plain numbers and text. Logins, links and window titles of other
+        apps never go to the page."""
+        tone = {C["red"]: "bad", C["yellow"]: "warn", C["green"]: "ok"}
+        gb = 2 ** 30
+        if page == "home":
+            home = self.pages["home"]
+            saved, open_now = len(self.accounts), len(self.running)
+            ingame = sum(1 for a in self.running.values() if (self.presence.get(a) or {}).get("userPresenceType") == 2)
+            bad = len(self.expired)
+            on = self.anti_afk_var.get()
+            free, total = memory_status()
+            used = 1 - free / total if total else 0.0
+            steps = home.steps()
+            return {"sub": f"{saved} account{'s' if saved != 1 else ''} saved · {open_now} open · {ingame} in a game",
+                    "cards": [{"title": "Accounts", "value": str(saved), "sub": f"{bad} need logging in" if bad else "all logged in", "subTone": "bad" if bad else ""},
+                              {"title": "In a game", "value": f"{ingame} / {open_now}", "sub": "windows in a game", "tone": "ok" if open_now and ingame == open_now else ""},
+                              {"title": "Anti-AFK", "value": "On" if on else "Off", "sub": f"keeping {len(self.afk_last)} window(s) active" if on else "accounts can be idle-kicked",
+                               "tone": "ok" if on else "warn" if open_now else ""},
+                              {"title": "Memory", "value": f"{used:.0%}", "sub": f"{free / gb:.1f} of {total / gb:.0f} GB free",
+                               "tone": "bad" if used >= MEMORY_ALERT else "warn" if used >= AFK_PRESSURE else ""}],
+                    "steps": [{"done": d, "text": t} for d, t, _ in steps] if steps else None,
+                    "attention": [{"tone": tone.get(c, "ok"), "text": t, "target": p or ""} for c, t, p in home.attention()],
+                    "activity": [{"time": time.strftime("%H:%M", time.localtime(created)), "warn": level >= logging.WARNING,
+                                  "text": message.removeprefix("Anti-AFK: ").strip() if level < logging.WARNING else message}
+                                 for created, level, message in list(ACTIVITY.items)[:30]]}
+        if page == "profiles":
+            out = []
+            for i, p in enumerate(self.pages["profiles"].profiles()):
+                names = [self.who(a) for a in map(self.account, p["accounts"]) if a]
+                out.append({"index": i, "name": p["name"], "accounts": f"{len(names)} · " + ", ".join(names) if names else "none left",
+                            "game": clean_name(p.get("place_name")) or f"Place {p.get('place')}"})
+            return {"profiles": out}
+        if page == "games":
+            games = self.pages["games"].games()
+            missing = [g[0] for g in games if not os.path.exists(os.path.join(ICON_DIR, f"{g[0]}.png"))]
+            if missing:
+                self.pages["games"].load_icons(missing)   # fetched in the background, shown next time
+            return {"games": [{"id": place, "name": name, "starred": starred,
+                               "icon": f"https://icons.altvault.example/{place}.png" if place not in missing else ""}
+                              for place, name, starred in games]}
+        if page == "live":
+            windows = roblox_windows()
+            reading = measure(windows, self.web_pc, self.web_rbx)
+            order = {a["id"]: i for i, a in enumerate(self.accounts)}
+            tiles, ingame = [], 0
+            for hwnd, pid, title in sorted(windows, key=lambda w: order.get(self.running.get(w[1]), len(order))):
+                color, name = self.live_state(hwnd, pid, title)
+                ingame += color == "green"
+                usage = process_usage(pid)
+                frozen, small = color == "red", _user32.IsIconic(hwnd)
+                tiles.append({"hwnd": int(hwnd), "name": name, "usage": f"{usage[1] / 2 ** 20:,.0f} MB" if usage and usage[1] else "",
+                              "tone": {"green": "ok", "yellow": "warn", "red": "bad", "lost": "bad"}.get(color, "off"),
+                              "note": "Minimised: click to restore" if small else "Not responding" if frozen else ""})
+            n, cpu, ram = len(tiles), reading["rbx_cpu"], reading["rbx_bytes"]
+            cpu_text = "…" if cpu is None else f"{cpu:.0f}%"
+            ram_text = "—" if ram is None else f"{ram / gb:.1f} GB"
+            return {"windows": tiles, "cols": 1 if n <= 1 else 2 if n <= 4 else 3 if n <= 9 else 4,
+                    "allMin": bool(windows) and all(_user32.IsIconic(h) for h, _, _ in windows),
+                    "sub": f"{ingame} of {n} in a game · Roblox {cpu_text} CPU, {ram_text} · {reading['free'] / gb:.1f} GB free"
+                    if n else "Your Roblox windows, live."}
+        if page in ("stats", "pulse"):
+            h, key = self.history, self.web_ranges[page]
+            if page == "stats":
+                hours = RANGE_HOURS[key]
+                span = "24 hours" if hours == 24 else "7 days"
+                total = lambda f: h.total(f, hours)
+                ingame = percent_of(total("ingame"), total("open"))
+                ok, failed = total("launch_ok"), total("launch_fail")
+                rate = percent_of(ok, ok + failed)
+                closed, lost, moved = total("closed"), total("lost"), total("moved")
+                return {"range": key, "ends": [f"{span} ago", "now"], "labels": hour_labels(hours),
+                        "cards": [{"title": "Time in a game", "value": "—" if ingame is None else f"{ingame:.1f}%", "sub": f"of the time Roblox was open, last {span}",
+                                   "tone": "" if ingame is None else "ok" if ingame >= 95 else "warn" if ingame >= 80 else "bad"},
+                                  {"title": "Launches that worked", "value": "—" if rate is None else f"{rate:.1f}%", "sub": f"{ok + failed:g} launches, {failed:g} failed"},
+                                  {"title": "Anti-AFK pings", "value": short_number(total("pings")), "sub": f"{total('missed'):g} missed and retried"},
+                                  {"title": "Closed outside AltVault", "value": f"{closed:g}", "tone": "bad" if closed else "",
+                                   "sub": "crashes, kicks or closed by hand" + (f"\n{lost:g} dropped out · {moved:g} moved server" if lost or moved else "")}],
+                        "open": h.series("open", hours, per="open_n"), "ingame": h.series("ingame", hours, per="ingame_n"),
+                        "pings": h.series("pings", hours), "missed": h.series("missed", hours)}
+            sample = measure(roblox_windows(), self.web_pc, self.web_rbx)
+            fmt = lambda v: "…" if v is None else f"{v:.0f}%"
+            n, ram = sample["windows"], sample["rbx_bytes"]
+            free, total = sample["free"], sample["total"]
+            data = {"range": key, "cards": [
+                {"title": "PC CPU", "value": fmt(sample["pc_cpu"]), "sub": f"{os.cpu_count() or 1} logical processors"},
+                {"title": "PC memory", "value": fmt(sample["pc_ram"]), "sub": f"{(total - free) / gb:.1f} of {total / gb:.0f} GB in use",
+                 "tone": "bad" if free < 0.1 * total else "warn" if free < 0.25 * total else ""},
+                {"title": "Roblox CPU", "value": fmt(sample["rbx_cpu"]) if n else "—", "sub": f"{n} window{'s' if n != 1 else ''}"},
+                {"title": "Roblox memory", "value": "—" if ram is None or not n else f"{ram / gb:.1f} GB", "sub": f"{ram / n / 2 ** 20:,.0f} MB per window" if ram and n else ""}]}
+            if key == "hour":
+                now = time.time()
+                slots = {round((now - t) / 60): s for t, s in self.recent}
+                points = [slots.get(m) for m in range(59, -1, -1)]
+                pick = lambda f: [p[f] if p else None for p in points]
+                data.update(ends=["60 min ago", "now"], **{f: pick(f) for f in ("pc_cpu", "rbx_cpu", "pc_ram", "rbx_ram")})
+            else:
+                hours = RANGE_HOURS[key]
+                data.update(ends=["24 hours ago" if key == "day" else "7 days ago", "now"],
+                            **{f: h.series(f, hours, per=f + "_n") for f in ("pc_cpu", "rbx_cpu", "pc_ram", "rbx_ram")})
+            return data
+        if page == "doctor":
+            doctor, items = self.doctor, self.doctor.items
+            dropped = doctor.count(("exit", "login", "lost", "crash"))
+            idle = sum(1 for i in items if i.get("code") == 278 and i["t"] >= time.time() - 86400)
+            logins, moved = doctor.count(("login",)), doctor.count(("moved",))
+            page_obj, out = self.pages["doctor"], []
+            for n, item in enumerate(items):
+                title, why, fix, action, color = explain(item)
+                if action == "login" and not self.account(item.get("id")):
+                    action = None
+                out.append({"key": f"{item['t']}-{item['kind']}-{item.get('id')}-{n}", "when": time.strftime("%d %b %H:%M", time.localtime(item["t"])),
+                            "who": page_obj.who(item), "title": title, "why": why, "fix": fix,
+                            "action": page_obj.ACTIONS.get(action) if action else "", "tone": {"red": "bad", "yellow": "warn", "green": "ok"}.get(color, "")})
+            return {"chosen": self.web_doctor_pick, "items": out, "cards": [
+                {"title": "Dropped, 24 hours", "value": str(dropped), "sub": "all clear" if not dropped else "see the list below", "tone": "bad" if dropped else "ok"},
+                {"title": "Idle kicks", "value": str(idle), "sub": "last 24 hours", "tone": "bad" if idle else ""},
+                {"title": "Login problems", "value": str(logins), "sub": "last 24 hours", "tone": "bad" if logins else ""},
+                {"title": "Server moves", "value": str(moved), "sub": "last 24 hours", "tone": "warn" if moved else ""}]}
+        if page == "settings":
+            s = self.settings
+            main = main_account(s)
+            return {"tab": self.web_settings_tab, "version": APP_VERSION, "panicKey": PANIC_HOTKEY,
+                    "webhook": "A webhook is saved. Alerts go to Discord." if self.webhook else "No webhook saved.",
+                    "delays": [[d, "No wait" if not d else f"{d} seconds"] for d in LAUNCH_DELAYS],
+                    "mains": [["", "None"]] + [[str(a["id"]), self.who(a)] for a in self.accounts],
+                    "keys": [[k, k.upper() if len(k) > 1 else k] for k in ["f13", "space"] + list("abcdefghijklmnopqrstuvwxyz")],
+                    "values": {"multi": self.multi_var.get(), "same_server": self.same_server_var.get(), "auto_tile": self.auto_tile_var.get(),
+                               "anti_afk": self.anti_afk_var.get(), "stream_mode": self.stream_var.get(), "hide_taskbar": self.hide_taskbar_var.get(),
+                               "launch_delay": s.get("launch_delay", 0), "mode": mode_of(s), "main_account": "" if main is None else str(main),
+                               "afk_key": str(s.get("afk_key", AFK_DEFAULT_KEY)).lower(),
+                               **{k: s.get(k, default) is not False for k, default in (("launch_memory_wait", True), ("lighter_rendering", True),
+                                                                                       ("clean_logs", True), ("update_check", True), ("panic_hotkey", False))}},
+                    "text": WEB_SETTING_TEXT}
+        return None
+
+    def push_page(self, page=None):
+        page = page or self.web_page
+        if self.web and page != "accounts":
+            try:
+                data = self.web_page_data(page)
+                message = {"type": "page", "page": page, "data": data}
+                if data is not None and message != self.web_sent.get(page):   # unchanged: the page needn't redraw
+                    self.web_sent[page] = message
+                    self.web.post(message)
+            except OSError as e:
+                log.warning("Couldn't update the %s page: %s", page, e)
+
+    def web_tick(self):
+        """Keeps the open page current, at that page's pace, and only while AltVault is on screen."""
+        self.web_job = None
+        if not self.web or self.root.state() in ("iconic", "withdrawn"):
+            return
+        self.push_page()
+        every = self.WEB_REFRESH.get(self.web_page)
+        if every:
+            self.web_job = self.root.after(every, self.web_tick)
+
+    def show_web_page(self, page):
+        if page != "live":
+            self.release_web_thumbs()
+        self.web_page = page
+        if self.web_job:
+            self.root.after_cancel(self.web_job)
+        self.web_tick()
+
+    def place_web_thumbs(self, tiles):
+        """Puts each Roblox window's live preview (drawn by Windows, like a taskbar preview) over its
+        tile on the Live page. Minimised and frozen windows have no fresh picture, so they get none."""
+        if self.web_page != "live":
+            return
+        alive = {hwnd for hwnd, _, _ in roblox_windows()}
+        dest = _user32.GetParent(self.root.winfo_id())
+        ox, oy = client_origin(dest)
+        hx, hy = self.web_host.winfo_rootx() - ox, self.web_host.winfo_rooty() - oy
+        wanted = {}
+        for t in tiles:
+            hwnd = t.get("hwnd")
+            if hwnd in alive and not _user32.IsIconic(hwnd) and all(isinstance(t.get(k), int) for k in "xywh"):
+                wanted[hwnd] = fit_rect(*client_size(hwnd), hx + t["x"], hy + t["y"], t["w"], t["h"])
+        for hwnd in set(self.web_thumbs) - set(wanted):
+            unregister_thumbnail(self.web_thumbs.pop(hwnd))
+        for hwnd, rect in wanted.items():
+            if hwnd not in self.web_thumbs:
+                thumb = register_thumbnail(dest, hwnd)
+                if not thumb:
+                    continue
+                self.web_thumbs[hwnd] = thumb
+            place_thumbnail(self.web_thumbs[hwnd], rect)
+
+    def release_web_thumbs(self):
+        for thumb in self.web_thumbs.values():
+            unregister_thumbnail(thumb)
+        self.web_thumbs.clear()
+
+    def web_set(self, key, value):
+        """A setting changed on the Settings page."""
+        s = self.settings
+        tk_vars = {"multi": (self.multi_var, self.toggle_multi), "same_server": (self.same_server_var, self.save_settings),
+                   "auto_tile": (self.auto_tile_var, self.save_settings), "anti_afk": (self.anti_afk_var, self.toggle_anti_afk),
+                   "stream_mode": (self.stream_var, self.toggle_stream), "hide_taskbar": (self.hide_taskbar_var, self.toggle_taskbar)}
+        if key in tk_vars and isinstance(value, bool):
+            var, apply = tk_vars[key]
+            var.set(value)
+            apply()
+        elif key in ("launch_memory_wait", "lighter_rendering", "clean_logs", "update_check", "panic_hotkey") and isinstance(value, bool):
+            s[key] = value
+            save_settings(s)
+            if key == "panic_hotkey":
+                self.set_panic_hotkey(value)
+        elif key == "launch_delay" and str(value).isdigit() and int(value) in LAUNCH_DELAYS:
+            s[key] = int(value)
+            save_settings(s)
+        elif key == "mode" and value in MODES:
+            self.set_mode(value)
+        elif key == "main_account":
+            self.set_main(self.account(int(value)) if str(value).isdigit() else None)
+        elif key == "afk_key" and (value in ("f13", "space") or (len(str(value)) == 1 and str(value).isalpha())):
+            s[key] = str(value).lower()
+            save_settings(s)
+
+    def web_do(self, name, msg):
+        """A button on one of the new pages."""
+        def place():
+            p = str(msg.get("place", ""))
+            return p if p.isdigit() else None
+        def hwnd():
+            h = int(msg["hwnd"]) if str(msg.get("hwnd", "")).isdigit() else None
+            return h if h in {w for w, _, _ in roblox_windows()} else None   # only ever a Roblox window
+        profiles = self.pages["profiles"]
+        index = int(msg["index"]) if str(msg.get("index", "")).isdigit() else None
+        if name == "add":
+            AddAccountDialog(self)
+        elif name == "goto" and msg.get("target") in self.pages:
+            self.show_page(msg["target"])
+        elif name == "open":
+            if msg.get("target") == "update" and self.update_available:
+                webbrowser.open(self.update_available[1])
+            elif msg.get("target") in self.pages:
+                self.show_page(msg["target"])
+        elif name == "tile":
+            self.tile()
+        elif name == "minimize":
+            self.minimize_all()
+        elif name == "close-all":
+            self.close_all()
+        elif name == "show-window" and hwnd():
+            focus_window(hwnd())
+        elif name == "close-window" and hwnd():
+            h = hwnd()
+            pid = next(p for w, p, _ in roblox_windows() if w == h)
+            if ask_yes_no("Close Roblox", "Close this Roblox window?", parent=self.root, yes="Close", danger=True):
+                self.close_windows([pid])
+        elif name == "seg" and msg.get("seg") == "tab" and msg.get("value") in ("general", "modes", "afk", "alerts", "privacy", "data"):
+            self.web_settings_tab = msg["value"]
+        elif name == "seg" and msg.get("seg") == "range" and msg.get("page") in self.web_ranges:
+            if msg.get("value") in (("hour",) if msg["page"] == "pulse" else ()) + tuple(RANGE_HOURS):
+                self.web_ranges[msg["page"]] = msg["value"]
+        elif name == "set":
+            self.web_set(msg.get("key"), msg.get("value"))
+        elif name == "new-profile":
+            profiles.edit(None)
+        elif name in ("launch-profile", "edit-profile", "delete-profile") and index is not None and index < len(profiles.profiles()):
+            if name == "launch-profile":
+                self.launch_profile(profiles.profiles()[index])
+            elif name == "edit-profile":
+                profiles.edit(str(index))
+            else:
+                profiles.tree.selection_set(str(index))
+                profiles.delete()
+        elif name == "pick-game" and place():
+            self.place_var.set(f"{self.pages['games'].name_of(place())}  ({place()})")
+            self.job_var.set("")
+            self.show_page("accounts")
+        elif name == "servers" and place():
+            ServerBrowser(self, place())
+        elif name == "open-game" and place():
+            webbrowser.open(f"https://www.roblox.com/games/{int(place())}")
+        elif name in ("star", "remove-game") and place():
+            games = self.pages["games"]
+            games.tree.selection_set(place()) if games.tree.exists(place()) else None
+            (games.toggle_star if name == "star" else games.remove)()
+        elif name == "add-game":
+            self.pages["games"].add_var.set(str(msg.get("text", ""))[:300])
+            self.pages["games"].add_game()
+        elif name == "doctor-pick":
+            self.web_doctor_pick = str(msg.get("key", ""))[:100]
+        elif name == "doctor-act":
+            data = self.web_page_data("doctor")
+            n = next((i for i, item in enumerate(data["items"]) if item["key"] == msg.get("key")), None)
+            if n is not None:
+                doctor = self.pages["doctor"]
+                doctor.current = self.doctor.items[n]
+                doctor.action_key = explain(doctor.current)[3]
+                doctor.act()
+        elif name == "doctor-clear":
+            self.pages["doctor"].clear()
+        elif name == "webhook-save":
+            error = self.set_webhook(str(msg.get("url", "")))
+            self.toast("Discord alerts", error or "Webhook saved. Send a test to check it.", warning=bool(error))
+        elif name == "webhook-test":
+            self.test_webhook(lambda ok: self.toast("Discord alerts", "Sent. Check your Discord channel." if ok
+                                                    else "Discord didn't accept it. Check the link, or make a new webhook.", warning=not ok))
+        elif name == "webhook-remove":
+            self.set_webhook(None)
+        else:
+            {"forget-link": self.forget_private_link, "export-accounts": self.export_accounts, "import-accounts": self.import_accounts,
+             "backup": self.export_settings, "restore": self.import_settings, "github": lambda: webbrowser.open(GITHUB_URL),
+             "log-folder": lambda: os.startfile(APP_DIR), "check-updates": lambda: self.check_updates(tell=True),
+             "diagnostics": self.copy_diagnostics}.get(name, lambda: None)()
+
+    def push_web_state(self, **extra):
+        if self.web:
+            try:
+                self.web.post({**self.web_state(), **extra})
+            except OSError as e:
+                log.warning("Couldn't update the new interface: %s", e)
+
+    def on_web_message(self, msg):
+        kind = msg.get("type")
+        if kind == "page" and msg.get("page") in self.pages:
+            self.show_web_page(msg["page"])
+            return
+        if kind == "tiles" and isinstance(msg.get("tiles"), list):
+            self.place_web_thumbs(msg["tiles"][:64])
+            return
+        if kind == "do" and isinstance(msg.get("name"), str):
+            self.web_do(msg["name"], msg)
+            self.push_page()
+        elif kind == "mode" and msg.get("value") in MODES:
+            self.set_mode(msg["value"])
+        elif kind == "action":
+            if msg.get("name") in ("add", "import"):   # the add dialog also imports from Roblox Account Manager
+                AddAccountDialog(self)
+        elif kind in ("join", "menu"):
+            ids = [str(i) for i in msg.get("ids", []) if isinstance(i, int) and self.tree.exists(str(i))]
+            self.tree.selection_set(ids)
+            sel = self.selected_accounts()
+            if kind == "join":
+                self.place_var.set(str(msg.get("place", ""))[:500])
+                self.job_var.set(str(msg.get("job", ""))[:100])
+                self.join_selected()
+            elif sel and msg.get("item") == "join":
+                self.join_selected()
+            elif sel and msg.get("item") == "main" and len(sel) == 1:
+                self.set_main(None if sel[0]["id"] == main_account(self.settings) else sel[0])
+            elif sel and msg.get("item") in ("low", "mute"):
+                key = "low_graphics" if msg["item"] == "low" else "muted"
+                on = not all(a["id"] in self.flagged(key) for a in sel)
+                self.set_flag(key, sel, on, "lowest graphics" if key == "low_graphics" else "mute")
+            elif sel and msg.get("item") == "login" and len(sel) == 1:
+                AddAccountDialog(self, sel[0])
+            elif sel and msg.get("item") == "remove":
+                self.remove_selected()
+        self.push_web_state()
 
     # ------------------------------------------------------------ windows, hotkey and upkeep
     def minimize_all(self):
@@ -7599,6 +8073,9 @@ class App:
             self.root.destroy()
             return
         self.root.withdraw()
+        if self.web:   # in the tray nobody sees the page: stop drawing it and hand memory back
+            self.release_web_thumbs()
+            self.web.set_hidden(True)
         if not self.settings.get("tray_hint_shown"):
             self.tray.notify("AltVault is still running",
                              "Anti-AFK and your accounts keep working. Click the tray icon to open AltVault, "
@@ -7608,6 +8085,10 @@ class App:
 
     def show_from_tray(self):
         self.root.deiconify()
+        if self.web:
+            self.web.set_hidden(False)
+            self.push_web_state()
+            self.show_web_page(self.web_page)
         self.root.lift()
         self.root.focus_force()
 
@@ -7625,6 +8106,8 @@ class App:
                 set_on_taskbar(hwnd, True)
         if self.hotkey:
             self.hotkey.stop()
+        if self.web:
+            self.web.close()
         if self.tray:
             self.tray.remove()
         self.root.destroy()
