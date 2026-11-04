@@ -616,6 +616,12 @@ class TestJoinExtras(unittest.TestCase):
         self.assertEqual(waits, [2, 2])
         self.assertIn("95% used", statuses[0])
 
+    def test_launches_soon_when_memory_isnt_freeing_up(self):
+        waits = []
+        ok, _ = self.pause({}, [0.97] * 30, waits)
+        self.assertTrue(ok)
+        self.assertEqual(waits, [2] * av.LAUNCH_MEMORY_STUCK, "a PC that's just full with alts isn't kept waiting")
+
     def test_gap_between_launches_uses_allowed_values_only(self):
         waits = []
         self.pause({"launch_delay": 10, "launch_memory_wait": False}, [], waits)

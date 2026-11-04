@@ -216,7 +216,7 @@ To check an FPS cap, press **Shift+F5** in that Roblox window to show its frame 
 ## Joining many accounts
 
 - With **Put accounts in the same server** on (Settings > General), AltVault looks for a public server with room for everyone and sends every account straight there. If there's none, the others follow the first account into its server.
-- **Wait between launches** gives each client time to load before the next starts. **Wait for free memory** holds the next launch for up to a minute while memory is over 90% full.
+- **Wait between launches** gives each client time to load before the next starts. **Wait for free memory** holds the next launch for a few seconds (20 at most) while memory is over 90% full and still freeing up; a PC that is simply full with alts launches straight on.
 - While a join runs, the Join button reads **Joining... (stop)**: click it to stop after the account that's starting. The accounts that didn't start are selected afterwards, so Join tries them again.
 
 ## Lighter rendering

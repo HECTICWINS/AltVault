@@ -10,7 +10,7 @@ Every release on the [Releases](../../releases) page is built by GitHub from the
 - **Main account:** the account you play on keeps your own Roblox settings and normal priority in every mode. Right-click it on the Accounts page and choose **Main account**, or pick it in **Settings > Modes**.
 - **A server with room for everyone:** with Put accounts in the same server on, every account goes straight to a public server with space for all of them, instead of waiting for the first to arrive.
 - **Stop and retry:** the Join button stops a running join, and accounts that didn't start are selected afterwards so Join tries them again.
-- **Gentler launching:** an optional gap between launches, and a wait of up to a minute while memory is over 90% full.
+- **Gentler launching:** an optional gap between launches, and a short wait (20 seconds at most) while memory is over 90% full and still freeing up. A PC that is simply full with alts is not kept waiting.
 - **Lighter rendering:** alts on lowest graphics also get the lowest textures, no anti-aliasing, a grey sky and no grass, through Roblox's allowed rendering flags. Your own flags file is always put back.
 - **Minimise all** (Ctrl+M) and Restore all, on the Live page next to Tile.
 - **Discord alerts:** Settings > Alerts sends disconnects, expired logins, crashes and low memory to your own Discord webhook.

@@ -54,8 +54,8 @@ WEB_SETTING_TEXT = {
                    "If there's none, the others follow the first account.",
     "auto_tile": "Splits the screen evenly between every Roblox window, like the Tile button.",
     "launch_delay": "A gap gives each client time to load before the next one starts. While a join runs, the Join button stops it.",
-    "launch_memory_wait": "If memory is over 90% full, the next client waits up to a minute for it to free up, so the ones "
-                          "already running don't stall.",
+    "launch_memory_wait": "If memory is over 90% full and freeing up, the next client waits a little (20 seconds at most) "
+                          "so the ones already running don't stall. If it isn't freeing up, it launches straight away.",
     "modes": "Normal: your own Roblox settings. Grind: alts at 15 FPS, lowest graphics, muted, in Windows' efficiency mode. "
              "Max alts: like Grind at 10 FPS, and Windows moves alts out of memory first when it runs short.",
     "main": "The account you play on. It keeps your own Roblox settings and normal priority in every mode.",
@@ -118,7 +118,8 @@ LOST_AFTER = 300                 # seconds a window may sit out of its game befo
 HIDDEN_PRESENCE_EVERY = 6        # while hidden in the tray, check presence every 6th time (3 min) if windows are open
 MEMORY_ALERT = 0.92              # memory this full for 3 readings in a row, with several Roblox windows: warn
 LAUNCH_MEMORY = 0.90             # memory this full: wait before starting the next Roblox client...
-LAUNCH_MEMORY_WAIT = 60          # ...for up to this many seconds, then launch anyway
+LAUNCH_MEMORY_WAIT = 20          # ...for up to this many seconds, then launch anyway
+LAUNCH_MEMORY_STUCK = 3          # ...or sooner, after this many checks (2 s apart) in which it didn't free up
 LAUNCH_DELAYS = (0, 5, 10, 20, 30)   # seconds between launches the user can choose
 ROBLOX_LOG_DAYS = 3              # Roblox's own log files older than this are deleted once a day
 WEBHOOK_PER_HOUR = 20            # Discord alerts sent at most this often, so a bad night can't spam
@@ -3354,8 +3355,8 @@ class SettingsPage(ttk.Frame):
         detail(tab, "A gap gives each client time to load before the next one starts. While a join runs, the "
                "Join button stops it.", indent=0)
         setting(tab, "launch_memory_wait", True, "Wait for free memory before each launch",
-                f"If memory is over {LAUNCH_MEMORY:.0%} full, the next client waits up to a minute for it to free up, "
-                "so the ones already running don't stall.")
+                f"If memory is over {LAUNCH_MEMORY:.0%} full and freeing up, the next client waits a little "
+                "(20 seconds at most) so the ones already running don't stall.")
 
         tab = self.tabs["modes"]
         section(tab, "Mode", first=True)
@@ -8066,11 +8067,20 @@ class App:
         if delay in LAUNCH_DELAYS and delay and self.join_cancel.wait(delay):
             return False
         if self.settings.get("launch_memory_wait", True):
+            # A PC that's simply full with alts stays full, and waiting only slows the join, so the
+            # wait goes on only while memory is actually freeing up (a client still settling).
             deadline = time.monotonic() + LAUNCH_MEMORY_WAIT
-            while (used := memory_used_fraction()) >= LAUNCH_MEMORY and time.monotonic() < deadline:
+            best = used = memory_used_fraction()
+            stuck = 0
+            while used >= LAUNCH_MEMORY and time.monotonic() < deadline and stuck < LAUNCH_MEMORY_STUCK:
                 self.set_status(f"Waiting for memory to free up ({used:.0%} used)...")
                 if self.join_cancel.wait(2):
                     return False
+                used = memory_used_fraction()
+                if used < best - 0.01:
+                    best, stuck = used, 0
+                else:
+                    stuck += 1
         return not self.join_cancel.is_set()
 
     def wait_for_new_window(self, before):
