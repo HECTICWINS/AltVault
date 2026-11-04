@@ -2,21 +2,22 @@
 
 Every release on the [Releases](../../releases) page is built by GitHub from the tagged commit, comes with a build attestation, and is scanned by VirusTotal. See [Verify your download](README.md#verify-your-download).
 
-## Unreleased
+## 3.0.0
 
 - **Free for everyone:** no access key any more. Download, unzip and run.
 - **A new, plainer look:** every page is redrawn in Microsoft's WebView2: a sidebar, a dense account table, plain status words and a one-line status bar. Windows draws the Live page's previews itself, so they still cost almost nothing. The window opens in under a second, and while it's hidden in the tray the page stops drawing and hands memory back.
 - **Modes:** **Normal**, **Grind** and **Max alts**, one click at the top of Home. Grind runs every alt at 15 FPS, lowest graphics and muted, in Windows' efficiency mode; Max alts goes to 10 FPS and lets Windows move alts out of memory first when it runs short.
-- **Main account:** the account you play on keeps your own Roblox settings and normal priority in every mode. Right-click it, **Performance > Main account**, or pick it in **Settings > Modes**.
+- **Main account:** the account you play on keeps your own Roblox settings and normal priority in every mode. Right-click it on the Accounts page and choose **Main account**, or pick it in **Settings > Modes**.
 - **A server with room for everyone:** with Put accounts in the same server on, every account goes straight to a public server with space for all of them, instead of waiting for the first to arrive.
 - **Stop and retry:** the Join button stops a running join, and accounts that didn't start are selected afterwards so Join tries them again.
 - **Gentler launching:** an optional gap between launches, and a wait of up to a minute while memory is over 90% full.
 - **Lighter rendering:** alts on lowest graphics also get the lowest textures, no anti-aliasing, a grey sky and no grass, through Roblox's allowed rendering flags. Your own flags file is always put back.
-- **Minimise all** (Ctrl+M) and Restore all, next to Tile.
+- **Minimise all** (Ctrl+M) and Restore all, on the Live page next to Tile.
 - **Discord alerts:** Settings > Alerts sends disconnects, expired logins, crashes and low memory to your own Discord webhook.
 - **Panic hotkey:** Ctrl+Alt+End closes every Roblox window from any app (off by default).
 - **Upkeep:** Roblox logs older than 3 days are deleted once a day, and AltVault tells you when a newer version is out (it never installs anything by itself).
 - **Copy diagnostics** in Settings > Data, for bug reports, with no logins, links or usernames.
+- Dialogs (Add account, Edit profile, Servers, export and import, confirmations) and the notes in the corner match the new look.
 - The low-memory warning suggests Max alts mode.
 - Fixed a harmless error in the log when a background check finished just after AltVault closed.
 

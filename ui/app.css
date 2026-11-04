@@ -116,6 +116,7 @@ p { margin: 4px 0; }
 h2 { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
 h3 { margin: 12px 0 2px; font-size: 13px; font-weight: 600; color: var(--sub); }
 .settings h2, .panel.detail h2 { margin-top: 18px; }
+.settings h2 { margin: 30px 0 6px; font-size: 15px; }
 .settings h2:first-child, .panel h2:first-child { margin-top: 0; }
 .line-item { display: flex; align-items: flex-start; gap: 10px; width: 100%; padding: 5px 0; border: 0; background: none; text-align: left; min-width: 0; }
 .line-item.link:hover span:last-child { text-decoration: underline; }
@@ -167,12 +168,16 @@ button.row.plain.sel { background: var(--sel); }
 .tile .x:hover { background: var(--active); color: var(--red); }
 .tile-body { flex: 1; min-height: 0; border: 0; background: #111112; display: grid; place-items: center; }
 
-.settings { flex: 1; min-height: 0; overflow-y: auto; max-width: 760px; padding-bottom: 16px; }
-.option { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0; }
+.settings { flex: 1; min-height: 0; overflow-y: auto; max-width: 820px; padding: 0 8px 24px 0; }
+.settings .sub { line-height: 1.5; margin: 0 0 4px; }
+.settings .toolbar { margin: 12px 0 8px; gap: 10px; }
+.settings .btn-row { margin-top: 12px; gap: 10px; }
+.option { display: flex; align-items: flex-start; gap: 12px; padding: 12px 0; }
 .option b { display: block; font-weight: 500; }
-.option small { display: block; color: var(--sub); font-size: 12px; margin-top: 1px; }
+.option small { display: block; color: var(--sub); font-size: 12px; line-height: 1.5; margin-top: 3px; }
 .option > span { flex: 1; min-width: 0; }
 .option input[type=checkbox] { margin-top: 3px; flex: none; }
+.option > span + select { margin-left: 24px; }
 .option select { height: 30px; min-width: 170px; padding: 0 8px; border: 1px solid var(--field-line); border-radius: 5px; background: var(--field); }
 @media (max-width: 1000px) { .split { grid-template-columns: 1fr; grid-template-rows: auto 1fr; } }
 

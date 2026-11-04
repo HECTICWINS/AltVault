@@ -742,7 +742,7 @@ class TestUpkeep(unittest.TestCase):
         with mock.patch.object(av, "_request", reply(404, {})):
             self.assertIsNone(av.latest_release())
         self.assertEqual(av.version_tuple("2.10.0"), (2, 10, 0))
-        self.assertGreater(av.version_tuple("v2.10.0"), av.version_tuple(av.APP_VERSION))
+        self.assertGreater(av.version_tuple("v2.10.0"), av.version_tuple("2.9.1"))   # compared as numbers, not text
         self.assertIsNone(av.version_tuple("latest"))
 
 

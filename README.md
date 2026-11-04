@@ -84,7 +84,7 @@ Get-FileHash .\AltVault-*-win64.zip
 If you have the [GitHub CLI](https://cli.github.com), you can also confirm GitHub built the file from this repository:
 
 ```powershell
-gh attestation verify .\AltVault-2.8.0-win64.zip --repo HECTICWINS/AltVault
+gh attestation verify .\AltVault-3.0.0-win64.zip --repo HECTICWINS/AltVault
 ```
 
 The download includes its own copy of Python, so one or two lesser-known engines may flag it; that's a common false positive for Python apps.
@@ -194,7 +194,7 @@ Pick a mode at the top of **Home** (or in **Settings > Modes**). It applies to e
 - **Grind**: alts run at 15 FPS, lowest graphics and muted, in Windows' efficiency mode (a lower clock and below-normal priority, like Task Manager's Efficiency mode);
 - **Max alts**: like Grind at 10 FPS, and Windows moves alts out of memory first when memory runs short, so your main account and other programs stay fast.
 
-To set your main account, right-click it and choose **Performance > Main account**, or pick it in **Settings > Modes**. It keeps your own Roblox settings and normal priority in every mode.
+To set your main account, right-click it on the Accounts page and choose **Main account**, or pick it in **Settings > Modes**. It keeps your own Roblox settings and normal priority in every mode.
 FPS, graphics and sound apply from each window's next join; efficiency mode and memory priority apply to open windows straight away. An account's own FPS cap wins over the mode's.
 Nothing is injected into Roblox: modes use Roblox's own settings file (see below) and the same Windows switches as Task Manager.
 

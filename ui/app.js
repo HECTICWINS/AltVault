@@ -170,6 +170,7 @@ document.addEventListener("keydown", (e) => {
   if (e.ctrlKey && e.key.toLowerCase() === "a" && !["INPUT", "SELECT"].includes(document.activeElement.tagName)) {
     e.preventDefault(); selected = new Set(state.accounts.filter(visible).map((a) => a.id)); drawRows(); drawStatus();
   }
+  if (e.ctrlKey && e.key.toLowerCase() === "m") { e.preventDefault(); send({ type: "do", name: "minimize" }); }
 });
 
 if (host) host.addEventListener("message", (e) => {
