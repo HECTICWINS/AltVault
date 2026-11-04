@@ -2,7 +2,10 @@
 
 Every release on the [Releases](../../releases) page is built by GitHub from the tagged commit, comes with a build attestation, and is scanned by VirusTotal. See [Verify your download](README.md#verify-your-download).
 
-## 3.0.0
+## 3.0.1
+
+The first 3.0 release (3.0.0 was never published). Everything below is new since 2.8.0.
+
 
 - **Free for everyone:** no access key any more. Download, unzip and run.
 - **A new, plainer look:** every page is redrawn in Microsoft's WebView2: a sidebar, a dense account table, plain status words and a one-line status bar. Windows draws the Live page's previews itself, so they still cost almost nothing. The window opens in under a second, and while it's hidden in the tray the page stops drawing and hands memory back.
